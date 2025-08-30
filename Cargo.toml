@@ -1,0 +1,38 @@
+[package]
+name = "webshart"
+version = "0.1.0"
+edition = "2021"
+authors = ["bghira <bghira@users.github.com>"]
+license = "MIT"
+description = "Fast and memory-efficient webdataset shard reader with Python bindings"
+repository = "https://github.com/yourubghirasername/webshart"
+readme = "README.md"
+
+[lib]
+name = "webshart"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"] }
+pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+# Changed: removed "blocking" feature, using async reqwest
+reqwest = { version = "0.12", features = ["json"] }
+url = "2.5"
+tracing = "0.1"
+# Changed: added required features for our async runtime usage
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+regex = "1.10"
+log = "*"
+futures = "0.3.31"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
+
+[profile.release]
+#lto = true
+#codegen-units = 1
+opt-level = 3
