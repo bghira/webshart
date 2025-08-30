@@ -21,20 +21,22 @@ jobs:
       uses: PyO3/maturin-action@v1
       with:
         target: ${{ matrix.target }}
+        args: --release --out dist --find-interpreter --features openssl-sys/vendored
+        sccache: 'true'
+        manylinux: auto
+      env:
+        # Use stable ABI for forward compatibility
+        PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
+        # Force static linking and vendored OpenSSL
+        OPENSSL_STATIC: '1'
+        target: ${{ matrix.target }}
         args: --release --out dist --find-interpreter
         sccache: 'true'
         manylinux: auto
-        # Use vendored OpenSSL to avoid cross-compilation issues
-        rustup-components: rust-std
-        before-script-linux: |
-          # For cross-compilation, we'll use vendored OpenSSL
-          echo "Using vendored OpenSSL for cross-compilation"
+        docker-options: -e OPENSSL_DIR=/usr -e OPENSSL_INCLUDE_DIR=/usr/include -e OPENSSL_LIB_DIR=/usr/lib64
       env:
-        # Use stable ABI for forward compatibility with newer Python versions
+        # Use stable ABI for forward compatibility
         PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
-        # Use vendored OpenSSL to avoid cross-compilation issues
-        OPENSSL_STATIC: '1'
-        OPENSSL_NO_VENDOR: '0'
     
     - name: Upload wheels
       uses: actions/upload-artifact@v4
@@ -60,7 +62,7 @@ jobs:
         args: --release --out dist --find-interpreter
         sccache: 'true'
       env:
-        # Use stable ABI for forward compatibility with newer Python versions
+        # Use stable ABI for forward compatibility
         PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
     - name: Upload wheels
       uses: actions/upload-artifact@v4
@@ -86,11 +88,8 @@ jobs:
         args: --release --out dist --find-interpreter
         sccache: 'true'
       env:
-        # Use stable ABI for forward compatibility with newer Python versions
+        # Use stable ABI for forward compatibility
         PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
-        # macOS should handle OpenSSL fine, but set these just in case
-        OPENSSL_STATIC: '1'
-        OPENSSL_NO_VENDOR: '0'
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
