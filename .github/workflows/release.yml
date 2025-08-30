@@ -21,19 +21,9 @@ jobs:
       uses: PyO3/maturin-action@v1
       with:
         target: ${{ matrix.target }}
-        args: --release --out dist --find-interpreter --features openssl-sys/vendored
+        args: --release --out dist --find-interpreter --zig
         sccache: 'true'
         manylinux: auto
-      env:
-        # Use stable ABI for forward compatibility
-        PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
-        # Force static linking and vendored OpenSSL
-        OPENSSL_STATIC: '1'
-        target: ${{ matrix.target }}
-        args: --release --out dist --find-interpreter
-        sccache: 'true'
-        manylinux: auto
-        docker-options: -e OPENSSL_DIR=/usr -e OPENSSL_INCLUDE_DIR=/usr/include -e OPENSSL_LIB_DIR=/usr/lib64
       env:
         # Use stable ABI for forward compatibility
         PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
