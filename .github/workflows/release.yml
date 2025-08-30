@@ -17,22 +17,25 @@ jobs:
       with:
         python-version: '3.11'
     
-    # Install OpenSSL development headers
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libssl-dev pkg-config
-    
     - name: Build wheels
       uses: PyO3/maturin-action@v1
       with:
         target: ${{ matrix.target }}
         args: --release --out dist --find-interpreter
         sccache: 'true'
+        manylinux: auto
+        # Use vendored OpenSSL to avoid cross-compilation issues
+        rustup-components: rust-std
+        before-script-linux: |
+          # For cross-compilation, we'll use vendored OpenSSL
+          echo "Using vendored OpenSSL for cross-compilation"
       env:
         # Use stable ABI for forward compatibility with newer Python versions
         PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
-        manylinux: auto
+        # Use vendored OpenSSL to avoid cross-compilation issues
+        OPENSSL_STATIC: '1'
+        OPENSSL_NO_VENDOR: '0'
+    
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
@@ -76,25 +79,18 @@ jobs:
       with:
         python-version: '3.11'
     
-    # Install OpenSSL on macOS (if needed)
-    - name: Install dependencies
-      run: |
-        brew install openssl pkg-config
-        echo "PKG_CONFIG_PATH=/opt/homebrew/opt/openssl/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
-      if: matrix.target == 'aarch64'
-    
-    - name: Install dependencies
-      run: |
-        brew install openssl pkg-config
-        echo "PKG_CONFIG_PATH=/usr/local/opt/openssl/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
-      if: matrix.target == 'x86_64'
-    
     - name: Build wheels
       uses: PyO3/maturin-action@v1
       with:
         target: ${{ matrix.target }}
         args: --release --out dist --find-interpreter
         sccache: 'true'
+      env:
+        # Use stable ABI for forward compatibility with newer Python versions
+        PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
+        # macOS should handle OpenSSL fine, but set these just in case
+        OPENSSL_STATIC: '1'
+        OPENSSL_NO_VENDOR: '0'
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
