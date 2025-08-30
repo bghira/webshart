@@ -29,7 +29,13 @@ jobs:
         target: ${{ matrix.target }}
         args: --release --out dist --find-interpreter
         sccache: 'true'
+      env:
+        # Use stable ABI for forward compatibility with newer Python versions
+        PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
         manylinux: auto
+      env:
+        # Use stable ABI for forward compatibility with newer Python versions
+        PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
@@ -53,6 +59,9 @@ jobs:
         target: ${{ matrix.target }}
         args: --release --out dist --find-interpreter
         sccache: 'true'
+      env:
+        # Use stable ABI for forward compatibility with newer Python versions
+        PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
