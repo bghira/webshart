@@ -19,16 +19,19 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 # Changed: removed "blocking" feature, using async reqwest
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 url = "2.5"
 tracing = "0.1"
 # Changed: added required features for our async runtime usage
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "signal"] }
 regex = "1.10"
 log = "*"
 futures = "0.3.31"
 openssl = { version = "*", features = ["vendored"] }
 openssl-sys = { version = "*", features = ["vendored"] }
+sha2 = "0.10"
+tar = "0.4.44"
+tokio-util = { version = "0.7.16", features = ["compat"] }
 
 [dev-dependencies]
 tempfile = "3"

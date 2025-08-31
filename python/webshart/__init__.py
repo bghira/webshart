@@ -3,18 +3,23 @@
 import asyncio
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Any
+import argparse
+import sys
+
 
 from webshart._webshart import (
     __version__,
     DatasetDiscovery,
     DiscoveredDataset,
     BatchOperations,
+    MetadataExtractor,
 )
 
 __all__ = [
     "__version__",
     "DatasetDiscovery",
     "DiscoveredDataset",
+    "MetadataExtractor",
     "discover_dataset",
     "discover_dataset_async",
     "AsyncDatasetDiscovery",
@@ -294,81 +299,70 @@ class BatchProcessor:
         return results
 
 
-# Example usage documentation
+
+
+def extract_metadata(args):
+    """Extract metadata from unindexed webdataset shards."""
+    extractor = MetadataExtractor(hf_token=args.hf_token)
+    
+    try:
+        extractor.extract_metadata(
+            source=args.source,
+            destination=args.destination,
+            checkpoint_dir=args.checkpoint_dir,
+            max_workers=args.max_workers
+        )
+        print(f"✓ Metadata extraction complete for {args.source}")
+    except Exception as e:
+        print(f"✗ Error extracting metadata: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="webshart - Fast webdataset shard utilities"
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    
+    # extract-metadata subcommand
+    extract_parser = subparsers.add_parser(
+        "extract-metadata",
+        help="Extract metadata from unindexed webdataset shards"
+    )
+    extract_parser.add_argument(
+        "--source",
+        required=True,
+        help="Source dataset (local path or HF repo like 'laion/conceptual-captions-12m-webdataset')"
+    )
+    extract_parser.add_argument(
+        "--destination",
+        required=True,
+        help="Destination for metadata (local path or HF repo like 'username/dataset-name')"
+    )
+    extract_parser.add_argument(
+        "--checkpoint-dir",
+        help="Directory for checkpoint files to enable resumable extraction"
+    )
+    extract_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Maximum number of parallel workers (default: 4)"
+    )
+    extract_parser.add_argument(
+        "--hf-token",
+        help="HuggingFace token for private datasets"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.command == "extract-metadata":
+        extract_metadata(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    # Synchronous example
-    def sync_example():
-        # Discover dataset
-        dataset = discover_dataset(
-            "NebulaeWis/e621-2024-webp-4Mpixel", subfolder="original"
-        )
-        print(f"Found {dataset.num_shards} shards")
-
-        # Get quick stats
-        size, files = dataset.quick_stats()
-        if size:
-            print(f"Total size: {size:,} bytes")
-
-        # Access a specific shard
-        shard_info = dataset.get_shard_info(0)
-        print(f"First shard has {shard_info['num_files']} files")
-
-    # Asynchronous example
-    async def async_example():
-        # Using the async convenience function
-        dataset = await discover_dataset_async(
-            "NebulaeWis/e621-2024-webp-4Mpixel", subfolder="original"
-        )
-        print(f"Found {dataset.num_shards} shards")
-
-        # Or using the async wrapper class
-        discovery = AsyncDatasetDiscovery()
-        dataset2 = await discovery.discover(
-            "NebulaeWis/e621-2024-webp-4Mpixel", subfolder="original"
-        )
-        print(f"Also found {dataset2.num_shards} shards")
-
-    # Run the examples
-    print("=== Synchronous Example ===")
-    sync_example()
-
-    print("\n=== Asynchronous Example ===")
-    asyncio.run(async_example())
-
-    # Batch operations example
-    def batch_example():
-        print("=== Batch Operations Example ===")
-
-        # Discover multiple datasets in parallel
-        sources = [
-            "NebulaeWis/e621-2024-webp-4Mpixel",
-            "username/another-dataset",  # This might fail
-            "/local/path/dataset",  # Local dataset
-        ]
-
-        datasets = discover_datasets_batch(sources, subfolders=[None, "images", None])
-
-        for i, ds in enumerate(datasets):
-            if ds:
-                print(f"Dataset {i}: {ds.name} has {ds.num_shards} shards")
-            else:
-                print(f"Dataset {i}: Failed to discover")
-
-        # Read multiple files in parallel from a single dataset
-        if datasets[0]:
-            files = read_files_batch(
-                datasets[0],
-                [
-                    (0, 0),  # First file in first shard
-                    (0, 1),  # Second file in first shard
-                    (1, 0),  # First file in second shard
-                ],
-            )
-
-            for i, file_data in enumerate(files):
-                if file_data:
-                    print(f"File {i}: {len(file_data)} bytes")
-                else:
-                    print(f"File {i}: Failed to read")
-
-    batch_example()
+    main()
