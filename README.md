@@ -1,4 +1,5 @@
-<img width="1530" height="492" alt="image" src="https://github.com/user-attachments/assets/cbf18ea6-2aa9-45c5-89fb-5981d5f77ca0" />
+<img width="1530" height="492" alt="image" src="https://github.com/user-attachments/assets/1ff6cd93-1261-42ff-b120-16509fa3cc27" />
+
 
 Fast parallel reader for webdataset tar shards. Rust core with Python bindings. Built for streaming large video and image datasets, but handles any byte data.
 
