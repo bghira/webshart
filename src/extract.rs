@@ -1,6 +1,7 @@
 use crate::error::{Result, WebshartError};
 use crate::metadata::{FileInfo, ShardMetadata, ShardMetadataFormat};
 use futures::future::join_all;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use pyo3::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -141,6 +142,9 @@ impl MetadataExtractor {
                     HashMap::new()
                 };
 
+                // Create multi-progress for managing multiple progress bars
+                let multi_progress = Arc::new(MultiProgress::new());
+
                 // Process shards in parallel
                 let semaphore = Arc::new(tokio::sync::Semaphore::new(max_workers));
                 let futures = shards.into_iter().map(|shard| {
@@ -150,10 +154,10 @@ impl MetadataExtractor {
                     let dest = destination.to_string();
                     let checkpoint_dir = checkpoint_dir.map(|s| s.to_string());
                     let extractor = self.clone();
+                    let mp = multi_progress.clone();
 
                     async move {
                         let _permit = sem.acquire().await.unwrap();
-                        println!("[webshart] Worker acquired, processing {}", shard.name);
                         let result = extractor
                             .process_shard(
                                 shard.clone(),
@@ -161,9 +165,9 @@ impl MetadataExtractor {
                                 &dest,
                                 checkpoint_dir.as_deref(),
                                 token,
+                                mp,
                             )
                             .await;
-                        println!("[webshart] Worker completed {}", shard.name);
                         result
                     }
                 });
@@ -234,6 +238,9 @@ impl MetadataExtractor {
                 HashMap::new()
             };
 
+            // Create multi-progress for managing multiple progress bars
+            let multi_progress = Arc::new(MultiProgress::new());
+
             // Process shards in parallel
             let semaphore = Arc::new(tokio::sync::Semaphore::new(max_workers));
             let futures = shards.into_iter().map(|shard| {
@@ -243,10 +250,10 @@ impl MetadataExtractor {
                 let dest = destination.to_string();
                 let checkpoint_dir = checkpoint_dir.map(|s| s.to_string());
                 let extractor = self.clone();
+                let mp = multi_progress.clone();
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    println!("[webshart] Worker acquired, processing {}", shard.name);
                     let result = extractor
                         .process_shard(
                             shard.clone(),
@@ -254,9 +261,9 @@ impl MetadataExtractor {
                             &dest,
                             checkpoint_dir.as_deref(),
                             token,
+                            mp,
                         )
                         .await;
-                    println!("[webshart] Worker completed {}", shard.name);
                     result
                 }
             });
@@ -472,12 +479,8 @@ impl MetadataExtractor {
         destination: &str,
         checkpoint_dir: Option<&str>,
         hf_token: Option<String>,
+        multi_progress: Arc<MultiProgress>,
     ) -> Result<()> {
-        println!(
-            "[webshart] Processing {} ({} bytes)...",
-            shard.name, shard.size
-        );
-
         let start_offset = checkpoint.as_ref().map(|c| c.offset).unwrap_or(0);
 
         // Update checkpoint to in-progress
@@ -492,10 +495,10 @@ impl MetadataExtractor {
         }
 
         let metadata = match if shard.is_remote {
-            self.extract_remote_metadata(&shard, start_offset, hf_token.clone())
+            self.extract_remote_metadata(&shard, start_offset, hf_token.clone(), multi_progress)
                 .await
         } else {
-            self.extract_local_metadata(&shard, start_offset)
+            self.extract_local_metadata(&shard, start_offset, multi_progress)
         } {
             Ok(m) => m,
             Err(e) => {
@@ -527,7 +530,6 @@ impl MetadataExtractor {
             self.save_checkpoint(dir, &checkpoint)?;
         }
 
-        println!("[webshart] Completed {}", shard.name);
         Ok(())
     }
 
@@ -536,11 +538,19 @@ impl MetadataExtractor {
         shard: &UnindexedShard,
         start_offset: u64,
         hf_token: Option<String>,
+        multi_progress: Arc<MultiProgress>,
     ) -> Result<ShardMetadata> {
-        println!(
-            "[webshart] Streaming {} for metadata extraction",
-            shard.name
+        // Create progress bar for download
+        let download_pb = multi_progress.add(ProgressBar::new(shard.size));
+        download_pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "[{elapsed_precise}] {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
         );
+        download_pb.set_message(format!("↓ {}", shard.name));
 
         // Create request
         let mut request = self
@@ -565,6 +575,7 @@ impl MetadataExtractor {
         })?;
 
         if !response.status().is_success() {
+            download_pb.finish_and_clear();
             return Err(WebshartError::InvalidShardFormat(format!(
                 "Failed to download tar file: {}",
                 response.status()
@@ -579,11 +590,14 @@ impl MetadataExtractor {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(shard.size);
 
-        println!("[webshart] Streaming {} bytes in memory", actual_size);
+        download_pb.set_length(actual_size);
 
         // Stream to memory using channels
         let (tx, rx) =
             std::sync::mpsc::sync_channel::<std::result::Result<Vec<u8>, std::io::Error>>(100);
+
+        // Clone progress bar for the stream task
+        let download_pb_clone = download_pb.clone();
 
         // Spawn task to stream chunks into channel
         let shard_name_clone = shard.name.clone();
@@ -596,15 +610,9 @@ impl MetadataExtractor {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        downloaded += chunk.len() as u64;
-
-                        if downloaded % (100 * 1024 * 1024) == 0 {
-                            println!(
-                                "[webshart] Streamed {} MB of {}",
-                                downloaded / (1024 * 1024),
-                                shard_name_clone
-                            );
-                        }
+                        let chunk_len = chunk.len() as u64;
+                        downloaded += chunk_len;
+                        download_pb_clone.inc(chunk_len);
 
                         // Send chunk through channel
                         if tx.send(std::result::Result::Ok(chunk.to_vec())).is_err() {
@@ -620,7 +628,17 @@ impl MetadataExtractor {
                     }
                 }
             }
+            download_pb_clone.finish_with_message(format!("✓ Downloaded {}", shard_name_clone));
         });
+
+        // Create progress bar for processing
+        let process_pb = multi_progress.add(ProgressBar::new_spinner());
+        process_pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("[{elapsed_precise}] {msg} {spinner} [{pos} files]")
+                .unwrap(),
+        );
+        process_pb.set_message(format!("⚙ Processing {}", shard.name));
 
         // Process tar in blocking task using channel reader
         let shard_name = shard.name.clone();
@@ -665,7 +683,6 @@ impl MetadataExtractor {
             };
             let mut files = HashMap::new();
             let mut file_count = 0;
-            println!("[webshart] Processing streamed tar data for {}", shard_name);
             let mut archive = Archive::new(reader);
             let entries = archive.entries()?;
             for entry in entries {
@@ -711,9 +728,7 @@ impl MetadataExtractor {
                                 sha256: file_hash,
                             });
                             file_count += 1;
-                            if file_count % 100 == 0 {
-                                println!("[webshart] Processed {} files in {}...", file_count, shard_name);
-                            }
+                            process_pb.inc(1);
                         }
                     }
                     Err(e) => {
@@ -722,7 +737,7 @@ impl MetadataExtractor {
                 }
             }
 
-            println!("[webshart] Extracted metadata for {} files from {}", files.len(), shard_name);
+            process_pb.finish_with_message(format!("✓ Processed {} ({} files)", shard_name, file_count));
             Ok::<HashMap<String, FileInfo>, WebshartError>(files)
         }).await.map_err(|e| WebshartError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -745,6 +760,7 @@ impl MetadataExtractor {
         &self,
         shard: &UnindexedShard,
         start_offset: u64,
+        multi_progress: Arc<MultiProgress>,
     ) -> Result<ShardMetadata> {
         use std::fs::File;
         use tar::Archive;
@@ -752,7 +768,14 @@ impl MetadataExtractor {
         let mut files = HashMap::new();
         let mut file_count = 0;
 
-        println!("[webshart] Reading {} for metadata extraction", shard.name);
+        // Create progress bar
+        let pb = multi_progress.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("[{elapsed_precise}] {msg} {spinner} [{pos} files]")
+                .unwrap(),
+        );
+        pb.set_message(format!("⚙ Processing {}", shard.name));
 
         let file = File::open(&shard.path)?;
         let mut archive = Archive::new(file);
@@ -807,12 +830,7 @@ impl MetadataExtractor {
                         );
 
                         file_count += 1;
-                        if file_count % 100 == 0 {
-                            println!(
-                                "[webshart] Processed {} files in {}...",
-                                file_count, shard.name
-                            );
-                        }
+                        pb.inc(1);
                     }
                 }
                 Err(e) => {
@@ -822,28 +840,40 @@ impl MetadataExtractor {
             }
         }
 
-        println!(
-            "[webshart] Extracted {} files from {}",
-            files.len(),
-            shard.name
-        );
+        pb.finish_with_message(format!("✓ Processed {} ({} files)", shard.name, file_count));
 
         // Calculate file hash if requested
         let tar_hash = if self.compute_sha256 && shard.size < 100_000_000 {
-            println!(
-                "[webshart] Computing hash for {} (size: {} bytes)",
-                shard.name, shard.size
+            let hash_pb = multi_progress.add(ProgressBar::new(shard.size));
+            hash_pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "[{elapsed_precise}] {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes}",
+                    )
+                    .unwrap()
+                    .progress_chars("#>-"),
             );
+            hash_pb.set_message(format!("# Computing hash for {}", shard.name));
+
             let mut file = File::open(&shard.path)?;
             let mut hasher = Sha256::new();
             let mut buffer = [0; 8192];
+            let mut total_read = 0u64;
             loop {
                 match std::io::Read::read(&mut file, &mut buffer) {
                     Ok(0) => break,
-                    Ok(n) => hasher.update(&buffer[..n]),
-                    Err(e) => return Err(WebshartError::Io(e)),
+                    Ok(n) => {
+                        hasher.update(&buffer[..n]);
+                        total_read += n as u64;
+                        hash_pb.set_position(total_read);
+                    }
+                    Err(e) => {
+                        hash_pb.finish_and_clear();
+                        return Err(WebshartError::Io(e));
+                    }
                 }
             }
+            hash_pb.finish_with_message(format!("✓ Hash computed for {}", shard.name));
             Some(format!("{:x}", hasher.finalize()))
         } else {
             None
