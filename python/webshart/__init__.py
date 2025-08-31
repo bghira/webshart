@@ -323,14 +323,14 @@ def extract_metadata(args):
             sys.exit(1)
 
     try:
-        # Note: This assumes the Rust extract_metadata method will be updated to accept shard_range
         if shard_range:
             extractor.extract_metadata(
                 source=args.source,
                 destination=args.destination,
                 checkpoint_dir=args.checkpoint_dir,
                 max_workers=args.max_workers,
-                shard_range=shard_range,  # Pass the range tuple
+                shard_range=shard_range,
+                include_image_geometry=args.include_image_geometry,
             )
         else:
             extractor.extract_metadata(
@@ -338,6 +338,7 @@ def extract_metadata(args):
                 destination=args.destination,
                 checkpoint_dir=args.checkpoint_dir,
                 max_workers=args.max_workers,
+                include_image_geometry=args.include_image_geometry,
             )
         print(f"✓ Metadata extraction complete for {args.source}")
     except Exception as e:
@@ -383,6 +384,11 @@ def main():
         "--range",
         help="Range of tar file indices to process (e.g., '0,1000' for indices 0-999). "
         "Useful for distributing work across multiple machines.",
+    )
+    extract_parser.add_argument(
+        "--include-image-geometry",
+        action="store_true",
+        help="Include image geometry (width, height, aspect ratio) in metadata extraction"
     )
 
     args = parser.parse_args()

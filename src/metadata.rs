@@ -19,6 +19,18 @@ pub struct FileInfo {
     /// SHA256 hash of the file (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+
+    /// Image width in pixels (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+
+    /// Image height in pixels (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+
+    /// Image aspect ratio (width / height) (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect: Option<f32>,
 }
 
 /// Metadata for a single shard - supports both HashMap and Vec formats
@@ -35,6 +47,9 @@ pub enum ShardMetadataFormat {
         #[serde(skip_serializing_if = "Option::is_none")]
         hash_lfs: Option<String>,
         files: HashMap<String, FileInfo>,
+        /// Whether image geometry was extracted
+        #[serde(default)]
+        includes_image_geometry: bool,
     },
     /// Alternative format with Vec (common in some webdatasets)
     Vec {
@@ -43,6 +58,9 @@ pub enum ShardMetadataFormat {
         #[serde(default)]
         filesize: u64,
         files: Vec<FileInfo>,
+        /// Whether image geometry was extracted
+        #[serde(default)]
+        includes_image_geometry: bool,
     },
 }
 
@@ -53,6 +71,7 @@ pub struct ShardMetadata {
     pub filesize: u64,
     pub hash: Option<String>,
     pub hash_lfs: Option<String>,
+    pub includes_image_geometry: bool,
     files: Vec<FileInfoInternal>, // Internal storage with guaranteed path
 }
 
@@ -63,6 +82,9 @@ struct FileInfoInternal {
     pub offset: u64,
     pub length: u64,
     pub sha256: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub aspect: Option<f32>,
 }
 
 impl From<FileInfo> for FileInfoInternal {
@@ -72,10 +94,12 @@ impl From<FileInfo> for FileInfoInternal {
             offset: info.offset,
             length: info.length,
             sha256: info.sha256,
+            width: info.width,
+            height: info.height,
+            aspect: info.aspect,
         }
     }
 }
-
 impl From<&FileInfoInternal> for FileInfo {
     fn from(info: &FileInfoInternal) -> Self {
         Self {
@@ -83,6 +107,9 @@ impl From<&FileInfoInternal> for FileInfo {
             offset: info.offset,
             length: info.length,
             sha256: info.sha256.clone(),
+            width: info.width,
+            height: info.height,
+            aspect: info.aspect,
         }
     }
 }
@@ -97,6 +124,7 @@ impl ShardMetadata {
                 hash,
                 hash_lfs,
                 files,
+                includes_image_geometry,
             } => {
                 // Convert HashMap to Vec, setting the path from the HashMap key
                 let mut file_vec: Vec<FileInfoInternal> = files
@@ -116,6 +144,7 @@ impl ShardMetadata {
                     filesize,
                     hash,
                     hash_lfs,
+                    includes_image_geometry,
                     files: file_vec,
                 }
             }
@@ -123,6 +152,7 @@ impl ShardMetadata {
                 path,
                 filesize,
                 files,
+                includes_image_geometry,
             } => {
                 let file_vec: Vec<FileInfoInternal> =
                     files.into_iter().map(FileInfoInternal::from).collect();
@@ -132,6 +162,7 @@ impl ShardMetadata {
                     filesize,
                     hash: None,
                     hash_lfs: None,
+                    includes_image_geometry,
                     files: file_vec,
                 }
             }
@@ -190,6 +221,9 @@ impl Serialize for ShardMetadata {
                     offset: file.offset,
                     length: file.length,
                     sha256: file.sha256.clone(),
+                    width: file.width,
+                    height: file.height,
+                    aspect: file.aspect,
                 },
             );
         }
@@ -203,6 +237,7 @@ impl Serialize for ShardMetadata {
             #[serde(skip_serializing_if = "Option::is_none")]
             hash_lfs: &'a Option<String>,
             files: HashMap<String, FileInfo>,
+            includes_image_geometry: bool,
         }
 
         let helper = Helper {
@@ -211,6 +246,7 @@ impl Serialize for ShardMetadata {
             hash: &self.hash,
             hash_lfs: &self.hash_lfs,
             files: files_map,
+            includes_image_geometry: self.includes_image_geometry,
         };
 
         helper.serialize(serializer)
