@@ -299,19 +299,46 @@ class BatchProcessor:
         return results
 
 
-
-
 def extract_metadata(args):
     """Extract metadata from unindexed webdataset shards."""
     extractor = MetadataExtractor(hf_token=args.hf_token)
-    
+
+    # Parse range if provided
+    shard_range = None
+    if args.range:
+        try:
+            parts = args.range.split(",")
+            if len(parts) != 2:
+                raise ValueError("Range must be in format 'start,end'")
+            start = int(parts[0])
+            end = int(parts[1])
+            if start < 0 or end < start:
+                raise ValueError(
+                    "Invalid range: start must be >= 0 and end must be >= start"
+                )
+            shard_range = (start, end)
+            print(f"Processing shards in range [{start}, {end})")
+        except Exception as e:
+            print(f"✗ Error parsing range: {e}", file=sys.stderr)
+            sys.exit(1)
+
     try:
-        extractor.extract_metadata(
-            source=args.source,
-            destination=args.destination,
-            checkpoint_dir=args.checkpoint_dir,
-            max_workers=args.max_workers
-        )
+        # Note: This assumes the Rust extract_metadata method will be updated to accept shard_range
+        if shard_range:
+            extractor.extract_metadata(
+                source=args.source,
+                destination=args.destination,
+                checkpoint_dir=args.checkpoint_dir,
+                max_workers=args.max_workers,
+                shard_range=shard_range,  # Pass the range tuple
+            )
+        else:
+            extractor.extract_metadata(
+                source=args.source,
+                destination=args.destination,
+                checkpoint_dir=args.checkpoint_dir,
+                max_workers=args.max_workers,
+            )
         print(f"✓ Metadata extraction complete for {args.source}")
     except Exception as e:
         print(f"✗ Error extracting metadata: {e}", file=sys.stderr)
@@ -324,45 +351,44 @@ def main():
         description="webshart - Fast webdataset shard utilities"
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    
+
     # extract-metadata subcommand
     extract_parser = subparsers.add_parser(
-        "extract-metadata",
-        help="Extract metadata from unindexed webdataset shards"
+        "extract-metadata", help="Extract metadata from unindexed webdataset shards"
     )
     extract_parser.add_argument(
         "--source",
         required=True,
-        help="Source dataset (local path or HF repo like 'laion/conceptual-captions-12m-webdataset')"
+        help="Source dataset (local path or HF repo like 'laion/conceptual-captions-12m-webdataset')",
     )
     extract_parser.add_argument(
         "--destination",
         required=True,
-        help="Destination for metadata (local path or HF repo like 'username/dataset-name')"
+        help="Destination for metadata (local path or HF repo like 'username/dataset-name')",
     )
     extract_parser.add_argument(
         "--checkpoint-dir",
-        help="Directory for checkpoint files to enable resumable extraction"
+        help="Directory for checkpoint files to enable resumable extraction",
     )
     extract_parser.add_argument(
         "--max-workers",
         type=int,
         default=4,
-        help="Maximum number of parallel workers (default: 4)"
+        help="Maximum number of parallel workers (default: 4)",
     )
     extract_parser.add_argument(
-        "--hf-token",
-        help="HuggingFace token for private datasets"
+        "--hf-token", help="HuggingFace token for private datasets"
     )
-    
+    extract_parser.add_argument(
+        "--range",
+        help="Range of tar file indices to process (e.g., '0,1000' for indices 0-999). "
+        "Useful for distributing work across multiple machines.",
+    )
+
     args = parser.parse_args()
-    
+
     if args.command == "extract-metadata":
         extract_metadata(args)
     else:
         parser.print_help()
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
