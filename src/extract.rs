@@ -1096,7 +1096,7 @@ impl PyMetadataExtractor {
         checkpoint_dir: Option<&str>,
         max_workers: usize,
         shard_range: Option<(usize, usize)>,
-        include_image_geometry: bool, // NEW parameter
+        include_image_geometry: bool,
     ) -> PyResult<()> {
         // Create a new extractor with the image geometry setting
         let extractor = self
