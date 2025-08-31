@@ -1,4 +1,5 @@
-# webshart
+<img width="1530" height="492" alt="image" src="https://github.com/user-attachments/assets/ebf0d101-eae7-4908-bb73-a264bf89a479" />
+
 
 Fast parallel reader for webdataset tar shards. Rust core with Python bindings. Built for streaming large video and image datasets, but handles any byte data.
 
@@ -85,6 +86,16 @@ print(f"Dataset size: {size / 1e9:.1f} GB")
 
 Any tar-based webdataset can benefit from indexing! Webshart includes tools to generate indices:
 
+A command-line tool that auto-discovers tars to process:
+```bash
+% webshart extract-metadata \
+    --source laion/conceptual-captions-12m-webdataset \
+    --destination laion_output/ \
+    --checkpoint-dir ./laion_output/checkpoints \
+    --max-workers 2
+```
+
+Or, if you prefer/require direct-integration to an existing Python application, use the API:
 ```python
 from webshart import MetadataExtractor
 
