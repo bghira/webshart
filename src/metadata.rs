@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Information about a single file within a tar shard
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     /// Name/path of the file (optional in JSON, as it may be the HashMap key)
