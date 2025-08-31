@@ -12,6 +12,31 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+fn is_image_file(path: &str) -> bool {
+    let path_lower = path.to_lowercase();
+    path_lower.ends_with(".png")
+        || path_lower.ends_with(".jpg")
+        || path_lower.ends_with(".jpeg")
+        || path_lower.ends_with(".webp")
+        || path_lower.ends_with(".tiff")
+        || path_lower.ends_with(".tif")
+        || path_lower.ends_with(".bmp")
+        || path_lower.ends_with(".gif")
+        || path_lower.ends_with(".ico")
+}
+
+fn extract_image_dimensions(data: &[u8]) -> Option<(u32, u32, f32)> {
+    match imagesize::blob_size(data) {
+        Ok(size) => {
+            let width = size.width as u32;
+            let height = size.height as u32;
+            let aspect = width as f32 / height as f32;
+            Some((width, height, aspect))
+        }
+        Err(_) => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardCheckpoint {
     pub shard_name: String,
@@ -43,6 +68,7 @@ pub struct MetadataExtractor {
     client: reqwest::Client,
     shard_pattern: Regex,
     compute_sha256: bool,
+    include_image_geometry: bool,
 }
 
 impl MetadataExtractor {
@@ -68,11 +94,17 @@ impl MetadataExtractor {
             client,
             shard_pattern: Regex::new(r"^(.+?)\.tar$").unwrap(),
             compute_sha256: false,
+            include_image_geometry: false,
         }
     }
 
     pub fn with_sha256(mut self, compute: bool) -> Self {
         self.compute_sha256 = compute;
+        self
+    }
+
+    pub fn with_image_geometry(mut self, include: bool) -> Self {
+        self.include_image_geometry = include;
         self
     }
 
@@ -643,6 +675,7 @@ impl MetadataExtractor {
         // Process tar in blocking task using channel reader
         let shard_name = shard.name.clone();
         let compute_sha256 = self.compute_sha256;
+        let include_image_geometry = self.include_image_geometry;
 
         let result = tokio::task::spawn_blocking(move || {
             use tar::Archive;
@@ -676,56 +709,89 @@ impl MetadataExtractor {
                     Ok(to_copy)
                 }
             }
+
             let reader = ChannelReader {
                 rx,
                 buffer: Vec::new(),
                 pos: 0,
             };
+
             let mut files = HashMap::new();
             let mut file_count = 0;
             let mut archive = Archive::new(reader);
             let entries = archive.entries()?;
+
             for entry in entries {
                 match entry {
                     Ok(mut entry) => {
                         let path = entry.path()?.to_string_lossy().to_string();
                         let offset = entry.raw_header_position();
                         let size = entry.size();
+
                         if entry.header().entry_type() == tar::EntryType::Regular {
-                            let file_hash = if compute_sha256 && size > 0 && size < 10_000_000 {
-                                let mut hasher = Sha256::new();
+                            let mut file_data = Vec::new();
+                            let mut hasher = if compute_sha256 && size > 0 && size < 10_000_000 {
+                                Some(Sha256::new())
+                            } else {
+                                None
+                            };
+                            // Determine if we need to read the file data
+                            let need_hash = hasher.is_some();
+                            let need_dimensions = include_image_geometry && is_image_file(&path) && size > 0 && size < 50_000_000;
+                            let should_read = need_hash || need_dimensions;
+                            if should_read {
+                                if need_dimensions {
+                                    file_data.reserve(size as usize);
+                                }
                                 let mut buffer = [0; 8192];
                                 let mut total_read = 0u64;
                                 while total_read < size {
                                     let to_read = std::cmp::min(buffer.len(), (size - total_read) as usize);
                                     match entry.read_exact(&mut buffer[..to_read]) {
                                         Ok(_) => {
-                                            hasher.update(&buffer[..to_read]);
+                                            if let Some(ref mut h) = hasher {
+                                                h.update(&buffer[..to_read]);
+                                            }
+                                            if need_dimensions {
+                                                file_data.extend_from_slice(&buffer[..to_read]);
+                                            }
                                             total_read += to_read as u64;
                                         }
                                         Err(e) => {
-                                            eprintln!("[webshart] Error reading file {} for hash: {}", path, e);
+                                            eprintln!("[webshart] Error reading file {} for processing: {}", path, e);
                                             break;
                                         }
                                     }
                                 }
-                                if total_read == size {
-                                    Some(format!("{:x}", hasher.finalize()))
+                            } else {
+                                // Skip the file if we don't need to process it
+                                std::io::copy(&mut entry, &mut std::io::sink())?;
+                            }
+                            let file_hash = if compute_sha256 {
+                                if size == 0 {
+                                    Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
+                                } else if let Some(h) = hasher {
+                                    Some(format!("{:x}", h.finalize()))
                                 } else {
                                     None
                                 }
-                            } else if size == 0 {
-                                Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
                             } else {
-                                // Skip large files
-                                std::io::copy(&mut entry, &mut std::io::sink())?;
                                 None
+                            };
+                            // Extract image dimensions if needed
+                            let (width, height, aspect) = if need_dimensions && !file_data.is_empty() {
+                                extract_image_dimensions(&file_data).unwrap_or((0, 0, 0.0))
+                            } else {
+                                (0, 0, 0.0)
                             };
                             files.insert(path.clone(), FileInfo {
                                 path: Some(path.clone()),
                                 offset: offset + 512,
                                 length: size,
                                 sha256: file_hash,
+                                width: if width > 0 { Some(width) } else { None },
+                                height: if height > 0 { Some(height) } else { None },
+                                aspect: if aspect > 0.0 { Some(aspect) } else { None },
                             });
                             file_count += 1;
                             process_pb.inc(1);
@@ -753,6 +819,7 @@ impl MetadataExtractor {
             hash: None,
             hash_lfs: None,
             files: result,
+            includes_image_geometry: self.include_image_geometry,
         }))
     }
 
@@ -796,27 +863,66 @@ impl MetadataExtractor {
 
                     // Only process regular files
                     if entry.header().entry_type() == tar::EntryType::Regular {
-                        let file_hash = if self.compute_sha256 && size > 0 {
-                            let mut hasher = Sha256::new();
+                        let mut file_data = Vec::new();
+                        let mut hasher = if self.compute_sha256 && size > 0 && size < 10_000_000 {
+                            Some(Sha256::new())
+                        } else {
+                            None
+                        };
+
+                        // Determine if we need to read the file
+                        let need_hash = hasher.is_some();
+                        let need_dimensions = self.include_image_geometry
+                            && is_image_file(&path)
+                            && size > 0
+                            && size < 50_000_000;
+                        let should_read = need_hash || need_dimensions;
+
+                        if should_read {
+                            if need_dimensions {
+                                file_data.reserve(size as usize);
+                            }
+
                             let mut buffer = [0; 8192];
                             loop {
                                 match std::io::Read::read(&mut entry, &mut buffer) {
                                     Ok(0) => break,
-                                    Ok(n) => hasher.update(&buffer[..n]),
+                                    Ok(n) => {
+                                        if let Some(ref mut h) = hasher {
+                                            h.update(&buffer[..n]);
+                                        }
+                                        if need_dimensions {
+                                            file_data.extend_from_slice(&buffer[..n]);
+                                        }
+                                    }
                                     Err(e) => {
                                         eprintln!("[webshart] Error reading file {}: {}", path, e);
                                         break;
                                     }
                                 }
                             }
-                            Some(format!("{:x}", hasher.finalize()))
-                        } else if size == 0 {
-                            Some(
-                                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                                    .to_string(),
-                            )
+                        } else {
+                            // Skip the file if we don't need to process it
+                            std::io::copy(&mut entry, &mut std::io::sink())?;
+                        }
+
+                        let file_hash = if self.compute_sha256 {
+                            if size == 0 {
+                                Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
+                            } else if let Some(h) = hasher {
+                                Some(format!("{:x}", h.finalize()))
+                            } else {
+                                None
+                            }
                         } else {
                             None
+                        };
+
+                        // Extract dimensions if needed
+                        let (width, height, aspect) = if need_dimensions && !file_data.is_empty() {
+                            extract_image_dimensions(&file_data).unwrap_or((0, 0, 0.0))
+                        } else {
+                            (0, 0, 0.0)
                         };
 
                         files.insert(
@@ -826,6 +932,9 @@ impl MetadataExtractor {
                                 offset: offset + 512, // Add header size to get file content offset
                                 length: size,
                                 sha256: file_hash,
+                                width: if width > 0 { Some(width) } else { None },
+                                height: if height > 0 { Some(height) } else { None },
+                                aspect: if aspect > 0.0 { Some(aspect) } else { None },
                             },
                         );
 
@@ -885,6 +994,7 @@ impl MetadataExtractor {
             hash: tar_hash.clone(),
             hash_lfs: tar_hash,
             files,
+            includes_image_geometry: self.include_image_geometry,
         }))
     }
 
@@ -957,6 +1067,7 @@ impl Clone for MetadataExtractor {
             client,
             shard_pattern: Regex::new(r"^(.+?)\.tar$").unwrap(),
             compute_sha256: self.compute_sha256,
+            include_image_geometry: self.include_image_geometry,
         }
     }
 }
@@ -977,16 +1088,23 @@ impl PyMetadataExtractor {
         }
     }
 
-    #[pyo3(signature = (source, destination, checkpoint_dir=None, max_workers=2, shard_range=None))]
+    #[pyo3(signature = (source, destination, checkpoint_dir=None, max_workers=2, shard_range=None, include_image_geometry=false))]
     fn extract_metadata(
         &self,
         source: &str,
         destination: &str,
         checkpoint_dir: Option<&str>,
         max_workers: usize,
-        shard_range: Option<(usize, usize)>, // Accept Python tuple
+        shard_range: Option<(usize, usize)>,
+        include_image_geometry: bool, // NEW parameter
     ) -> PyResult<()> {
-        self.inner
+        // Create a new extractor with the image geometry setting
+        let extractor = self
+            .inner
+            .clone()
+            .with_image_geometry(include_image_geometry);
+
+        extractor
             .extract_metadata(
                 source,
                 destination,
