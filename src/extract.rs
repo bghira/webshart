@@ -81,6 +81,7 @@ impl MetadataExtractor {
         destination: &str,
         checkpoint_dir: Option<&str>,
         max_workers: usize,
+        shard_range: Option<(usize, usize)>, // NEW: Add range parameter
     ) -> Result<()> {
         self.runtime.block_on(async {
             // Set up Ctrl+C handler
@@ -89,12 +90,42 @@ impl MetadataExtractor {
             // Create the main extraction future
             let extraction = async {
                 // Discover unindexed shards
-                let shards = self
+                let mut shards = self
                     .discover_unindexed_shards(source, checkpoint_dir)
                     .await?;
 
+                // Apply range filter if provided
+                if let Some((start, end)) = shard_range {
+                    println!("[webshart] Filtering shards to range [{}, {})", start, end);
+
+                    // Sort shards by name first to ensure consistent ordering
+                    shards.sort_by(|a, b| a.name.cmp(&b.name));
+
+                    // Filter to the specified range
+                    let total_shards = shards.len();
+                    shards = shards
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(idx, shard)| {
+                            if idx >= start && idx < end {
+                                Some(shard)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    println!(
+                        "[webshart] Processing {} shards out of {} total (indices {}-{})",
+                        shards.len(),
+                        total_shards,
+                        start,
+                        std::cmp::min(end, total_shards) - 1
+                    );
+                }
+
                 if shards.is_empty() {
-                    println!("[webshart] No unindexed shards found");
+                    println!("[webshart] No unindexed shards found in specified range");
                     return Ok(());
                 }
 
@@ -827,38 +858,6 @@ impl MetadataExtractor {
         }))
     }
 
-    async fn read_remote_bytes(
-        &self,
-        url: &str,
-        offset: u64,
-        length: u64,
-        hf_token: &Option<String>,
-    ) -> Result<Vec<u8>> {
-        // Handle empty files
-        if length == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut request = self
-            .client
-            .get(url)
-            .header("Range", format!("bytes={}-{}", offset, offset + length - 1));
-
-        if let Some(token) = hf_token {
-            request = request.bearer_auth(token);
-        }
-
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(WebshartError::InvalidShardFormat(format!(
-                "Failed to read bytes: {}",
-                response.status()
-            )));
-        }
-
-        Ok(response.bytes().await?.to_vec())
-    }
-
     fn load_checkpoints(&self, dir: &str) -> Result<HashMap<String, ShardCheckpoint>> {
         let mut checkpoints = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -948,16 +947,23 @@ impl PyMetadataExtractor {
         }
     }
 
-    #[pyo3(signature = (source, destination, checkpoint_dir=None, max_workers=2))]
+    #[pyo3(signature = (source, destination, checkpoint_dir=None, max_workers=2, shard_range=None))]
     fn extract_metadata(
         &self,
         source: &str,
         destination: &str,
         checkpoint_dir: Option<&str>,
         max_workers: usize,
+        shard_range: Option<(usize, usize)>, // Accept Python tuple
     ) -> PyResult<()> {
         self.inner
-            .extract_metadata(source, destination, checkpoint_dir, max_workers)
+            .extract_metadata(
+                source,
+                destination,
+                checkpoint_dir,
+                max_workers,
+                shard_range,
+            )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }
