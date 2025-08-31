@@ -19,6 +19,7 @@ Webshart is a fast reader for webdataset tar files with separate JSON index file
 - **Selective downloads**: Only fetch the files you need
 - **True parallelism**: Read from multiple shards simultaneously
 - **Cloud-optimized**: Works efficiently with HTTP range requests
+- **Aspect bucketing**: Optionally include image geometry hints `width`, `height` and `aspect` for the ability to bucket by shape
 
 **Performance**: 10-20x faster for random access, 5-10x faster for batch reads compared to standard tar extraction.
 
@@ -92,7 +93,8 @@ A command-line tool that auto-discovers tars to process:
     --source laion/conceptual-captions-12m-webdataset \
     --destination laion_output/ \
     --checkpoint-dir ./laion_output/checkpoints \
-    --max-workers 2
+    --max-workers 2 \
+    --include-image-geometry
 ```
 
 Or, if you prefer/require direct-integration to an existing Python application, use the API:
@@ -106,7 +108,8 @@ extractor = MetadataExtractor(hf_token="hf_...")
 extractor.extract_metadata(
     source="username/dataset-name",  # HF dataset or local path
     destination="./indices/",        # Where to save JSON files
-    max_workers=4                    # Parallel processing
+    max_workers=4,                   # Parallel processing
+    include_image_geometry=True,     # Not much slower, but far more useful
 )
 ```
 
