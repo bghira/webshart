@@ -50,3 +50,4 @@ env/
 # OS
 .DS_Store
 Thumbs.db.venv
+.venv/

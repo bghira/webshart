@@ -2,12 +2,13 @@ use pyo3::prelude::*;
 mod batch;
 mod discovery;
 mod error;
+mod extract;
 mod metadata;
-
 // Re-export main types
 pub use batch::{BatchOperations, BatchResult, FileReadRequest};
 pub use discovery::{DatasetDiscovery, DiscoveredDataset};
 pub use error::{Result, WebshartError};
+pub use extract::MetadataExtractor;
 pub use metadata::{FileInfo, ShardMetadata};
 
 /// A Python module implemented in Rust for fast webdataset shard reading
@@ -20,6 +21,7 @@ fn _webshart(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<discovery::PyDiscoveredDataset>()?;
     m.add_class::<discovery::PyShardReader>()?;
     m.add_class::<batch::PyBatchOperations>()?;
+    m.add_class::<extract::PyMetadataExtractor>()?;
 
     Ok(())
 }

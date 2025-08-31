@@ -28,6 +28,9 @@ classifiers = [
 ]
 keywords = ["dataset", "shards", "tar", "webdataset", "machine-learning"]
 
+[project.scripts]
+webshart = "webshart:main"
+
 [project.urls]
 Homepage = "https://github.com/bghira/webshart"
 Repository = "https://github.com/bghira/webshart"
@@ -36,6 +39,4 @@ Issues = "https://github.com/bghira/webshart/issues"
 [tool.maturin]
 python-source = "python"
 module-name = "webshart._webshart"
-[tool.poetry.group.dev.dependencies]
-maturin = "^1.9.4"
 
