@@ -10,16 +10,18 @@ pip install webshart
 
 ## What is this?
 
-Webshart is a fast reader for a specific webdataset format: tar files with separate JSON index files. This format enables random access to any file in the dataset without downloading the entire archive.
+Webshart is a fast reader for webdataset tar files with separate JSON index files. This format enables random access to any file in the dataset without downloading the entire archive.
 
-**The format is rare** but used by some large image datasets:
-- `NebulaeWis/e621-2024-webp-4Mpixel`
-- `picollect/danbooru2` (subfolder: `images`)
-- Other picollect datasets
+**The indexed format** provides massive performance benefits:
 
-**Not a replacement** for HF datasets or the webdataset library - just a purpose-built tool for this indexed format.
+- **Random access**: Jump to any file instantly
+- **Selective downloads**: Only fetch the files you need
+- **True parallelism**: Read from multiple shards simultaneously
+- **Cloud-optimized**: Works efficiently with HTTP range requests
 
 **Performance**: 10-20x faster for random access, 5-10x faster for batch reads compared to standard tar extraction.
+
+**Growing ecosystem**: While not all datasets use this format yet, you can easily create indices for any tar-based dataset (see below).
 
 ## Quick Start
 
@@ -52,6 +54,7 @@ for i, data in enumerate(byte_list):
 ## Common Patterns
 
 Stream a subset efficiently:
+
 ```python
 # Read files 0-100 from each of the first 10 shards
 requests = []
@@ -71,11 +74,65 @@ for chunk_idx, i in enumerate(range(0, len(requests), 500)):
 ```
 
 Quick dataset stats:
+
 ```python
 # Without downloading anything
 size, num_files = dataset.quick_stats()
 print(f"Dataset size: {size / 1e9:.1f} GB")
 ```
+
+## Creating Indices for Existing Datasets
+
+Any tar-based webdataset can benefit from indexing! Webshart includes tools to generate indices:
+
+```python
+from webshart import MetadataExtractor
+
+# Create an extractor (optionally with HF token for private datasets)
+extractor = MetadataExtractor(hf_token="hf_...")
+
+# Generate indices for a dataset
+extractor.extract_metadata(
+    source="username/dataset-name",  # HF dataset or local path
+    destination="./indices/",        # Where to save JSON files
+    max_workers=4                    # Parallel processing
+)
+```
+
+### Uploading Indices to HuggingFace
+
+Once you've generated indices, share them with the community:
+
+```bash
+# Upload all JSON files to your dataset
+huggingface-cli upload --repo-type=dataset \
+    username/dataset-name \
+    ./indices/ \
+    --include "*.json" \
+    --path-in-repo "indices/"
+```
+
+Or if you want to contribute to an existing dataset you don't own:
+
+1. Create a community dataset with indices: `username/original-dataset-indices`
+2. Upload the JSON files there
+3. Open a discussion on the original dataset suggesting they add the indices
+
+### Creating New Indexed Datasets
+
+If you're creating a new dataset, generate indices during creation:
+
+```json
+{
+  "files": {
+    "image_0001.webp": {"offset": 512, "length": 102400},
+    "image_0002.webp": {"offset": 102912, "length": 98304},
+    ...
+  }
+}
+```
+
+The JSON index should have the same name as the tar file (e.g., `shard_0000.tar` → `shard_0000.json`).
 
 ## Batch Operations
 
@@ -99,11 +156,13 @@ results = processor.process_dataset(
 ## Advanced
 
 Local dataset:
+
 ```python
 dataset = webshart.discover_dataset("/path/to/shards/")
 ```
 
 Custom auth:
+
 ```python
 # Pass token directly
 dataset = webshart.discover_dataset("private/dataset", hf_token="hf_...")
@@ -115,6 +174,7 @@ dataset = webshart.discover_dataset("private/dataset", hf_token=token)
 ```
 
 Async interface (if you're already in async code):
+
 ```python
 dataset = await webshart.discover_dataset_async("NebulaeWis/e621-2024-webp-4Mpixel")
 ```
@@ -124,32 +184,25 @@ dataset = await webshart.discover_dataset_async("NebulaeWis/e621-2024-webp-4Mpix
 **Problem**: Standard tar files require sequential reading. To get file #10,000, you must read through files #1-9,999 first.
 
 **Solution**: The indexed format stores byte offsets in a separate JSON file, enabling:
+
 - HTTP range requests for any file
 - True random access over network
 - Parallel reads from multiple shards
 - No wasted bandwidth
 
 The Rust implementation provides:
+
 - Real parallelism (no Python GIL)
 - Zero-copy operations where possible
 - Efficient HTTP connection pooling
 - Optimized tokio async runtime
 
-## Creating indexed datasets
+## Datasets Using This Format
 
-If you're making a new webdataset, consider using the indexed format:
-
-```json
-{
-  "files": {
-    "image_0001.webp": {"offset": 512, "length": 102400},
-    "image_0002.webp": {"offset": 102912, "length": 98304},
-    ...
-  }
-}
-```
-
-This enables random access over HTTP, making cloud-stored datasets as fast as local ones for many use cases.
+- `NebulaeWis/e621-2024-webp-4Mpixel`
+- `picollect/danbooru2` (subfolder: `images`)
+- Many picollect image datasets
+- Your dataset could be next! See "Creating Indices" above
 
 ## Requirements
 
