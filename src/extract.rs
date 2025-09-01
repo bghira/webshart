@@ -637,13 +637,11 @@ impl MetadataExtractor {
             use futures::StreamExt;
 
             let mut stream = response.bytes_stream();
-            let mut downloaded = 0u64;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
                         let chunk_len = chunk.len() as u64;
-                        downloaded += chunk_len;
                         download_pb_clone.inc(chunk_len);
 
                         // Send chunk through channel
