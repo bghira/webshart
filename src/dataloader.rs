@@ -59,8 +59,12 @@ pub struct PyTarDataLoader {
     buffer_size: usize, // How many entries to load at once
     load_file_data: bool,
     max_file_size: u64,
-    skip_to_index: Option<usize>, // where to begin reading the dataset
-    current_file_index: usize,    // where we are in the current shard
+    // Tracks the global file index within the current shard
+    // This represents the index of the next file to be loaded from the shard
+    next_file_to_load: usize,
+    // Store the original source and hf_token for state persistence
+    source: String,
+    hf_token: Option<String>,
 }
 
 #[pymethods]
@@ -77,18 +81,21 @@ impl PyTarDataLoader {
         let runtime = Arc::new(Runtime::new().expect("Failed to create runtime"));
 
         // Handle either a DiscoveredDataset or a path string
-        let dataset =
+        let (dataset, source) =
             if let Ok(py_dataset) = dataset_or_path.extract::<PyRef<PyDiscoveredDataset>>() {
-                py_dataset.inner.clone()
+                // Extract source from the dataset if possible
+                let source = py_dataset.inner.name.clone();
+                (py_dataset.inner.clone(), source)
             } else if let Ok(path) = dataset_or_path.extract::<String>() {
                 // Auto-discover dataset
                 let discovery = DatasetDiscovery::new().with_optional_token(hf_token.clone());
 
-                if Path::new(&path).exists() {
+                let dataset = if Path::new(&path).exists() {
                     discovery.discover_local(Path::new(&path))?
                 } else {
                     runtime.block_on(discovery.discover_huggingface(&path, None))?
-                }
+                };
+                (dataset, path)
             } else {
                 return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
                     "Expected either a DiscoveredDataset or a path string",
@@ -104,9 +111,210 @@ impl PyTarDataLoader {
             buffer_size: buffer_size.max(1),
             load_file_data,
             max_file_size,
-            skip_to_index: None,
-            current_file_index: 0,
+            next_file_to_load: 0,
+            source,
+            hf_token,
         })
+    }
+
+    fn state_dict(&self, py: Python) -> PyResult<PyObject> {
+        let dict = PyDict::new(py);
+        // Calculate the actual current file index within the shard
+        // This represents the next file that would be returned to the user
+        let current_file_index = if self.entry_buffer.is_empty() {
+            // No buffer, so we haven't loaded any files yet from current position
+            self.next_file_to_load
+        } else {
+            // We have a buffer with files. The current file index is:
+            // next_file_to_load - (total files in buffer - files already consumed)
+            let total_in_buffer = self.entry_buffer.len();
+            let consumed = self.buffer_position;
+            let unread_in_buffer = total_in_buffer - consumed;
+
+            // The actual current position is where we started loading the buffer
+            // plus how many we've consumed
+            self.next_file_to_load.saturating_sub(total_in_buffer) + consumed
+        };
+
+        // Core state
+        dict.set_item("current_shard", self.current_shard)?;
+        dict.set_item("current_file_index", current_file_index)?; // Local to shard
+        dict.set_item("buffer_position", self.buffer_position)?;
+
+        // Configuration
+        dict.set_item("buffer_size", self.buffer_size)?;
+        dict.set_item("load_file_data", self.load_file_data)?;
+        dict.set_item("max_file_size", self.max_file_size)?;
+        dict.set_item("source", &self.source)?;
+        dict.set_item("hf_token", &self.hf_token)?;
+
+        // Dataset info
+        let dataset = self.dataset.lock().unwrap();
+        dict.set_item("num_shards", dataset.num_shards())?;
+        dict.set_item("is_remote", dataset.is_remote)?;
+
+        // Version for future compatibility
+        dict.set_item("version", 1)?;
+
+        Ok(dict.into())
+    }
+
+    /// Load state from a dictionary
+    fn load_state_dict(&mut self, state_dict: &PyDict) -> PyResult<()> {
+        // Validate version
+        if let Ok(Some(version_item)) = state_dict.get_item("version") {
+            if let Ok(version) = version_item.extract::<i32>() {
+                if version != 1 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Unsupported state dict version: {}",
+                        version
+                    )));
+                }
+            }
+        }
+
+        // Load core state
+        let mut new_shard = self.current_shard;
+        let mut new_file_index = 0;
+
+        if let Ok(Some(item)) = state_dict.get_item("current_shard") {
+            if let Ok(v) = item.extract::<usize>() {
+                new_shard = v;
+            }
+        }
+        if let Ok(Some(item)) = state_dict.get_item("current_file_index") {
+            if let Ok(v) = item.extract::<usize>() {
+                new_file_index = v;
+            }
+        }
+
+        // Load configuration (optional - only update if present)
+        if let Ok(Some(item)) = state_dict.get_item("buffer_size") {
+            if let Ok(v) = item.extract::<usize>() {
+                self.buffer_size = v.max(1);
+            }
+        }
+        if let Ok(Some(item)) = state_dict.get_item("load_file_data") {
+            if let Ok(v) = item.extract::<bool>() {
+                self.load_file_data = v;
+            }
+        }
+        if let Ok(Some(item)) = state_dict.get_item("max_file_size") {
+            if let Ok(v) = item.extract::<u64>() {
+                self.max_file_size = v;
+            }
+        }
+
+        // Ensure metadata is loaded for the target shard
+        if new_shard < self.dataset.lock().unwrap().num_shards() {
+            self.dataset
+                .lock()
+                .unwrap()
+                .ensure_shard_metadata(new_shard)?;
+        }
+
+        // Clear buffer since we're repositioning
+        self.entry_buffer.clear();
+        self.buffer_position = 0;
+
+        // Set the new position
+        self.current_shard = new_shard;
+        self.next_file_to_load = new_file_index;
+
+        Ok(())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (state_dict, dataset_or_path=None))]
+    fn from_state_dict(
+        py: Python,
+        state_dict: &PyDict,
+        dataset_or_path: Option<&PyAny>,
+    ) -> PyResult<Self> {
+        // Extract configuration from state dict
+        let load_file_data = match state_dict.get_item("load_file_data")? {
+            Some(item) => item.extract::<bool>().unwrap_or(true),
+            None => true,
+        };
+        let max_file_size = match state_dict.get_item("max_file_size")? {
+            Some(item) => item.extract::<u64>().unwrap_or(50_000_000),
+            None => 50_000_000,
+        };
+        let buffer_size = match state_dict.get_item("buffer_size")? {
+            Some(item) => item.extract::<usize>().unwrap_or(100),
+            None => 100,
+        };
+        let hf_token = match state_dict.get_item("hf_token")? {
+            Some(item) => item.extract::<Option<String>>().unwrap_or(None),
+            None => None,
+        };
+
+        // Determine the dataset source
+        let source = if let Some(dataset_or_path) = dataset_or_path {
+            dataset_or_path
+        } else {
+            // Try to get source from state dict
+            let source_str = match state_dict.get_item("source")? {
+                Some(item) => item.extract::<String>().map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid source in state_dict")
+                })?,
+                None => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "No dataset_or_path provided and no source in state_dict",
+                    ));
+                }
+            };
+            let py_source = py.eval(&format!("'{}'", source_str), None, None)?;
+            py_source
+        };
+
+        // Create new dataloader
+        let mut loader = Self::new(source, load_file_data, max_file_size, buffer_size, hf_token)?;
+
+        // Load the state
+        loader.load_state_dict(state_dict)?;
+
+        Ok(loader)
+    }
+
+    fn get_state_summary(&self, py: Python) -> PyResult<PyObject> {
+        let dict = PyDict::new(py);
+
+        let mut dataset = self.dataset.lock().unwrap();
+
+        // Calculate current position more accurately
+        let current_file_index_in_shard = self.current_file_index();
+
+        // Calculate global position across all shards
+        let mut files_processed = 0;
+        for i in 0..self.current_shard {
+            // Ensure metadata is loaded for accurate count
+            dataset.ensure_shard_metadata(i)?;
+            if let Some(shard) = dataset.shards.get(i) {
+                if let Some(metadata) = &shard.metadata {
+                    files_processed += metadata.num_files();
+                }
+            }
+        }
+        files_processed += current_file_index_in_shard;
+
+        let total_files = dataset.total_files().unwrap_or(0);
+
+        dict.set_item("current_shard", self.current_shard)?;
+        dict.set_item("total_shards", dataset.num_shards())?;
+        dict.set_item("current_file_index", current_file_index_in_shard)?;
+        dict.set_item("files_processed", files_processed)?;
+        dict.set_item("total_files", total_files)?;
+        dict.set_item(
+            "progress_percent",
+            if total_files > 0 {
+                files_processed as f64 / total_files as f64 * 100.0
+            } else {
+                0.0
+            },
+        )?;
+
+        Ok(dict.into())
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -128,8 +336,31 @@ impl PyTarDataLoader {
     }
 
     #[getter]
+    fn current_file_index(&self) -> usize {
+        // Return the actual current position (what would be returned next)
+        if self.entry_buffer.is_empty() {
+            self.next_file_to_load
+        } else {
+            // Calculate based on buffer state
+            let total_in_buffer = self.entry_buffer.len();
+            let consumed = self.buffer_position;
+            self.next_file_to_load.saturating_sub(total_in_buffer) + consumed
+        }
+    }
+
+    #[getter]
     fn buffer_size(&self) -> usize {
         self.buffer_size
+    }
+
+    #[getter]
+    fn load_file_data(&self) -> bool {
+        self.load_file_data
+    }
+
+    #[getter]
+    fn max_file_size(&self) -> u64 {
+        self.max_file_size
     }
 
     #[setter]
@@ -177,8 +408,7 @@ impl PyTarDataLoader {
         self.current_shard = 0;
         self.entry_buffer.clear();
         self.buffer_position = 0;
-        self.skip_to_index = None;
-        self.current_file_index = 0;
+        self.next_file_to_load = 0;
         Ok(())
     }
 
@@ -201,8 +431,26 @@ impl PyTarDataLoader {
         self.entry_buffer.clear();
         self.buffer_position = 0;
 
-        // Store the skip index
-        self.skip_to_index = Some(idx);
+        // Find which shard and file index within that shard
+        let mut remaining = idx;
+        let mut target_shard = 0;
+        let dataset = self.dataset.lock().unwrap();
+
+        for (shard_idx, shard) in dataset.shards.iter().enumerate() {
+            if let Some(metadata) = &shard.metadata {
+                let num_files = metadata.num_files();
+                if remaining < num_files {
+                    target_shard = shard_idx;
+                    break;
+                }
+                remaining -= num_files;
+            }
+        }
+
+        drop(dataset);
+
+        self.current_shard = target_shard;
+        self.next_file_to_load = remaining;
 
         Ok(())
     }
@@ -263,148 +511,15 @@ impl PyTarDataLoader {
         // Update current shard
         self.current_shard = target_shard;
 
-        // Set skip index if cursor provided
-        self.skip_to_index = cursor_idx;
+        // Set file index if cursor provided
+        self.next_file_to_load = cursor_idx.unwrap_or(0);
 
         Ok(())
     }
 }
 
+// Rest of the implementation remains the same...
 impl PyTarDataLoader {
-    fn process_tar_entries(&mut self, reader: Box<dyn Read>, shard_idx: usize) -> PyResult<()> {
-        let mut archive = Archive::new(reader);
-        let entries = match archive.entries() {
-            Ok(entries) => entries,
-            Err(e) => {
-                eprintln!(
-                    "Failed to read archive entries in shard {}: {}. Skipping shard.",
-                    shard_idx, e
-                );
-                self.current_shard += 1;
-                return Ok(());
-            }
-        };
-
-        let mut entries_loaded = 0;
-        let mut entry_errors = 0;
-        let debug = std::env::var("WEBSHART_DEBUG").is_ok();
-
-        for (entry_idx, entry) in entries.enumerate() {
-            if entries_loaded >= self.buffer_size {
-                break; // Buffer is full
-            }
-
-            match entry {
-                Ok(mut entry) => {
-                    let path = match entry.path() {
-                        Ok(p) => p.to_string_lossy().to_string(),
-                        Err(e) => {
-                            eprintln!("Failed to read path for entry {}: {}", entry_idx, e);
-                            entry_errors += 1;
-                            continue;
-                        }
-                    };
-
-                    let offset = entry.raw_header_position();
-                    let size = entry.size();
-
-                    // Get entry type safely
-                    let entry_type = entry.header().entry_type();
-
-                    if debug {
-                        eprintln!(
-                            "Reading entry {}: {} (size: {}, type: {:?})",
-                            entry_idx, path, size, entry_type
-                        );
-                    }
-
-                    // Only process regular files
-                    if entry_type != tar::EntryType::Regular {
-                        continue;
-                    }
-
-                    // Read file data if requested and within size limit
-                    let data = if self.load_file_data && size <= self.max_file_size && size > 0 {
-                        let mut buffer = Vec::with_capacity(size as usize);
-                        match entry.read_to_end(&mut buffer) {
-                            Ok(_) => buffer,
-                            Err(e) => {
-                                eprintln!("Failed to read data for {}: {}. Continuing...", path, e);
-                                entry_errors += 1;
-                                // Skip remaining content using copy
-                                let _ = std::io::copy(&mut entry, &mut std::io::sink());
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        // Skip the content - use the same method as the metadata extractor
-                        match std::io::copy(&mut entry, &mut std::io::sink()) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!(
-                                    "Error skipping content for {}: {}. Continuing...",
-                                    path, e
-                                );
-                                entry_errors += 1;
-                            }
-                        }
-                        Vec::new()
-                    };
-
-                    self.entry_buffer.push(PyTarFileEntry {
-                        path,
-                        offset: offset + 512, // Add header size
-                        size,
-                        data,
-                    });
-
-                    entries_loaded += 1;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Error reading tar entry {} in shard {}: {}",
-                        entry_idx, shard_idx, e
-                    );
-                    entry_errors += 1;
-
-                    // If we're getting too many errors at the beginning, skip the shard
-                    if entry_idx < 10 && entry_errors > 5 {
-                        eprintln!(
-                            "Too many errors at beginning of shard {}. Skipping to next shard.",
-                            shard_idx
-                        );
-                        self.current_shard += 1;
-                        return Ok(());
-                    }
-                    // Otherwise continue trying other entries
-                    continue;
-                }
-            }
-        }
-
-        // If we loaded some entries but not a full buffer, we're at the end of the shard
-        if entries_loaded > 0 {
-            if entries_loaded < self.buffer_size {
-                self.current_shard += 1;
-            }
-            if debug {
-                eprintln!(
-                    "Loaded {} entries from shard {} ({} errors)",
-                    entries_loaded, shard_idx, entry_errors
-                );
-            }
-        } else {
-            // No entries loaded, move to next shard
-            eprintln!(
-                "No entries loaded from shard {}. Moving to next shard.",
-                shard_idx
-            );
-            self.current_shard += 1;
-        }
-
-        Ok(())
-    }
-
     fn next_entry(&mut self) -> PyResult<Option<PyTarFileEntry>> {
         // Check if we have entries in the buffer
         if self.buffer_position < self.entry_buffer.len() {
@@ -441,8 +556,7 @@ impl PyTarDataLoader {
             if self.entry_buffer.is_empty() {
                 // No entries in this shard, move to next
                 self.current_shard += 1;
-                self.current_file_index = 0;
-                self.skip_to_index = None;
+                self.next_file_to_load = 0;
             }
         }
 
@@ -470,20 +584,6 @@ impl PyTarDataLoader {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Metadata not loaded")
         })?;
 
-        // Determine starting index
-        let start_idx = if let Some(skip_idx) = self.skip_to_index {
-            eprintln!("[DEBUG] Using skip_to_index={}", skip_idx);
-            self.skip_to_index = None; // Clear skip index after use
-            self.current_file_index = skip_idx;
-            skip_idx
-        } else {
-            eprintln!(
-                "[DEBUG] Using current_file_index={}",
-                self.current_file_index
-            );
-            self.current_file_index
-        };
-
         let tar_path = shard.tar_path.clone();
         let is_remote = dataset.is_remote;
         let token = if is_remote {
@@ -493,19 +593,18 @@ impl PyTarDataLoader {
         };
 
         // Get file entries from metadata
-        let mut file_entries = Vec::new();
         let total_files = metadata.num_files();
 
-        // Debug: print what we're trying to load
-        eprintln!(
-            "[DEBUG] Loading entries from index {} to {} (total files: {})",
-            start_idx,
-            std::cmp::min(start_idx + self.buffer_size, total_files),
-            total_files
-        );
+        // If we've already read all files from this shard, return empty
+        if self.next_file_to_load >= total_files {
+            return Ok(());
+        }
 
-        // WORKAROUND: Get ALL files and sort them to ensure consistent ordering
-        // This is needed because HashMap doesn't guarantee order
+        // Calculate range to load
+        let start_idx = self.next_file_to_load;
+        let end_idx = std::cmp::min(start_idx + self.buffer_size, total_files);
+
+        // Get ALL files and sort them to ensure consistent ordering
         let mut all_files: Vec<(String, crate::metadata::FileInfo)> = Vec::new();
         for idx in 0..total_files {
             if let Some((filename, file_info)) = metadata.get_file_by_index(idx) {
@@ -516,12 +615,11 @@ impl PyTarDataLoader {
         // Sort files by name to ensure consistent ordering
         all_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Now get the files we need based on the sorted order
-        let end_idx = std::cmp::min(start_idx + self.buffer_size, total_files);
+        // Collect the files we need
+        let mut file_entries = Vec::new();
         for idx in start_idx..end_idx {
             if idx < all_files.len() {
                 let (filename, file_info) = &all_files[idx];
-                eprintln!("[DEBUG] Index {}: {}", idx, filename);
                 file_entries.push((filename.clone(), file_info.clone()));
             }
         }
@@ -539,8 +637,8 @@ impl PyTarDataLoader {
             self.load_files_local(tar_path, file_entries)?;
         }
 
-        // Update current file index
-        self.current_file_index = start_idx + self.entry_buffer.len();
+        // Update next_file_to_load to point to the next file we'll load
+        self.next_file_to_load = end_idx;
 
         Ok(())
     }
@@ -599,11 +697,6 @@ impl PyTarDataLoader {
         token: Option<String>,
         file_entries: Vec<(String, crate::metadata::FileInfo)>,
     ) -> PyResult<()> {
-        // For remote files, we can either:
-        // 1. Make individual range requests for each file (more requests but simpler)
-        // 2. Make one large range request and parse out the files (fewer requests but more complex)
-
-        // For now, let's use approach 1 for simplicity
         self.runtime.block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -615,7 +708,6 @@ impl PyTarDataLoader {
                 let length = file_info.length;
 
                 let data = if self.load_file_data && length <= self.max_file_size && length > 0 {
-                    // Make range request for this specific file
                     let mut request = client
                         .get(&url)
                         .header("Range", format!("bytes={}-{}", offset, offset + length - 1));
@@ -725,6 +817,26 @@ impl PyBatchDataLoader {
 
     fn reset(&mut self) -> PyResult<()> {
         self.base_loader.reset()
+    }
+
+    /// Get the current state of the batch dataloader
+    fn state_dict(&self, py: Python) -> PyResult<PyObject> {
+        let dict = self.base_loader.state_dict(py)?;
+        if let Ok(dict) = dict.downcast::<PyDict>(py) {
+            dict.set_item("batch_size", self.batch_size)?;
+        }
+        Ok(dict)
+    }
+
+    /// Load state from a dictionary
+    fn load_state_dict(&mut self, state_dict: &PyDict) -> PyResult<()> {
+        self.base_loader.load_state_dict(state_dict)?;
+        if let Ok(Some(item)) = state_dict.get_item("batch_size") {
+            if let Ok(batch_size) = item.extract::<usize>() {
+                self.batch_size = batch_size;
+            }
+        }
+        Ok(())
     }
 }
 
