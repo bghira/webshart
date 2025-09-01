@@ -390,8 +390,10 @@ impl PyTarDataLoader {
 
             let url_clone = url.clone();
             let runtime_clone = self.runtime.clone();
-            eprintln!("Attempting to download from URL: {}", url_clone);
-            eprintln!("Token present: {}", token.is_some());
+            if debug {
+                eprintln!("Attempting to download from URL: {}", url_clone);
+                eprintln!("Token present: {}", token.is_some());
+            }
 
             // Spawn task to stream chunks
             let stream_handle = std::thread::spawn(move || {
