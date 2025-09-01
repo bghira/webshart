@@ -66,6 +66,7 @@ Use as a DataLoader:
     # Discover dataset
     dataset = discover_dataset('NebulaeWis/e621-2024-webp-4Mpixel', hf_token=hf_token)
     loader = TarDataLoader(dataset, hf_token=hf_token)
+    # if you have to resume from a certain point, it won't waste your time or bandwidth:
     #loader.shard(idx=0)                    # set to a specific shard to begin from
     loader.skip(shard_idx=0, cursor_idx=0)  # -or- set the shard *and* a cursor position (file index) to resume from
 
