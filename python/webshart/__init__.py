@@ -388,7 +388,7 @@ def main():
     extract_parser.add_argument(
         "--include-image-geometry",
         action="store_true",
-        help="Include image geometry (width, height, aspect ratio) in metadata extraction"
+        help="Include image geometry (width, height, aspect ratio) in metadata extraction",
     )
 
     args = parser.parse_args()
