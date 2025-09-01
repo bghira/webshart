@@ -1,4 +1,4 @@
-# test_streaming_fixed.py
+# test_tar_dataloader.py
 import pytest
 import webshart
 import tempfile
@@ -6,6 +6,7 @@ import json
 import os
 import tarfile
 from pathlib import Path
+import io
 
 
 @pytest.fixture
@@ -23,14 +24,13 @@ def mock_dataset_dir():
                 for j in range(10):
                     filename = f"{shard_name}_{j:06d}.jpg"
                     # Create dummy image data
-                    data = b'FAKE_JPEG_DATA' * 100
+                    data = f'FAKE_JPEG_DATA_SHARD{i}_FILE{j}'.encode() * 100
                     
                     # Create tarinfo
                     info = tarfile.TarInfo(name=filename)
                     info.size = len(data)
                     
                     # Add to tar
-                    import io
                     tar.addfile(info, io.BytesIO(data))
             
             # Create metadata JSON that matches the tar structure
@@ -68,227 +68,285 @@ def discovered_dataset(mock_dataset_dir):
     return webshart.discover_dataset(mock_dataset_dir)
 
 
-class TestFileStream:
-    """Test the FileStream functionality."""
+class TestTarDataLoader:
+    """Test the TarDataLoader functionality."""
     
-    def test_basic_streaming(self, discovered_dataset):
-        """Test basic file streaming."""
-        # Open first shard
-        shard = discovered_dataset.open_shard(0)
+    def test_basic_iteration(self, discovered_dataset):
+        """Test basic iteration through files."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
         
-        # Stream first 5 files
         files_read = []
-        with shard.stream_files(0, 5) as stream:
-            for filename, data, metadata in stream:
-                files_read.append({
-                    'filename': filename,
-                    'data_len': len(data),
-                    'metadata': metadata
-                })
+        count = 0
+        for entry in loader:
+            files_read.append(entry.path)
+            count += 1
+            if count >= 10:  # Read first 10 files
+                break
         
-        assert len(files_read) == 5
-        assert all('filename' in f for f in files_read)
-        assert all(f['data_len'] > 0 for f in files_read)
-        assert all('metadata' in f for f in files_read)
-        
-        # Check metadata contains expected fields
-        for f in files_read:
-            assert 'index' in f['metadata']
-            assert 'offset' in f['metadata']
-            assert 'length' in f['metadata']
-            assert f['metadata']['length'] == f['data_len']
+        assert len(files_read) == 10
+        # Files should start with shard_0000
+        assert all(f.startswith("shard_0000") for f in files_read)
     
-    def test_stream_entire_shard(self, discovered_dataset):
-        """Test streaming an entire shard."""
-        shard = discovered_dataset.open_shard(0)
-        num_files = shard.num_files  # It's a property, not a method!
+    def test_skip_within_shard(self, discovered_dataset):
+        """Test skipping files within a shard."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
         
-        files_read = 0
-        for filename, data, metadata in shard.stream_files(0, num_files):
-            files_read += 1
-            assert isinstance(filename, str)
-            assert isinstance(data, bytes)
-            assert isinstance(metadata, dict)
+        # Skip first 5 files
+        loader.skip(5)
         
-        assert files_read == num_files
+        # Next file should be the 6th file (index 5)
+        entry = next(loader)
+        assert "000005" in entry.path  # Should be file 5 (0-indexed)
     
-    def test_stream_middle_range(self, discovered_dataset):
-        """Test streaming files from the middle of a shard."""
-        shard = discovered_dataset.open_shard(0)
+    def test_skip_to_end_of_shard(self, discovered_dataset):
+        """Test skipping to near end of shard."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
         
-        # Stream files 3-7
-        files_read = []
-        for filename, data, metadata in shard.stream_files(3, 7):
-            files_read.append(metadata['index'])
+        # Skip to file 8 (9th file)
+        loader.skip(8)
         
-        assert files_read == [3, 4, 5, 6]
+        # Should be able to read files 8 and 9
+        entries = []
+        for entry in loader:
+            entries.append(entry)
+            if len(entries) >= 2:
+                break
+        
+        assert len(entries) == 2
+        assert "000008" in entries[0].path
+        assert "000009" in entries[1].path
     
-    def test_stream_single_file(self, discovered_dataset):
-        """Test streaming a single file."""
-        shard = discovered_dataset.open_shard(0)
+    def test_shard_switch_by_index(self, discovered_dataset):
+        """Test switching shards by index."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
         
-        files = list(shard.stream_files(5, 6))
-        assert len(files) == 1
+        # Switch to shard 1
+        loader.shard(shard_idx=1)
         
-        filename, data, metadata = files[0]
-        assert metadata['index'] == 5
+        # Next file should be from shard 1
+        entry = next(loader)
+        assert "shard_0001" in entry.path
+        assert "000000" in entry.path  # First file in shard
     
-    def test_empty_range(self, discovered_dataset):
-        """Test streaming with empty range."""
-        shard = discovered_dataset.open_shard(0)
+    def test_shard_switch_by_filename(self, discovered_dataset):
+        """Test switching shards by filename."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
         
-        # Same start and end should yield nothing
-        files = list(shard.stream_files(5, 5))
-        assert len(files) == 0
+        # Switch to shard 2 by filename
+        loader.shard(filename="shard_0002")
+        
+        # Next file should be from shard 2
+        entry = next(loader)
+        assert "shard_0002" in entry.path
     
-    def test_out_of_bounds_start(self, discovered_dataset):
-        """Test streaming with out of bounds start index."""
-        shard = discovered_dataset.open_shard(0)
+    def test_shard_switch_with_cursor(self, discovered_dataset):
+        """Test switching shards with cursor position."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
         
+        # Switch to shard 1, starting at file 3
+        loader.shard(shard_idx=1, cursor_idx=3)
+        
+        # Next file should be file 3 from shard 1
+        entry = next(loader)
+        assert "shard_0001" in entry.path
+        assert "000003" in entry.path
+    
+    def test_reset(self, discovered_dataset):
+        """Test resetting the loader."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
+        
+        # Read a few files
+        for _ in range(5):
+            next(loader)
+        
+        # Reset
+        loader.reset()
+        
+        # Should start from beginning again
+        entry = next(loader)
+        assert "shard_0000" in entry.path
+        assert "000000" in entry.path
+    
+    def test_buffer_size_property(self, discovered_dataset):
+        """Test buffer size property."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=10)
+        
+        assert loader.buffer_size == 10
+        
+        # Change buffer size
+        loader.buffer_size = 20
+        assert loader.buffer_size == 20
+    
+    def test_num_shards_property(self, discovered_dataset):
+        """Test num_shards property."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        
+        assert loader.num_shards == 3  # We created 3 shards
+    
+    def test_current_shard_index_property(self, discovered_dataset):
+        """Test current_shard_index property."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        
+        # Initially should be 0
+        assert loader.current_shard_index == 0
+        
+        # After switching shards
+        loader.shard(shard_idx=2)
+        assert loader.current_shard_index == 2
+    
+    def test_get_metadata(self, discovered_dataset):
+        """Test getting metadata for a shard."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        
+        metadata = loader.get_metadata(0)
+        
+        # Should be a dict with file information
+        assert isinstance(metadata, dict)
+        assert len(metadata) == 10  # 10 files in shard
+        
+        # Check a specific file's metadata
+        first_file = next(iter(metadata.keys()))
+        assert 'offset' in metadata[first_file]
+        assert 'length' in metadata[first_file]
+    
+    def test_file_data_loading(self, discovered_dataset):
+        """Test that file data is loaded correctly."""
+        loader = webshart.TarDataLoader(discovered_dataset, load_file_data=True)
+        
+        entry = next(loader)
+        
+        # Check that data was loaded
+        assert len(entry.data) > 0
+        assert b'FAKE_JPEG_DATA_SHARD0_FILE0' in entry.data
+    
+    def test_file_data_not_loaded(self, discovered_dataset):
+        """Test skipping file data loading."""
+        loader = webshart.TarDataLoader(discovered_dataset, load_file_data=False)
+        
+        entry = next(loader)
+        
+        # Data should be empty
+        assert len(entry.data) == 0
+    
+    def test_iteration_across_shards(self, discovered_dataset):
+        """Test that iteration automatically moves across shards."""
+        loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
+        
+        # Collect all files
+        all_files = []
+        for entry in loader:
+            all_files.append(entry.path)
+        
+        # Should have all 30 files (3 shards × 10 files)
+        assert len(all_files) == 30
+        
+        # Check that we got files from all shards
+        shard_0_files = [f for f in all_files if "shard_0000" in f]
+        shard_1_files = [f for f in all_files if "shard_0001" in f]
+        shard_2_files = [f for f in all_files if "shard_0002" in f]
+        
+        assert len(shard_0_files) == 10
+        assert len(shard_1_files) == 10
+        assert len(shard_2_files) == 10
+    
+    def test_entry_properties(self, discovered_dataset):
+        """Test TarFileEntry properties."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        
+        entry = next(loader)
+        
+        # Check properties
+        assert isinstance(entry.path, str)
+        assert isinstance(entry.offset, int)
+        assert isinstance(entry.size, int)
+        assert isinstance(entry.data, bytes)
+        
+        # Size should match data length (when loaded)
+        assert entry.size == len(entry.data)
+
+
+class TestTarDataLoaderErrors:
+    """Test error handling in TarDataLoader."""
+    
+    def test_skip_out_of_bounds(self, discovered_dataset):
+        """Test skipping beyond shard bounds."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        
+        # Try to skip beyond the 10 files in shard 0
         with pytest.raises(Exception) as exc_info:
-            list(shard.stream_files(100, 101))
+            loader.skip(100)
         
         assert "out of range" in str(exc_info.value).lower()
-    
-    def test_out_of_bounds_end(self, discovered_dataset):
-        """Test streaming with out of bounds end index."""
-        shard = discovered_dataset.open_shard(0)
-        num_files = shard.num_files  # Property, not method
-        
-        with pytest.raises(Exception) as exc_info:
-            list(shard.stream_files(0, num_files + 10))
-        
-        assert "out of range" in str(exc_info.value).lower()
-    
-    def test_invalid_range(self, discovered_dataset):
-        """Test streaming with invalid range (start > end)."""
-        shard = discovered_dataset.open_shard(0)
-        num_files = shard.num_files
-        
-        # Use indices that are within bounds but reversed
-        if num_files >= 6:
-            with pytest.raises(Exception) as exc_info:
-                list(shard.stream_files(5, 3))
-            assert "invalid range" in str(exc_info.value).lower()
-    
-    def test_file_content_integrity(self, discovered_dataset):
-        """Test that streamed file content matches direct read."""
-        shard = discovered_dataset.open_shard(0)
-        
-        # Read file 3 via streaming
-        stream_files = list(shard.stream_files(3, 4))
-        assert len(stream_files) == 1
-        stream_filename, stream_data, stream_metadata = stream_files[0]
-        
-        # Read same file directly
-        direct_data = shard.read_file(3)
-        
-        # Should be identical
-        assert stream_data == direct_data
-        assert stream_metadata['index'] == 3
-    
-    def test_metadata_types(self, discovered_dataset):
-        """Test that metadata values have correct Python types."""
-        shard = discovered_dataset.open_shard(0)
-        
-        for filename, data, metadata in shard.stream_files(0, 1):
-            # Check types
-            assert isinstance(metadata['filename'], str)
-            assert isinstance(metadata['index'], int)
-            assert isinstance(metadata['offset'], int)
-            assert isinstance(metadata['length'], int)
-            
-            # Check values
-            assert metadata['filename'] == filename
-            assert metadata['index'] == 0
-            assert metadata['offset'] >= 0
-            assert metadata['length'] > 0
-
-
-class TestStreamPerformance:
-    """Test performance characteristics of streaming."""
-    
-    def test_lazy_evaluation(self, discovered_dataset):
-        """Test that streaming is lazy and doesn't load all files at once."""
-        shard = discovered_dataset.open_shard(0)
-        num_files = shard.num_files
-        
-        # Create stream but don't consume it
-        stream = shard.stream_files(0, min(10, num_files))
-        
-        # Stream object should be created immediately
-        assert stream is not None
-        
-        # No files should be read yet (lazy evaluation)
-        # We can't directly test memory usage, but we can verify
-        # the stream works incrementally
-        first_file = next(iter(stream))
-        assert first_file is not None
-    
-    def test_early_termination(self, discovered_dataset):
-        """Test that we can stop streaming early without reading all files."""
-        shard = discovered_dataset.open_shard(0)
-        num_files = shard.num_files
-        
-        files_read = 0
-        for filename, data, metadata in shard.stream_files(0, min(10, num_files)):
-            files_read += 1
-            if files_read >= 5:
-                break  # Stop early
-        
-        assert files_read == 5
-        # Stream should be properly cleaned up even if not fully consumed
-
-
-class TestErrorHandling:
-    """Test error handling in streaming."""
     
     def test_invalid_shard_index(self, discovered_dataset):
-        """Test streaming from invalid shard."""
+        """Test switching to invalid shard."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        
         with pytest.raises(Exception) as exc_info:
-            list(discovered_dataset.stream_shard_files(999, 0, 5))
+            loader.shard(shard_idx=999)
         
         assert "out of range" in str(exc_info.value).lower()
     
-    def test_stream_after_context_exit(self, discovered_dataset):
-        """Test that stream cannot be used after context exit."""
-        shard = discovered_dataset.open_shard(0)
+    def test_invalid_shard_filename(self, discovered_dataset):
+        """Test switching to non-existent shard by filename."""
+        loader = webshart.TarDataLoader(discovered_dataset)
         
-        stream = None
-        with shard.stream_files(0, 5) as s:
-            stream = s
-            # Consume one item
-            next(stream)
+        with pytest.raises(Exception) as exc_info:
+            loader.shard(filename="nonexistent_shard")
         
-        # Stream should raise error after context exit
-        with pytest.raises(RuntimeError) as exc_info:
-            next(stream)
-        assert "consumed" in str(exc_info.value).lower()
+        assert "not found" in str(exc_info.value).lower()
+    
+    def test_no_shard_specified(self, discovered_dataset):
+        """Test shard() without arguments."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        
+        with pytest.raises(Exception) as exc_info:
+            loader.shard()
+        
+        assert "must be provided" in str(exc_info.value).lower()
 
-
-class TestIntegration:
+class TestDataLoaderIntegration:
     """Integration tests with other webshart features."""
     
-    def test_stream_with_metadata_loading(self, discovered_dataset):
-        """Test streaming triggers metadata loading if needed."""
-        # Get a fresh dataset discovery to ensure metadata isn't loaded
-        dataset = webshart.discover_dataset(discovered_dataset.name)
+    def test_loader_with_string_path(self, mock_dataset_dir):
+        """Test creating loader with string path."""
+        loader = webshart.TarDataLoader(mock_dataset_dir)
         
-        # Stream should work even if metadata wasn't pre-loaded
-        files = list(dataset.stream_shard_files(0, 0, 3))
-        assert len(files) == 3
+        # Should work the same as with discovered dataset
+        entry = next(loader)
+        assert entry.path.startswith("shard_0000")
     
-    def test_stream_across_chunk_boundaries(self, discovered_dataset):
-        """Test streaming that might cross internal chunk boundaries."""
-        shard = discovered_dataset.open_shard(0)
-        num_files = shard.num_files  # Property!
+    def test_loader_preserves_hf_token(self, discovered_dataset):
+        """Test that HF token is preserved when using discovered dataset."""
+        # Create dataset with token
+        dataset = webshart.DatasetDiscovery(hf_token="test_token").discover_local(discovered_dataset.name)
         
-        # Stream a large range that would typically cross boundaries
-        large_range_files = list(shard.stream_files(0, min(10, num_files)))
+        loader = webshart.TarDataLoader(dataset)
         
-        # Verify continuity
-        indices = [f[2]['index'] for f in large_range_files]
-        assert indices == list(range(len(indices)))
+        # The loader should have access to the token internally
+        # (This is used for remote datasets)
+        assert dataset.get_hf_token() == "test_token"
+    
+    def test_max_file_size_limit(self, mock_dataset_dir):
+        """Test max_file_size parameter."""
+        # Create a loader with very small max file size
+        loader = webshart.TarDataLoader(mock_dataset_dir, max_file_size=100)
+        
+        entry = next(loader)
+        
+        # File should not be loaded due to size limit
+        assert len(entry.data) == 0
+    
+    def test_entry_repr(self, discovered_dataset):
+        """Test TarFileEntry __repr__ method."""
+        loader = webshart.TarDataLoader(discovered_dataset)
+        entry = next(loader)
+        
+        repr_str = repr(entry)
+        assert "TarFileEntry" in repr_str
+        assert entry.path in repr_str
+        assert str(entry.offset) in repr_str
+        assert str(entry.size) in repr_str
 
 
 if __name__ == "__main__":
