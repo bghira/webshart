@@ -75,8 +75,14 @@ pub struct ShardMetadata {
     files: Vec<FileInfoInternal>, // Internal storage with guaranteed path
 }
 
-/// Internal file info with guaranteed path
-#[derive(Debug, Clone)]
+impl ShardMetadata {
+    /// Get files as a vector of FileInfo
+    pub fn files(&self) -> Vec<FileInfo> {
+        self.files.iter().map(FileInfo::from).collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct FileInfoInternal {
     pub path: String,
     pub offset: u64,
@@ -100,6 +106,7 @@ impl From<FileInfo> for FileInfoInternal {
         }
     }
 }
+
 impl From<&FileInfoInternal> for FileInfo {
     fn from(info: &FileInfoInternal) -> Self {
         Self {

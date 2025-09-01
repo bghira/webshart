@@ -1223,6 +1223,10 @@ impl PyDiscoveredDataset {
         )))
     }
 
+    fn get_hf_token(&self) -> Option<String> {
+        self.inner.discovery_token.clone()
+    }
+
     fn print_summary(&mut self, detailed: Option<bool>) -> PyResult<()> {
         let detailed = detailed.unwrap_or(false);
 

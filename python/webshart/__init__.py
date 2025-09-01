@@ -13,6 +13,7 @@ from webshart._webshart import (
     DiscoveredDataset,
     BatchOperations,
     MetadataExtractor,
+    TarDataLoader,
 )
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "DatasetDiscovery",
     "DiscoveredDataset",
     "MetadataExtractor",
+    "TarDataLoader",
     "discover_dataset",
     "discover_dataset_async",
     "AsyncDatasetDiscovery",

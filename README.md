@@ -54,6 +54,29 @@ for i, data in enumerate(byte_list):
 
 ## Common Patterns
 
+Use as a DataLoader:
+
+```py
+    from webshart import TarDataLoader, discover_dataset
+    from huggingface_hub import get_token, whoami
+
+    print(f"\n📊 Benchmarking streaming dataloader (TarDataLoader)...")
+    hf_token = get_token()
+
+    # Discover dataset
+    dataset = discover_dataset('NebulaeWis/e621-2024-webp-4Mpixel', hf_token=hf_token)
+    loader = TarDataLoader(dataset, hf_token=hf_token)
+
+    processed = 0
+
+    for entry in loader:
+        print(f"   Processing {entry.path}, size: {format_bytes(entry.size)}")
+        data = entry.data
+        processed += 1
+        if processed >= 100:
+            break
+```
+
 Retrieve ranges in parallel without streaming:
 
 ```python
