@@ -19,6 +19,7 @@ Webshart is a fast reader for webdataset tar files with separate JSON index file
 - **True parallelism**: Read from multiple shards simultaneously
 - **Cloud-optimized**: Works efficiently with HTTP range requests
 - **Aspect bucketing**: Optionally include image geometry hints `width`, `height` and `aspect` for the ability to bucket by shape
+- **Custom DataLoader**: Includes state dict methods on the DataLoader so that you can resume training deterministically
 
 **Performance**: 10-20x faster for random access, 5-10x faster for batch reads compared to standard tar extraction.
 
@@ -54,76 +55,11 @@ for i, data in enumerate(byte_list):
 
 ## Common Patterns
 
-Use as a DataLoader:
+- [Use as a DataLoader](/examples/dataloader.py)
+- [Retrieve data subset/range](/examples/retrieve_range.py)
+- [Get dataset statistics without downloading](/examples/dataset_stats.py)
 
-```py
-    from webshart import TarDataLoader, discover_dataset
-    from huggingface_hub import get_token, whoami
-
-    print(f"\n📊 Benchmarking streaming dataloader (TarDataLoader)...")
-    hf_token = get_token()
-
-    # Discover dataset
-    dataset = discover_dataset('NebulaeWis/e621-2024-webp-4Mpixel', hf_token=hf_token)
-    loader = TarDataLoader(dataset, hf_token=hf_token)
-    # if you have to resume from a certain point, it won't waste your time or bandwidth:
-    #loader.shard(idx=0)                    # set to a specific shard to begin from
-    loader.skip(shard_idx=0, cursor_idx=0)  # -or- set the shard *and* a cursor position (file index) to resume from
-
-    processed = 0
-
-    for entry in loader:
-        print(f"   Processing {entry.path}, size: {format_bytes(entry.size)}")
-        data = entry.data
-        processed += 1
-        if processed >= 100:
-            break
-```
-
-Retrieve ranges in parallel without streaming:
-
-```python
-# Read files 0-100 from each of the first 10 shards
-requests = []
-for shard_idx in range(10):
-    for file_idx in range(100):
-        requests.append((shard_idx, file_idx))
-
-# Batch read in chunks of 500 files
-for chunk_idx, i in enumerate(range(0, len(requests), 500)):
-    byte_list = webshart.read_files_batch(dataset, requests[i:i+500])
-    for j, data in enumerate(byte_list):
-        if data:  # process successful reads
-            # Save with meaningful names
-            shard, file = requests[i+j]
-            with open(f"shard_{shard:04d}_file_{file:04d}.webp", "wb") as f:
-                f.write(data)
-```
-
-> ⚠️ This method uses several parallel connections to the source dataset, which will result in **429 Too Many Requests** responses from providers like Hugging Face Hub. It is intended for low-volume IO, with better solutions on the way for extended streaming.
-
-Get dataset statistics without downloading:
-
-```python
-# Quick stats (instant, uses cached values if available)
-stats = dataset.get_stats()
-print(f"Total shards: {stats['total_shards']}")
-print(f"Estimated total files: {stats.get('total_files', 'Unknown')}")
-
-# Detailed stats (loads all metadata)
-detailed = dataset.get_detailed_stats()
-print(f"Exact total files: {detailed['total_files']:,}")
-print(f"Average files per shard: {detailed['average_files_per_shard']:.1f}")
-
-# Pretty print summary
-dataset.print_summary(detailed=True)
-
-# Get info for specific shard
-file_count = dataset.get_shard_file_count(0)
-shard_info = dataset.get_shard_by_name('shard-0042')
-```
-
-## Creating Indices for Existing Datasets
+## Creating Indices for / Converting Existing Datasets
 
 Any tar-based webdataset can benefit from indexing! Webshart includes tools to generate indices:
 
@@ -138,22 +74,7 @@ A command-line tool that auto-discovers tars to process:
     --include-image-geometry
 ```
 
-Or, if you prefer/require direct-integration to an existing Python application, use the API:
-
-```python
-from webshart import MetadataExtractor
-
-# Create an extractor (optionally with HF token for private datasets)
-extractor = MetadataExtractor(hf_token="hf_...")
-
-# Generate indices for a dataset
-extractor.extract_metadata(
-    source="username/dataset-name",  # HF dataset or local path
-    destination="./indices/",        # Where to save JSON files
-    max_workers=4,                   # Parallel processing
-    include_image_geometry=True,     # Not much slower, but far more useful
-)
-```
+Or, if you prefer/require direct-integration to an existing Python application, [use the API](/examples/metadata_extractor.py)
 
 ### Uploading Indices to HuggingFace
 
@@ -209,32 +130,6 @@ results = processor.process_dataset(
 )
 ```
 
-## Advanced
-
-Local dataset:
-
-```python
-dataset = webshart.discover_dataset("/path/to/shards/")
-```
-
-Custom auth:
-
-```python
-# Pass token directly
-dataset = webshart.discover_dataset("private/dataset", hf_token="hf_...")
-
-# Or use your existing HF token from huggingface_hub
-from huggingface_hub import get_token
-token = get_token()
-dataset = webshart.discover_dataset("private/dataset", hf_token=token)
-```
-
-Async interface (if you're already in async code):
-
-```python
-dataset = await webshart.discover_dataset_async("NebulaeWis/e621-2024-webp-4Mpixel")
-```
-
 ## Why is it fast?
 
 **Problem**: Standard tar files require sequential reading. To get file #10,000, you must read through files #1-9,999 first.
@@ -254,6 +149,8 @@ The Rust implementation provides:
 - Optimized tokio async runtime
 
 ## Datasets Using This Format
+
+I discovered after creating this library that [cheesechaser](https://github.com/deepghs/cheesechaser) is the origin of the indexed tar format, which webshart has formalised and extended to include aspect bucketing support.
 
 - `NebulaeWis/e621-2024-webp-4Mpixel`
 - `picollect/danbooru2` (subfolder: `images`)
