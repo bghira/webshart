@@ -1,6 +1,5 @@
 <img width="1530" height="492" alt="image" src="https://github.com/user-attachments/assets/ebf0d101-eae7-4908-bb73-a264bf89a479" />
 
-
 Fast parallel reader for webdataset tar shards. Rust core with Python bindings. Built for streaming large video and image datasets, but handles any byte data.
 
 ## Install
@@ -75,12 +74,25 @@ for chunk_idx, i in enumerate(range(0, len(requests), 500)):
                 f.write(data)
 ```
 
-Quick dataset stats:
+Get dataset statistics without downloading:
 
 ```python
-# Without downloading anything
-size, num_files = dataset.quick_stats()
-print(f"Dataset size: {size / 1e9:.1f} GB")
+# Quick stats (instant, uses cached values if available)
+stats = dataset.get_stats()
+print(f"Total shards: {stats['total_shards']}")
+print(f"Estimated total files: {stats.get('total_files', 'Unknown')}")
+
+# Detailed stats (loads all metadata)
+detailed = dataset.get_detailed_stats()
+print(f"Exact total files: {detailed['total_files']:,}")
+print(f"Average files per shard: {detailed['average_files_per_shard']:.1f}")
+
+# Pretty print summary
+dataset.print_summary(detailed=True)
+
+# Get info for specific shard
+file_count = dataset.get_shard_file_count(0)
+shard_info = dataset.get_shard_by_name('shard-0042')
 ```
 
 ## Creating Indices for Existing Datasets
@@ -88,6 +100,7 @@ print(f"Dataset size: {size / 1e9:.1f} GB")
 Any tar-based webdataset can benefit from indexing! Webshart includes tools to generate indices:
 
 A command-line tool that auto-discovers tars to process:
+
 ```bash
 % webshart extract-metadata \
     --source laion/conceptual-captions-12m-webdataset \
@@ -98,6 +111,7 @@ A command-line tool that auto-discovers tars to process:
 ```
 
 Or, if you prefer/require direct-integration to an existing Python application, use the API:
+
 ```python
 from webshart import MetadataExtractor
 

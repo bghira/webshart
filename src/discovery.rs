@@ -1082,6 +1082,219 @@ impl PyDiscoveredDataset {
         Ok(PyShardReader { inner: reader })
     }
 
+    fn get_shard_file_count(&mut self, shard_index: usize) -> PyResult<usize> {
+        if shard_index >= self.inner.shards.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Shard index {} out of range. Dataset has {} shards.",
+                shard_index,
+                self.inner.shards.len()
+            )));
+        }
+        self.inner.ensure_shard_metadata(shard_index)?;
+        if let Some(shard) = self.inner.shards.get(shard_index) {
+            if let Some(metadata) = &shard.metadata {
+                Ok(metadata.num_files())
+            } else {
+                Err(pyo3::exceptions::PyValueError::new_err(
+                    "Failed to load shard metadata",
+                ))
+            }
+        } else {
+            Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Shard index {} out of range",
+                shard_index
+            )))
+        }
+    }
+
+    fn get_stats(&mut self) -> PyResult<Py<PyDict>> {
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("total_shards", self.inner.num_shards())?;
+            let (cached_size, cached_files) = self.inner.quick_stats();
+            if let Some(size) = cached_size {
+                dict.set_item("total_size", size)?;
+                dict.set_item("total_size_gb", size as f64 / (1024.0_f64).powi(3))?;
+            }
+            if let Some(files) = cached_files {
+                dict.set_item("total_files", files)?;
+                dict.set_item(
+                    "average_files_per_shard",
+                    files as f64 / self.inner.num_shards() as f64,
+                )?;
+            }
+            // Add a flag indicating if these are cached or computed values
+            dict.set_item(
+                "from_cache",
+                cached_size.is_some() || cached_files.is_some(),
+            )?;
+            let shard_details = PyList::empty(py);
+            for (i, shard) in self.inner.shards.iter().enumerate() {
+                let shard_dict = PyDict::new(py);
+                shard_dict.set_item("index", i)?;
+                shard_dict.set_item("name", &shard.name)?;
+                if let Some(metadata) = &shard.metadata {
+                    shard_dict.set_item("num_files", metadata.num_files())?;
+                    shard_dict.set_item("size", metadata.filesize)?;
+                    shard_dict.set_item("metadata_loaded", true)?;
+                } else {
+                    shard_dict.set_item("metadata_loaded", false)?;
+                }
+                shard_details.append(shard_dict)?;
+            }
+            dict.set_item("shard_details", shard_details)?;
+
+            Ok(dict.into())
+        })
+    }
+
+    fn get_detailed_stats(&mut self) -> PyResult<Py<PyDict>> {
+        self.inner.ensure_all_metadata_loaded()?;
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            let mut total_files = 0usize;
+            let mut total_size = 0u64;
+            let mut min_files = usize::MAX;
+            let mut max_files = 0usize;
+            let shard_details = PyList::empty(py);
+            for (i, shard) in self.inner.shards.iter().enumerate() {
+                if let Some(metadata) = &shard.metadata {
+                    let num_files = metadata.num_files();
+                    let size = metadata.filesize;
+                    total_files += num_files;
+                    total_size += size;
+                    min_files = min_files.min(num_files);
+                    max_files = max_files.max(num_files);
+                    // Create detailed shard info
+                    let shard_dict = PyDict::new(py);
+                    shard_dict.set_item("index", i)?;
+                    shard_dict.set_item("name", &shard.name)?;
+                    shard_dict.set_item("num_files", num_files)?;
+                    shard_dict.set_item("size", size)?;
+                    shard_dict.set_item("size_mb", size as f64 / (1024.0_f64).powi(2))?;
+                    shard_details.append(shard_dict)?;
+                }
+            }
+            let num_shards = self.inner.num_shards();
+            let avg_files = if num_shards > 0 {
+                total_files as f64 / num_shards as f64
+            } else {
+                0.0
+            };
+            let avg_size = if num_shards > 0 {
+                total_size as f64 / num_shards as f64
+            } else {
+                0.0
+            };
+            // Set all statistics
+            dict.set_item("total_shards", num_shards)?;
+            dict.set_item("total_files", total_files)?;
+            dict.set_item("total_size", total_size)?;
+            dict.set_item("total_size_gb", total_size as f64 / (1024.0_f64).powi(3))?;
+            dict.set_item("average_files_per_shard", avg_files)?;
+            dict.set_item("average_size_per_shard", avg_size)?;
+            dict.set_item("average_size_per_shard_mb", avg_size / (1024.0_f64).powi(2))?;
+            dict.set_item(
+                "min_files_in_shard",
+                if min_files == usize::MAX {
+                    0
+                } else {
+                    min_files
+                },
+            )?;
+            dict.set_item("max_files_in_shard", max_files)?;
+            dict.set_item("shard_details", shard_details)?;
+            dict.set_item("from_cache", false)?;
+            Ok(dict.into())
+        })
+    }
+
+    fn get_shard_by_name(&mut self, shard_name: &str) -> PyResult<Py<PyDict>> {
+        for (i, shard) in self.inner.shards.iter().enumerate() {
+            if shard.name == shard_name {
+                return self.get_shard_info(i);
+            }
+        }
+
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Shard '{}' not found in dataset",
+            shard_name
+        )))
+    }
+
+    fn print_summary(&mut self, detailed: Option<bool>) -> PyResult<()> {
+        let detailed = detailed.unwrap_or(false);
+
+        println!("\nDataset Summary: {}", self.inner.name);
+        println!("{}", "=".repeat(50));
+        println!("Total shards: {}", self.inner.num_shards());
+
+        // Try to use cached values first
+        let (cached_size, cached_files) = self.inner.quick_stats();
+
+        if let Some(files) = cached_files {
+            println!("Total files: {} (estimated)", files);
+        }
+        if let Some(size) = cached_size {
+            let size_gb = size as f64 / (1024.0_f64).powi(3);
+            println!("Total size: {:.2} GB", size_gb);
+        }
+        if detailed {
+            println!("\nShard Details:");
+            println!("{}", "-".repeat(50));
+            println!("{:<30} {:<12} {:<10}", "Shard Name", "Size (MB)", "Files");
+            println!("{}", "-".repeat(50));
+
+            let num_shards = self.inner.shards.len();
+            let max_display = if detailed {
+                num_shards
+            } else {
+                10.min(num_shards)
+            };
+
+            for i in 0..max_display {
+                let shard_name = self.inner.shards[i].name.clone();
+                let has_metadata = self.inner.shards[i].metadata.is_some();
+
+                if has_metadata {
+                    let metadata = self.inner.shards[i].metadata.as_ref().unwrap();
+                    let size_mb = metadata.filesize as f64 / (1024.0_f64).powi(2);
+                    println!(
+                        "{:<30} {:<12.2} {:<10}",
+                        shard_name,
+                        size_mb,
+                        metadata.num_files()
+                    );
+                } else if detailed {
+                    if self.inner.ensure_shard_metadata(i).is_ok() {
+                        if let Some(metadata) = &self.inner.shards[i].metadata {
+                            let size_mb = metadata.filesize as f64 / (1024.0_f64).powi(2);
+                            println!(
+                                "{:<30} {:<12.2} {:<10}",
+                                shard_name,
+                                size_mb,
+                                metadata.num_files()
+                            );
+                        } else {
+                            println!("{:<30} {:<12} {:<10}", shard_name, "error", "error");
+                        }
+                    } else {
+                        println!("{:<30} {:<12} {:<10}", shard_name, "error", "error");
+                    }
+                } else {
+                    println!("{:<30} {:<12} {:<10}", shard_name, "?", "?");
+                }
+            }
+
+            if num_shards > max_display {
+                println!("... and {} more shards", num_shards - max_display);
+            }
+        }
+
+        Ok(())
+    }
+
     fn __repr__(&self) -> String {
         // Don't call total_files/total_size to avoid loading all metadata
         format!(
@@ -1093,7 +1306,6 @@ impl PyDiscoveredDataset {
     }
 }
 
-/// Python wrapper for ShardReader
 #[pyclass(name = "ShardReader")]
 pub struct PyShardReader {
     inner: ShardReader,
