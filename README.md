@@ -54,7 +54,7 @@ for i, data in enumerate(byte_list):
 
 ## Common Patterns
 
-Stream a subset efficiently:
+Retrieve ranges in parallel without streaming:
 
 ```python
 # Read files 0-100 from each of the first 10 shards
@@ -73,6 +73,8 @@ for chunk_idx, i in enumerate(range(0, len(requests), 500)):
             with open(f"shard_{shard:04d}_file_{file:04d}.webp", "wb") as f:
                 f.write(data)
 ```
+
+> ⚠️ This method uses several parallel connections to the source dataset, which will result in **429 Too Many Requests** responses from providers like Hugging Face Hub. It is intended for low-volume IO, with better solutions on the way for extended streaming.
 
 Get dataset statistics without downloading:
 
