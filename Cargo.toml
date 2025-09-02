@@ -36,6 +36,7 @@ indicatif = "0.18.0"
 imagesize = "0.14.0"
 rayon = "1.11.0"
 pythonize = "0.20.0"
+anyhow = "1.0.99"
 
 [dev-dependencies]
 tempfile = "3"

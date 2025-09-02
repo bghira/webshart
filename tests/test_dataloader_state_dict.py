@@ -83,7 +83,7 @@ class TestTarDataLoaderStateDict:
         assert state["current_shard"] == 0
         assert state["current_file_index"] == 3
         assert state["buffer_size"] == 5
-        assert state["version"] == 1
+        assert state["version"] == 2
         assert "source" in state
         assert "num_shards" in state
 
