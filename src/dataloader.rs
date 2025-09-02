@@ -1,10 +1,8 @@
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tar::Archive;
 use tokio::runtime::Runtime;
 
 /// Python wrapper for a file entry from a TAR
@@ -56,7 +54,8 @@ pub struct PyTarDataLoader {
     current_shard: usize,
     entry_buffer: Vec<PyTarFileEntry>,
     buffer_position: usize,
-    buffer_size: usize, // How many entries to load at once
+    buffer_size: usize,      // How many entries to load at once
+    chunk_size_bytes: usize, // NEW: Size of byte chunks to stream
     load_file_data: bool,
     max_file_size: u64,
     // Tracks the global file index within the current shard
@@ -70,13 +69,14 @@ pub struct PyTarDataLoader {
 #[pymethods]
 impl PyTarDataLoader {
     #[new]
-    #[pyo3(signature = (dataset_or_path, load_file_data=true, max_file_size=50_000_000, buffer_size=100, hf_token=None))]
+    #[pyo3(signature = (dataset_or_path, load_file_data=true, max_file_size=50_000_000, buffer_size=100, hf_token=None, chunk_size_mb=10))]
     fn new(
         dataset_or_path: &PyAny,
         load_file_data: bool,
         max_file_size: u64,
         buffer_size: usize,
         hf_token: Option<String>,
+        chunk_size_mb: usize, // NEW: Chunk size in MB
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().expect("Failed to create runtime"));
 
@@ -109,6 +109,7 @@ impl PyTarDataLoader {
             entry_buffer: Vec::with_capacity(buffer_size),
             buffer_position: 0,
             buffer_size: buffer_size.max(1),
+            chunk_size_bytes: chunk_size_mb * 1024 * 1024, // Convert MB to bytes
             load_file_data,
             max_file_size,
             next_file_to_load: 0,
@@ -129,7 +130,6 @@ impl PyTarDataLoader {
             // next_file_to_load - (total files in buffer - files already consumed)
             let total_in_buffer = self.entry_buffer.len();
             let consumed = self.buffer_position;
-            let unread_in_buffer = total_in_buffer - consumed;
 
             // The actual current position is where we started loading the buffer
             // plus how many we've consumed
@@ -143,6 +143,7 @@ impl PyTarDataLoader {
 
         // Configuration
         dict.set_item("buffer_size", self.buffer_size)?;
+        dict.set_item("chunk_size_mb", self.chunk_size_bytes / (1024 * 1024))?;
         dict.set_item("load_file_data", self.load_file_data)?;
         dict.set_item("max_file_size", self.max_file_size)?;
         dict.set_item("source", &self.source)?;
@@ -154,7 +155,7 @@ impl PyTarDataLoader {
         dict.set_item("is_remote", dataset.is_remote)?;
 
         // Version for future compatibility
-        dict.set_item("version", 1)?;
+        dict.set_item("version", 2)?;
 
         Ok(dict.into())
     }
@@ -164,7 +165,7 @@ impl PyTarDataLoader {
         // Validate version
         if let Ok(Some(version_item)) = state_dict.get_item("version") {
             if let Ok(version) = version_item.extract::<i32>() {
-                if version != 1 {
+                if version > 2 {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                         "Unsupported state dict version: {}",
                         version
@@ -192,6 +193,11 @@ impl PyTarDataLoader {
         if let Ok(Some(item)) = state_dict.get_item("buffer_size") {
             if let Ok(v) = item.extract::<usize>() {
                 self.buffer_size = v.max(1);
+            }
+        }
+        if let Ok(Some(item)) = state_dict.get_item("chunk_size_mb") {
+            if let Ok(v) = item.extract::<usize>() {
+                self.chunk_size_bytes = v * 1024 * 1024;
             }
         }
         if let Ok(Some(item)) = state_dict.get_item("load_file_data") {
@@ -244,6 +250,10 @@ impl PyTarDataLoader {
             Some(item) => item.extract::<usize>().unwrap_or(100),
             None => 100,
         };
+        let chunk_size_mb = match state_dict.get_item("chunk_size_mb")? {
+            Some(item) => item.extract::<usize>().unwrap_or(10),
+            None => 10,
+        };
         let hf_token = match state_dict.get_item("hf_token")? {
             Some(item) => item.extract::<Option<String>>().unwrap_or(None),
             None => None,
@@ -269,7 +279,14 @@ impl PyTarDataLoader {
         };
 
         // Create new dataloader
-        let mut loader = Self::new(source, load_file_data, max_file_size, buffer_size, hf_token)?;
+        let mut loader = Self::new(
+            source,
+            load_file_data,
+            max_file_size,
+            buffer_size,
+            hf_token,
+            chunk_size_mb,
+        )?;
 
         // Load the state
         loader.load_state_dict(state_dict)?;
@@ -354,6 +371,11 @@ impl PyTarDataLoader {
     }
 
     #[getter]
+    fn chunk_size_mb(&self) -> usize {
+        self.chunk_size_bytes / (1024 * 1024)
+    }
+
+    #[getter]
     fn load_file_data(&self) -> bool {
         self.load_file_data
     }
@@ -371,6 +393,11 @@ impl PyTarDataLoader {
             self.entry_buffer
                 .reserve(self.buffer_size - self.entry_buffer.capacity());
         }
+    }
+
+    #[setter]
+    fn set_chunk_size_mb(&mut self, size_mb: usize) {
+        self.chunk_size_bytes = size_mb.max(1) * 1024 * 1024;
     }
 
     fn get_metadata(&self, shard_idx: usize, py: Python) -> PyResult<PyObject> {
@@ -632,7 +659,7 @@ impl PyTarDataLoader {
 
         // Load the files
         if is_remote {
-            self.load_files_remote(tar_path, token, file_entries)?;
+            self.load_files_remote_streaming(tar_path, token, file_entries)?;
         } else {
             self.load_files_local(tar_path, file_entries)?;
         }
@@ -691,12 +718,147 @@ impl PyTarDataLoader {
         Ok(())
     }
 
-    fn load_files_remote(
+    fn load_files_remote_streaming(
         &mut self,
         url: String,
         token: Option<String>,
         file_entries: Vec<(String, crate::metadata::FileInfo)>,
     ) -> PyResult<()> {
+        if file_entries.is_empty() {
+            return Ok(());
+        }
+
+        // Calculate the byte range we need to fetch
+        let first_offset = file_entries[0].1.offset;
+        let last_entry = &file_entries[file_entries.len() - 1];
+        let last_end = last_entry.1.offset + last_entry.1.length;
+
+        // Calculate total range size
+        let range_size = last_end - first_offset;
+
+        // If the range is too large, fall back to chunked approach
+        if range_size > self.chunk_size_bytes as u64 {
+            return self.load_files_remote_chunked(url, token, file_entries);
+        }
+
+        // Clone what we need for the async block
+        let load_file_data = self.load_file_data;
+        let max_file_size = self.max_file_size;
+
+        // Perform the fetch in the async block
+        let fetch_result = self.runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("Failed to build client");
+
+            // Fetch the entire range in one request
+            let mut request = client
+                .get(&url)
+                .header("Range", format!("bytes={}-{}", first_offset, last_end - 1));
+
+            if let Some(ref token) = token {
+                request = request.bearer_auth(token);
+            }
+
+            match request.send().await {
+                Ok(response) => {
+                    if response.status().is_success()
+                        || response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                    {
+                        match response.bytes().await {
+                            Ok(bytes) => Ok(bytes.to_vec()),
+                            Err(e) => {
+                                eprintln!("Failed to read response: {}", e);
+                                Err(anyhow::anyhow!(e))
+                            }
+                        }
+                    } else {
+                        eprintln!("HTTP error {}", response.status());
+                        Err(anyhow::anyhow!(format!("HTTP error {}", response.status())))
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Request failed: {}", e);
+                    Err(anyhow::anyhow!(e))
+                }
+            }
+        });
+
+        // Process the result
+        match fetch_result {
+            Ok(data) => {
+                // Extract each file from the downloaded data
+                for (filename, file_info) in file_entries {
+                    let relative_offset = (file_info.offset - first_offset) as usize;
+                    let length = file_info.length as usize;
+
+                    let file_data = if load_file_data
+                        && file_info.length <= max_file_size
+                        && file_info.length > 0
+                        && relative_offset + length <= data.len()
+                    {
+                        data[relative_offset..relative_offset + length].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    self.entry_buffer.push(PyTarFileEntry {
+                        path: filename,
+                        offset: file_info.offset,
+                        size: file_info.length,
+                        data: file_data,
+                    });
+                }
+                Ok(())
+            }
+            Err(_) => {
+                // Fall back to individual requests
+                self.load_files_remote_individual(url, token, file_entries)
+            }
+        }
+    }
+
+    fn load_files_remote_chunked(
+        &mut self,
+        url: String,
+        token: Option<String>,
+        file_entries: Vec<(String, crate::metadata::FileInfo)>,
+    ) -> PyResult<()> {
+        // For very large ranges, process in chunks
+        let mut processed = 0;
+
+        while processed < file_entries.len() {
+            let mut chunk_size = 0u64;
+            let mut chunk_end = processed;
+
+            // Build a chunk up to chunk_size_bytes
+            for i in processed..file_entries.len() {
+                let entry_size = file_entries[i].1.length;
+                if chunk_size + entry_size > self.chunk_size_bytes as u64 && chunk_end > processed {
+                    break;
+                }
+                chunk_size += entry_size;
+                chunk_end = i + 1;
+            }
+
+            // Process this chunk
+            let chunk_entries = file_entries[processed..chunk_end].to_vec();
+            self.load_files_remote_streaming(url.clone(), token.clone(), chunk_entries)?;
+
+            processed = chunk_end;
+        }
+
+        Ok(())
+    }
+
+    fn load_files_remote_individual(
+        &mut self,
+        url: String,
+        token: Option<String>,
+        file_entries: Vec<(String, crate::metadata::FileInfo)>,
+    ) -> PyResult<()> {
+        // Fallback to individual requests (original implementation)
         self.runtime.block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -770,7 +932,7 @@ pub struct PyBatchDataLoader {
 #[pymethods]
 impl PyBatchDataLoader {
     #[new]
-    #[pyo3(signature = (dataset_or_path, batch_size=32, load_file_data=true, max_file_size=50_000_000, entry_buffer_size=1000, hf_token=None))]
+    #[pyo3(signature = (dataset_or_path, batch_size=32, load_file_data=true, max_file_size=50_000_000, entry_buffer_size=1000, hf_token=None, chunk_size_mb=10))]
     fn new(
         dataset_or_path: &PyAny,
         batch_size: usize,
@@ -778,6 +940,7 @@ impl PyBatchDataLoader {
         max_file_size: u64,
         entry_buffer_size: usize,
         hf_token: Option<String>,
+        chunk_size_mb: usize,
     ) -> PyResult<Self> {
         let base_loader = PyTarDataLoader::new(
             dataset_or_path,
@@ -785,6 +948,7 @@ impl PyBatchDataLoader {
             max_file_size,
             entry_buffer_size,
             hf_token,
+            chunk_size_mb,
         )?;
 
         Ok(Self {
