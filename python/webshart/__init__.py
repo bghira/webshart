@@ -1,6 +1,5 @@
-"""Fast and memory-efficient webdataset shard reader with sync and async support."""
+"""Fast and memory-efficient webdataset shard reader with sync and batch support."""
 
-import asyncio
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Any
 import argparse
@@ -23,8 +22,6 @@ __all__ = [
     "MetadataExtractor",
     "TarDataLoader",
     "discover_dataset",
-    "discover_dataset_async",
-    "AsyncDatasetDiscovery",
     "BatchOperations",
     "discover_datasets_batch",
     "read_files_batch",
@@ -64,88 +61,6 @@ def discover_dataset(
     else:
         # Assume it's a HuggingFace repo
         return discovery.discover_huggingface(source, subfolder=subfolder)
-
-
-# Asynchronous convenience function
-async def discover_dataset_async(
-    source: str, hf_token: Optional[str] = None, subfolder: Optional[str] = None
-) -> DiscoveredDataset:
-    """
-    Discover dataset shards from various sources (asynchronous).
-
-    This is the async version of discover_dataset, useful when you're already
-    in an async context and want to avoid blocking the event loop.
-
-    Args:
-        source: Can be:
-            - Local directory path (e.g., '/path/to/dataset/')
-            - HuggingFace dataset repo (e.g., 'username/dataset-name')
-        hf_token: Optional HuggingFace token for private datasets
-        subfolder: Optional subfolder within HuggingFace repo
-
-    Returns:
-        DiscoveredDataset object with all shards discovered
-
-    Example:
-        >>> # In an async function
-        >>> dataset = await discover_dataset_async('NebulaeWis/e621-2024-webp-4Mpixel')
-        >>> print(f"Found {dataset.num_shards} shards")
-    """
-    discovery = DatasetDiscovery(hf_token=hf_token)
-
-    # Check if it's a local path
-    if Path(source).exists() and Path(source).is_dir():
-        # Local discovery is synchronous
-        return discovery.discover_local(source)
-    else:
-        # Use async HuggingFace discovery
-        return await discovery.discover_huggingface_async(source, subfolder=subfolder)
-
-
-# Async wrapper class for convenience
-class AsyncDatasetDiscovery:
-    """
-    Async-first wrapper around DatasetDiscovery.
-
-    This class provides a more ergonomic async API for dataset discovery,
-    especially useful when working in async contexts like web servers.
-
-    Example:
-        >>> async def main():
-        ...     discovery = AsyncDatasetDiscovery()
-        ...     dataset = await discovery.discover('username/dataset')
-        ...     print(f"Found {dataset.num_shards} shards")
-    """
-
-    def __init__(self, hf_token: Optional[str] = None):
-        self._inner = DatasetDiscovery(hf_token=hf_token)
-
-    async def discover(
-        self, source: str, subfolder: Optional[str] = None
-    ) -> DiscoveredDataset:
-        """
-        Discover dataset from any source.
-
-        Automatically detects whether the source is local or remote.
-        """
-        if Path(source).exists() and Path(source).is_dir():
-            return self._inner.discover_local(source)
-        else:
-            return await self._inner.discover_huggingface_async(
-                source, subfolder=subfolder
-            )
-
-    async def discover_huggingface(
-        self, repo_id: str, subfolder: Optional[str] = None
-    ) -> DiscoveredDataset:
-        """Discover dataset from HuggingFace Hub."""
-        return await self._inner.discover_huggingface_async(
-            repo_id, subfolder=subfolder
-        )
-
-    def discover_local(self, path: str) -> DiscoveredDataset:
-        """Discover dataset from local directory (synchronous)."""
-        return self._inner.discover_local(path)
 
 
 # Batch convenience functions
