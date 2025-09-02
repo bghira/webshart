@@ -1,9 +1,27 @@
+use crate::FileInfo;
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::time::sleep;
+
+#[derive(Debug, Clone)]
+pub enum BucketKeyType {
+    Aspect,
+    GeometryTuple,
+    GeometryList,
+}
+
+#[derive(Debug, Clone)]
+pub struct AspectBuckets {
+    pub buckets: BTreeMap<String, Vec<(String, FileInfo)>>,
+    pub shard_idx: usize,
+    pub shard_name: String,
+}
 
 /// Python wrapper for a file entry from a TAR
 #[pyclass(name = "TarFileEntry")]
@@ -543,9 +561,149 @@ impl PyTarDataLoader {
 
         Ok(())
     }
+
+    #[pyo3(signature = (shard_indices, key="aspect", target_resolution=None))]
+    fn list_shard_aspect_buckets(
+        &self,
+        py: Python,
+        shard_indices: Vec<usize>,
+        key: &str,
+        target_resolution: Option<u32>,
+    ) -> PyResult<Vec<PyObject>> {
+        let key_type = match key {
+            "aspect" => BucketKeyType::Aspect,
+            "geometry-tuple" => BucketKeyType::GeometryTuple,
+            "geometry-list" => BucketKeyType::GeometryList,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "key must be 'aspect', 'geometry-tuple', or 'geometry-list'",
+                ));
+            }
+        };
+
+        let results = self.runtime.block_on(async {
+            let mut results = Vec::new();
+
+            for shard_idx in shard_indices {
+                match self
+                    .get_shard_aspect_buckets_internal(
+                        shard_idx,
+                        key_type.clone(),
+                        target_resolution,
+                    )
+                    .await
+                {
+                    Ok(buckets) => results.push(buckets),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            Ok(results)
+        })?;
+
+        // Convert to Python objects
+        let py_results: Vec<PyObject> = results
+            .into_iter()
+            .map(|bucket| {
+                let dict = PyDict::new(py);
+                dict.set_item("shard_idx", bucket.shard_idx).unwrap();
+                dict.set_item("shard_name", bucket.shard_name).unwrap();
+
+                let buckets_dict = PyDict::new(py);
+                for (key, files) in bucket.buckets {
+                    let files_list = pyo3::types::PyList::new(
+                        py,
+                        files.into_iter().map(|(filename, file_info)| {
+                            let file_dict = PyDict::new(py);
+                            file_dict.set_item("filename", filename).unwrap();
+                            file_dict.set_item("offset", file_info.offset).unwrap();
+                            file_dict.set_item("size", file_info.length).unwrap();
+                            if let Some(w) = file_info.width {
+                                file_dict.set_item("width", w).unwrap();
+                            }
+                            if let Some(h) = file_info.height {
+                                file_dict.set_item("height", h).unwrap();
+                            }
+                            if let Some(a) = file_info.aspect {
+                                file_dict.set_item("aspect", a).unwrap();
+                            }
+                            file_dict
+                        }),
+                    );
+                    buckets_dict.set_item(key, files_list).unwrap();
+                }
+
+                dict.set_item("buckets", buckets_dict).unwrap();
+                dict.into()
+            })
+            .collect();
+
+        Ok(py_results)
+    }
+
+    // Generator that yields aspect buckets for all shards
+    fn list_all_aspect_buckets(
+        slf: PyRef<'_, Self>,
+        py: Python,
+        key: Option<&str>,
+        target_resolution: Option<u32>,
+    ) -> PyResult<PyObject> {
+        let key_str = key.unwrap_or("aspect");
+        let key_type = match key_str {
+            "aspect" => BucketKeyType::Aspect,
+            "geometry-tuple" => BucketKeyType::GeometryTuple,
+            "geometry-list" => BucketKeyType::GeometryList,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "key must be 'aspect', 'geometry-tuple', or 'geometry-list'",
+                ));
+            }
+        };
+
+        // Create a generator class
+        let generator_class = py.eval(
+            r#"
+class AspectBucketGenerator:
+    def __init__(self, loader, key_type, target_resolution):
+        self.loader = loader
+        self.key_type = key_type
+        self.target_resolution = target_resolution
+        self.current_shard = 0
+        self.num_shards = loader.num_shards
+        
+    def __iter__(self):
+        return self
+        
+    def __next__(self):
+        if self.current_shard >= self.num_shards:
+            raise StopIteration
+            
+        result = self.loader.list_shard_aspect_buckets(
+            [self.current_shard], 
+            key=self.key_type,
+            target_resolution=self.target_resolution
+        )
+        
+        self.current_shard += 1
+        
+        if result:
+            return result[0]
+        else:
+            raise StopIteration
+            
+AspectBucketGenerator
+"#,
+            None,
+            None,
+        )?;
+
+        // Create instance
+        let instance = generator_class.call1((slf.into_py(py), key_str, target_resolution))?;
+
+        Ok(instance.into())
+    }
 }
 
-// Rest of the implementation remains the same...
 impl PyTarDataLoader {
     fn next_entry(&mut self) -> PyResult<Option<PyTarFileEntry>> {
         // Check if we have entries in the buffer
@@ -920,9 +1078,131 @@ impl PyTarDataLoader {
 
         Ok(())
     }
+
+    async fn get_shard_aspect_buckets_internal(
+        &self,
+        shard_idx: usize,
+        key_type: BucketKeyType,
+        target_resolution: Option<u32>,
+    ) -> PyResult<AspectBuckets> {
+        let mut dataset = self.dataset.lock().unwrap();
+
+        // Ensure metadata is loaded with retry logic
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: u32 = 5;
+
+        loop {
+            match dataset.ensure_shard_metadata(shard_idx) {
+                Ok(_) => break,
+                Err(e) => {
+                    if attempts >= MAX_ATTEMPTS {
+                        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            e.to_string(),
+                        ));
+                    }
+
+                    // Check if it's a rate limit error (429)
+                    if e.to_string().contains("429") || e.to_string().contains("rate") {
+                        attempts += 1;
+                        let wait_time = Duration::from_secs(2u64.pow(attempts));
+                        eprintln!(
+                            "[webshart] Rate limited, waiting {:?} before retry",
+                            wait_time
+                        );
+                        drop(dataset);
+                        sleep(wait_time).await;
+                        dataset = self.dataset.lock().unwrap();
+                    } else {
+                        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            e.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyIndexError, _>(format!(
+                "Shard index {} out of range",
+                shard_idx
+            ))
+        })?;
+
+        let shard_name = shard.tar_path.clone();
+        let metadata = shard.metadata.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Metadata not loaded")
+        })?;
+
+        let mut buckets: BTreeMap<String, Vec<(String, FileInfo)>> = BTreeMap::new();
+
+        // Process all files in the shard
+        for file_info in metadata.files() {
+            if let (Some(width), Some(height)) = (file_info.width, file_info.height) {
+                let bucket_key = match key_type {
+                    BucketKeyType::Aspect => {
+                        // Use aspect ratio as key
+                        if let Some(aspect) = file_info.aspect {
+                            format!("{:.3}", aspect)
+                        } else {
+                            format!("{:.3}", width as f32 / height as f32)
+                        }
+                    }
+                    BucketKeyType::GeometryTuple => {
+                        // Use (width, height) tuple as key
+                        if let Some(target_res) = target_resolution {
+                            let (scaled_w, scaled_h) = scale_dimensions(width, height, target_res);
+                            format!("({}, {})", scaled_w, scaled_h)
+                        } else {
+                            format!("({}, {})", width, height)
+                        }
+                    }
+                    BucketKeyType::GeometryList => {
+                        // Use [width, height] list as key
+                        if let Some(target_res) = target_resolution {
+                            let (scaled_w, scaled_h) = scale_dimensions(width, height, target_res);
+                            format!("[{}, {}]", scaled_w, scaled_h)
+                        } else {
+                            format!("[{}, {}]", width, height)
+                        }
+                    }
+                };
+
+                let filename = file_info
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                buckets
+                    .entry(bucket_key)
+                    .or_insert_with(Vec::new)
+                    .push((filename, file_info));
+            }
+        }
+
+        Ok(AspectBuckets {
+            buckets,
+            shard_idx,
+            shard_name,
+        })
+    }
 }
 
-// Simple batch dataloader that yields lists of entries
+#[pyfunction]
+pub fn scale_dimensions(width: u32, height: u32, target_resolution: u32) -> (u32, u32) {
+    let aspect = width as f32 / height as f32;
+
+    if width > height {
+        // Landscape or square
+        let new_width = target_resolution;
+        let new_height = (target_resolution as f32 / aspect).round() as u32;
+        (new_width, new_height.max(1))
+    } else {
+        // Portrait
+        let new_height = target_resolution;
+        let new_width = (target_resolution as f32 * aspect).round() as u32;
+        (new_width.max(1), new_height)
+    }
+}
+
 #[pyclass(name = "BatchDataLoader")]
 pub struct PyBatchDataLoader {
     base_loader: PyTarDataLoader,
