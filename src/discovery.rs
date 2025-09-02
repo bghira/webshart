@@ -84,13 +84,14 @@ impl DiscoveredDataset {
                 let discovery = DatasetDiscovery::with_runtime(self.runtime.clone())
                     .with_optional_token(self.discovery_token.clone());
 
-                let metadata = if self.is_remote {
-                    self.runtime
-                        .block_on(discovery.load_remote_metadata(&shard.json_path))?
-                } else {
-                    self.runtime
-                        .block_on(discovery.load_local_metadata(&shard.json_path))?
-                };
+                // Use block_in_place to avoid blocking the async runtime
+                let metadata = tokio::task::block_in_place(|| {
+                    if self.is_remote {
+                        self.runtime.block_on(discovery.load_remote_metadata(&shard.json_path))
+                    } else {
+                        self.runtime.block_on(discovery.load_local_metadata(&shard.json_path))
+                    }
+                })?;
                 shard.metadata = Some(metadata);
             }
             Ok(())
