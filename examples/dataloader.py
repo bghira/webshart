@@ -33,3 +33,5 @@ for entry in loader:
 
     if processed >= 100:
         break
+
+print(f"✅ Processed {processed} files.")

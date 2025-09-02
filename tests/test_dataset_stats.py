@@ -136,7 +136,8 @@ class TestDatasetStats:
         mock_discover.return_value = mock_dataset
 
         dataset = discover_dataset(
-            "RareConcepts/conceptual-captions-12m-webdataset-indexed"
+            source="laion/conceptual-captions-12m-webdataset",
+            metadata="webshart/conceptual-captions-12m-webdataset-metadata",
         )
         stats = dataset.get_stats()
 

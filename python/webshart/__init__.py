@@ -28,9 +28,11 @@ __all__ = [
 ]
 
 
-# Synchronous convenience function
 def discover_dataset(
-    source: str, hf_token: Optional[str] = None, subfolder: Optional[str] = None
+    source: str,
+    hf_token: Optional[str] = None,
+    subfolder: Optional[str] = None,
+    metadata: Optional[str] = None,
 ) -> DiscoveredDataset:
     """
     Discover dataset shards from various sources (synchronous).
@@ -41,19 +43,15 @@ def discover_dataset(
             - HuggingFace dataset repo (e.g., 'username/dataset-name')
         hf_token: Optional HuggingFace token for private datasets
         subfolder: Optional subfolder within HuggingFace repo
+        metadata: Optional separate location for metadata:
+            - Local directory path for metadata files
+            - HuggingFace repo (e.g., 'username/dataset-index')
+            - Full URL prefix
 
     Returns:
         DiscoveredDataset object with all shards discovered
-
-    Example:
-        >>> # Local dataset
-        >>> dataset = discover_dataset('/path/to/dataset/')
-        >>>
-        >>> # HuggingFace dataset
-        >>> dataset = discover_dataset('NebulaeWis/e621-2024-webp-4Mpixel')
-        >>> print(f"Found {dataset.num_shards} shards")
     """
-    discovery = DatasetDiscovery(hf_token=hf_token)
+    discovery = DatasetDiscovery(hf_token=hf_token, metadata_source=metadata)
 
     # Check if it's a local path
     if Path(source).exists() and Path(source).is_dir():
