@@ -958,26 +958,6 @@ impl PyDatasetDiscovery {
             .block_on(self.inner.discover_huggingface(repo_id, subfolder))?;
         Ok(PyDiscoveredDataset { inner: dataset })
     }
-
-    // Async variants for Python asyncio users
-    #[pyo3(signature = (repo_id, subfolder=None))]
-    fn discover_huggingface_async<'py>(
-        &self,
-        py: Python<'py>,
-        repo_id: &str,
-        subfolder: Option<&str>,
-    ) -> PyResult<&'py PyAny> {
-        let inner = self.inner.clone();
-        let repo_id = repo_id.to_string();
-        let subfolder = subfolder.map(|s| s.to_string());
-
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let dataset = inner
-                .discover_huggingface(&repo_id, subfolder.as_deref())
-                .await?;
-            Ok(PyDiscoveredDataset { inner: dataset })
-        })
-    }
 }
 
 /// Python wrapper for DiscoveredDataset
