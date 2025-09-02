@@ -1,4 +1,4 @@
-"""Fast and memory-efficient webdataset shard reader with sync and batch support."""
+"""Fast and memory-efficient webdataset shard reader with synchronous and batch support."""
 
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Any
