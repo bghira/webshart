@@ -1,4 +1,5 @@
 use crate::FileInfo;
+use crate::aspect_buckets::{AspectBucketIterator, AspectBuckets};
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -14,13 +15,6 @@ pub enum BucketKeyType {
     Aspect,
     GeometryTuple,
     GeometryList,
-}
-
-#[derive(Debug, Clone)]
-pub struct AspectBuckets {
-    pub buckets: BTreeMap<String, Vec<(String, FileInfo)>>,
-    pub shard_idx: usize,
-    pub shard_name: String,
 }
 
 /// Python wrapper for a file entry from a TAR
@@ -563,7 +557,7 @@ impl PyTarDataLoader {
     }
 
     #[pyo3(signature = (shard_indices, key="aspect", target_resolution=None))]
-    fn list_shard_aspect_buckets(
+    pub fn list_shard_aspect_buckets(
         &self,
         py: Python,
         shard_indices: Vec<usize>,
@@ -649,7 +643,7 @@ impl PyTarDataLoader {
         target_resolution: Option<u32>,
     ) -> PyResult<PyObject> {
         let key_str = key.unwrap_or("aspect");
-        let key_type = match key_str {
+        let _key_type = match key_str {
             "aspect" => BucketKeyType::Aspect,
             "geometry-tuple" => BucketKeyType::GeometryTuple,
             "geometry-list" => BucketKeyType::GeometryList,
@@ -660,47 +654,16 @@ impl PyTarDataLoader {
             }
         };
 
-        // Create a generator class
-        let generator_class = py.eval(
-            r#"
-class AspectBucketGenerator:
-    def __init__(self, loader, key_type, target_resolution):
-        self.loader = loader
-        self.key_type = key_type
-        self.target_resolution = target_resolution
-        self.current_shard = 0
-        self.num_shards = loader.num_shards
-        
-    def __iter__(self):
-        return self
-        
-    def __next__(self):
-        if self.current_shard >= self.num_shards:
-            raise StopIteration
-            
-        result = self.loader.list_shard_aspect_buckets(
-            [self.current_shard], 
-            key=self.key_type,
-            target_resolution=self.target_resolution
-        )
-        
-        self.current_shard += 1
-        
-        if result:
-            return result[0]
-        else:
-            raise StopIteration
-            
-AspectBucketGenerator
-"#,
-            None,
-            None,
-        )?;
+        let num_shards = slf.num_shards();
+        let iterator = AspectBucketIterator {
+            loader: slf.into(),
+            key_type: key_str.to_string(),
+            target_resolution,
+            current_shard: 0,
+            num_shards,
+        };
 
-        // Create instance
-        let instance = generator_class.call1((slf.into_py(py), key_str, target_resolution))?;
-
-        Ok(instance.into())
+        Py::new(py, iterator).map(|py_iter| py_iter.to_object(py))
     }
 }
 
