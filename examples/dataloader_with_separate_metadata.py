@@ -4,7 +4,12 @@ import os
 import pickle
 
 hf_token = get_token()
-dataset = discover_dataset("NebulaeWis/e621-2024-webp-4Mpixel", hf_token=hf_token)
+dataset = discover_dataset(
+    source="laion/conceptual-captions-12m-webdataset",
+    metadata="webshart/conceptual-captions-12m-webdataset-metadata",
+    subfolder="data",
+    hf_token=hf_token,
+)
 loader = TarDataLoader(dataset)
 
 # Resume from checkpoint if it exists
@@ -34,4 +39,4 @@ for entry in loader:
     if processed >= 100:
         break
 
-print(f"✅ Processed {processed} files.")
+print(f"📦 Processed {processed} files")

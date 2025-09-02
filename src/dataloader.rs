@@ -76,6 +76,7 @@ pub struct PyTarDataLoader {
     // Store the original source and hf_token for state persistence
     source: String,
     hf_token: Option<String>,
+    metadata_source: Option<String>,
 }
 
 #[pymethods]
@@ -88,7 +89,7 @@ impl PyTarDataLoader {
         max_file_size: u64,
         buffer_size: usize,
         hf_token: Option<String>,
-        chunk_size_mb: usize, // NEW: Chunk size in MB
+        chunk_size_mb: usize,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().expect("Failed to create runtime"));
 
@@ -113,6 +114,7 @@ impl PyTarDataLoader {
                     "Expected either a DiscoveredDataset or a path string",
                 ));
             };
+        let metadata_source = dataset.metadata_source.clone();
 
         Ok(Self {
             dataset: Arc::new(Mutex::new(dataset)),
@@ -122,6 +124,7 @@ impl PyTarDataLoader {
             buffer_position: 0,
             buffer_size: buffer_size.max(1),
             chunk_size_bytes: chunk_size_mb * 1024 * 1024, // Convert MB to bytes
+            metadata_source,
             load_file_data,
             max_file_size,
             next_file_to_load: 0,
@@ -159,6 +162,7 @@ impl PyTarDataLoader {
         dict.set_item("load_file_data", self.load_file_data)?;
         dict.set_item("max_file_size", self.max_file_size)?;
         dict.set_item("source", &self.source)?;
+        dict.set_item("metadata_source", &self.metadata_source)?;
         dict.set_item("hf_token", &self.hf_token)?;
 
         // Dataset info
@@ -167,7 +171,7 @@ impl PyTarDataLoader {
         dict.set_item("is_remote", dataset.is_remote)?;
 
         // Version for future compatibility
-        dict.set_item("version", 2)?;
+        dict.set_item("version", 3)?;
 
         Ok(dict.into())
     }
@@ -177,7 +181,7 @@ impl PyTarDataLoader {
         // Validate version
         if let Ok(Some(version_item)) = state_dict.get_item("version") {
             if let Ok(version) = version_item.extract::<i32>() {
-                if version > 2 {
+                if version > 3 {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                         "Unsupported state dict version: {}",
                         version
@@ -230,6 +234,11 @@ impl PyTarDataLoader {
                 .unwrap()
                 .ensure_shard_metadata(new_shard)?;
         }
+        if let Ok(Some(item)) = state_dict.get_item("metadata_source") {
+            if let Ok(v) = item.extract::<Option<String>>() {
+                self.metadata_source = v;
+            }
+        }
 
         // Clear buffer since we're repositioning
         self.entry_buffer.clear();
@@ -266,6 +275,10 @@ impl PyTarDataLoader {
             Some(item) => item.extract::<usize>().unwrap_or(10),
             None => 10,
         };
+        let metadata_source = match state_dict.get_item("metadata_source")? {
+            Some(item) => item.extract::<Option<String>>().unwrap_or(None),
+            None => None,
+        };
         let hf_token = match state_dict.get_item("hf_token")? {
             Some(item) => item.extract::<Option<String>>().unwrap_or(None),
             None => None,
@@ -286,6 +299,50 @@ impl PyTarDataLoader {
                     ));
                 }
             };
+            let py_source = py.eval(&format!("'{}'", source_str), None, None)?;
+            py_source
+        };
+        // If recreating from source string and we have metadata_source,
+        // we need to create the discovery with metadata_source
+        let source = if let Some(dataset_or_path) = dataset_or_path {
+            dataset_or_path
+        } else {
+            let source_str = match state_dict.get_item("source")? {
+                Some(item) => item.extract::<String>()?,
+                None => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "No dataset_or_path provided and no source in state_dict",
+                    ));
+                }
+            };
+
+            // If we have metadata_source, we need to recreate the dataset properly
+            if metadata_source.is_some() {
+                // Create a DiscoveredDataset with the metadata source
+                let discovery = DatasetDiscovery::new()
+                    .with_optional_token(hf_token.clone())
+                    .with_metadata_source(metadata_source.clone());
+
+                let dataset = if Path::new(&source_str).exists() {
+                    discovery.discover_local(Path::new(&source_str))?
+                } else {
+                    py.allow_threads(|| {
+                        Runtime::new()?.block_on(discovery.discover_huggingface(&source_str, None))
+                    })?
+                };
+
+                // Return the dataset as PyAny
+                let py_dataset = Py::new(py, PyDiscoveredDataset { inner: dataset })?;
+                return Self::new(
+                    py_dataset.as_ref(py),
+                    load_file_data,
+                    max_file_size,
+                    buffer_size,
+                    hf_token,
+                    chunk_size_mb,
+                );
+            }
+
             let py_source = py.eval(&format!("'{}'", source_str), None, None)?;
             py_source
         };
@@ -887,13 +944,14 @@ impl PyTarDataLoader {
                     if response.status().is_success()
                         || response.status() == reqwest::StatusCode::PARTIAL_CONTENT
                     {
-                        match response.bytes().await {
-                            Ok(bytes) => Ok(bytes.to_vec()),
-                            Err(e) => {
+                        response
+                            .bytes()
+                            .await
+                            .map(|bytes| bytes.to_vec())
+                            .map_err(|e| {
                                 eprintln!("Failed to read response: {}", e);
-                                Err(anyhow::anyhow!(e))
-                            }
-                        }
+                                anyhow::anyhow!(e)
+                            })
                     } else {
                         eprintln!("HTTP error {}", response.status());
                         Err(anyhow::anyhow!(format!("HTTP error {}", response.status())))

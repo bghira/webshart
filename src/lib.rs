@@ -7,6 +7,7 @@ mod discovery;
 mod error;
 mod extract;
 mod metadata;
+mod metadata_resolver;
 mod streaming;
 // Re-export main types
 pub use aspect_buckets::AspectBucketIterator;
