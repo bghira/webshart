@@ -1,5 +1,8 @@
+use crate::discovery::DiscoveredDataset;
+use crate::error::{Result, WebshartError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Information about a single file within a tar shard
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,7 +207,7 @@ impl ShardMetadata {
 
 // Custom deserializer that tries both formats
 impl<'de> Deserialize<'de> for ShardMetadata {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -214,7 +217,7 @@ impl<'de> Deserialize<'de> for ShardMetadata {
 }
 
 impl Serialize for ShardMetadata {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -257,5 +260,36 @@ impl Serialize for ShardMetadata {
         };
 
         helper.serialize(serializer)
+    }
+}
+
+pub fn ensure_shard_metadata_with_retry(
+    dataset: &mut DiscoveredDataset,
+    shard_idx: usize,
+) -> Result<()> {
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: u32 = 5;
+
+    loop {
+        match dataset.ensure_shard_metadata(shard_idx) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if attempts >= MAX_ATTEMPTS {
+                    return Err(e.into());
+                }
+
+                if matches!(e, WebshartError::RateLimited) || e.to_string().contains("429") {
+                    attempts += 1;
+                    let wait_time = Duration::from_secs(2u64.pow(attempts));
+                    eprintln!(
+                        "[webshart] Rate limited, waiting {:?} before retry",
+                        wait_time
+                    );
+                    std::thread::sleep(wait_time);
+                } else {
+                    return Err(e.into());
+                }
+            }
+        }
     }
 }
