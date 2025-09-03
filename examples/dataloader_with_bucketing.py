@@ -21,7 +21,6 @@ processed = 0
 print("- Starting to iterate over dataloader. -")
 for entry in loader:
     print(f"Processing entry: {entry}")
-    data = entry.data
     processed += 1
     if processed >= 100:
         break
