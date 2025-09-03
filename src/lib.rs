@@ -1,7 +1,5 @@
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
-mod aspect_buckets;
-mod batch;
 mod dataloader;
 mod discovery;
 mod error;
@@ -9,8 +7,7 @@ mod extract;
 mod metadata;
 mod metadata_resolver;
 // Re-export main types
-pub use aspect_buckets::AspectBucketIterator;
-pub use batch::{BatchOperations, BatchResult, FileReadRequest};
+pub use dataloader::{AspectBucketIterator, BatchOperations, BatchResult, FileReadRequest};
 use dataloader::{PyBucketDataLoader, PyTarDataLoader, PyTarFileEntry, scale_dimensions};
 pub use discovery::{DatasetDiscovery, DiscoveredDataset};
 pub use error::{Result, WebshartError};
@@ -26,7 +23,7 @@ fn _webshart(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<discovery::PyDatasetDiscovery>()?;
     m.add_class::<discovery::PyDiscoveredDataset>()?;
     m.add_class::<discovery::PyShardReader>()?;
-    m.add_class::<batch::PyBatchOperations>()?;
+    m.add_class::<dataloader::PyBatchOperations>()?;
     m.add_class::<extract::PyMetadataExtractor>()?;
     m.add_class::<PyTarDataLoader>()?;
     m.add_class::<PyTarFileEntry>()?;

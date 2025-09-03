@@ -1,11 +1,8 @@
 use crate::FileInfo;
-use crate::aspect_buckets::{
-    AspectBucketIterator, AspectBuckets, format_aspect, scale_dimensions_with_multiple,
-};
-use crate::discovery::{DatasetDiscovery, DiscoveredDataset};
+use crate::discovery::{DatasetDiscovery, DiscoveredDataset, PyDiscoveredDataset};
 use crate::error::{Result, WebshartError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyDict;
 use rand::{rng, seq::SliceRandom};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,365 +10,36 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
-// ===== CONFIGURATION =====
+// Import from modules
+mod aspect_buckets;
+mod batch;
+mod config;
+mod entry_types;
+mod file_loading;
+use crate::impl_batch_iterator;
+use crate::metadata::ensure_shard_metadata_with_retry;
+pub use aspect_buckets::{AspectBucketIterator, AspectBuckets, scale_dimensions_with_multiple};
+use aspect_buckets::{BucketKeyType, BucketSamplingStrategy, calculate_bucket_key};
+pub use batch::{BatchIterable, BatchOperations, BatchResult, FileReadRequest, PyBatchOperations};
+use config::DataLoaderConfig;
+pub use entry_types::{BucketEntry, PyTarFileEntry, create_tar_entry};
+use file_loading::{FileLoader, create_file_loader};
 
-#[derive(Debug, Clone)]
-struct DataLoaderConfig {
-    load_file_data: bool,
-    max_file_size: u64,
-    buffer_size: usize,
-    chunk_size_mb: usize,
-    hf_token: Option<String>,
-    batch_size: Option<usize>,
-}
+// Re-export the entry type as it's part of the public API
+pub use entry_types::PyTarFileEntry as TarFileEntry;
 
-impl DataLoaderConfig {
-    fn from_state_dict(state_dict: &PyDict) -> Self {
-        Self {
-            load_file_data: state_dict
-                .get_item("load_file_data")
-                .ok()
-                .flatten()
-                .and_then(|v| v.extract().ok())
-                .unwrap_or(true),
-            max_file_size: state_dict
-                .get_item("max_file_size")
-                .ok()
-                .flatten()
-                .and_then(|v| v.extract().ok())
-                .unwrap_or(50_000_000),
-            buffer_size: state_dict
-                .get_item("buffer_size")
-                .ok()
-                .flatten()
-                .and_then(|v| v.extract().ok())
-                .unwrap_or(100),
-            chunk_size_mb: state_dict
-                .get_item("chunk_size_mb")
-                .ok()
-                .flatten()
-                .and_then(|v| v.extract().ok())
-                .unwrap_or(10),
-            hf_token: state_dict
-                .get_item("hf_token")
-                .ok()
-                .flatten()
-                .and_then(|v| v.extract().ok()),
-            batch_size: state_dict
-                .get_item("batch_size")
-                .ok()
-                .flatten()
-                .and_then(|v| v.extract().ok()),
-        }
-    }
-
-    fn to_state_dict(&self, dict: &PyDict) -> PyResult<()> {
-        dict.set_item("load_file_data", self.load_file_data)?;
-        dict.set_item("max_file_size", self.max_file_size)?;
-        dict.set_item("buffer_size", self.buffer_size)?;
-        dict.set_item("chunk_size_mb", self.chunk_size_mb)?;
-        dict.set_item("hf_token", &self.hf_token)?;
-        dict.set_item("batch_size", self.batch_size)?;
-        Ok(())
-    }
-}
-
-// ===== ENUMS =====
-
-#[derive(Debug, Clone)]
-pub enum BucketKeyType {
-    Aspect,
-    GeometryTuple,
-    GeometryList,
-}
-
-impl BucketKeyType {
-    fn parse(key: &str) -> Result<Self> {
-        match key {
-            "aspect" => Ok(Self::Aspect),
-            "geometry-tuple" => Ok(Self::GeometryTuple),
-            "geometry-list" => Ok(Self::GeometryList),
-            _ => Err(WebshartError::InvalidShardFormat(
-                "key must be 'aspect', 'geometry-tuple', or 'geometry-list'".to_string(),
-            )),
-        }
-    }
-
-    fn format_dimensions(&self, width: u32, height: u32) -> String {
-        match self {
-            Self::Aspect => {
-                let aspect = width as f32 / height as f32;
-                format_aspect(aspect, Some(2))
-            }
-            Self::GeometryTuple => format!("({}, {})", width, height),
-            Self::GeometryList => format!("[{}, {}]", width, height),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BucketSamplingStrategy {
-    Sequential,
-    RandomWithinBuckets,
-    FullyRandom,
-}
-
-impl BucketSamplingStrategy {
-    fn parse(s: &str) -> Result<Self> {
-        match s {
-            "sequential" => Ok(Self::Sequential),
-            "random_within_buckets" => Ok(Self::RandomWithinBuckets),
-            "fully_random" => Ok(Self::FullyRandom),
-            _ => Err(WebshartError::InvalidShardFormat(
-                "sampling_strategy must be 'sequential', 'random_within_buckets', or 'fully_random'".to_string()
-            )),
-        }
-    }
-}
-
-// ===== TAR FILE ENTRY =====
-
-#[pyclass(name = "TarFileEntry")]
-#[derive(Clone)]
-pub struct PyTarFileEntry {
-    pub path: String,
-    pub offset: u64,
-    pub size: u64,
-    pub data: Vec<u8>,
-}
-
-#[pymethods]
-impl PyTarFileEntry {
-    #[getter]
-    fn path(&self) -> &str {
-        &self.path
-    }
-
-    #[getter]
-    fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    #[getter]
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    #[getter]
-    fn data(&self) -> PyResult<Py<PyBytes>> {
-        Python::with_gil(|py| Ok(PyBytes::new(py, &self.data).into()))
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "TarFileEntry(path='{}', offset={}, size={})",
-            self.path, self.offset, self.size
-        )
-    }
-}
-
-// ===== FILE LOADING TRAIT =====
-
-trait FileLoader {
-    fn load_file(&self, file_info: &FileInfo) -> Result<Vec<u8>>;
-}
-
-struct LocalFileLoader {
-    tar_path: String,
-}
-
-impl FileLoader for LocalFileLoader {
-    fn load_file(&self, file_info: &FileInfo) -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
-
-        let mut file = std::fs::File::open(&self.tar_path)?;
-        file.seek(SeekFrom::Start(file_info.offset))?;
-
-        let mut buffer = vec![0u8; file_info.length as usize];
-        file.read_exact(&mut buffer)?;
-
-        Ok(buffer)
-    }
-}
-
-struct RemoteFileLoader {
-    url: String,
-    token: Option<String>,
-    runtime: Arc<Runtime>,
-}
-
-impl FileLoader for RemoteFileLoader {
-    fn load_file(&self, file_info: &FileInfo) -> Result<Vec<u8>> {
-        self.runtime.block_on(async {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()?;
-
-            let mut request = client.get(&self.url).header(
-                "Range",
-                format!(
-                    "bytes={}-{}",
-                    file_info.offset,
-                    file_info.offset + file_info.length - 1
-                ),
-            );
-
-            if let Some(token) = &self.token {
-                request = request.bearer_auth(token);
-            }
-
-            let response = request.send().await?;
-
-            if response.status().is_success()
-                || response.status() == reqwest::StatusCode::PARTIAL_CONTENT
-            {
-                Ok(response.bytes().await?.to_vec())
-            } else if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                Err(WebshartError::RateLimited)
-            } else {
-                Err(WebshartError::Http(reqwest::Error::from(
-                    response.error_for_status().unwrap_err(),
-                )))
-            }
-        })
-    }
-}
-
-// ===== HELPER FUNCTIONS =====
-
-fn create_tar_entry(path: String, file_info: &FileInfo, data: Vec<u8>) -> PyTarFileEntry {
-    PyTarFileEntry {
-        path,
-        offset: file_info.offset,
-        size: file_info.length,
-        data,
-    }
-}
-
-fn ensure_shard_metadata_with_retry(
-    dataset: &mut DiscoveredDataset,
-    shard_idx: usize,
-) -> Result<()> {
-    let mut attempts = 0;
-    const MAX_ATTEMPTS: u32 = 5;
-
-    loop {
-        match dataset.ensure_shard_metadata(shard_idx) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                if attempts >= MAX_ATTEMPTS {
-                    return Err(e.into());
-                }
-
-                if matches!(e, WebshartError::RateLimited) || e.to_string().contains("429") {
-                    attempts += 1;
-                    let wait_time = Duration::from_secs(2u64.pow(attempts));
-                    eprintln!(
-                        "[webshart] Rate limited, waiting {:?} before retry",
-                        wait_time
-                    );
-                    std::thread::sleep(wait_time);
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
-    }
-}
-
-fn calculate_bucket_key(
-    key_type: &BucketKeyType,
-    width: u32,
-    height: u32,
-    aspect: Option<f32>,
-    target_pixel_area: Option<u32>,
-    target_resolution_multiple: u32,
-    round_to: Option<usize>,
-) -> (String, Option<(u32, u32)>) {
-    // Extract common scaling logic
-    let (final_width, final_height, original_size) = if let Some(target_res) = target_pixel_area {
-        let (scaled_w, scaled_h) =
-            scale_dimensions_with_multiple(width, height, target_res, target_resolution_multiple);
-        let orig = if scaled_w != width || scaled_h != height {
-            Some((width, height))
-        } else {
-            None
-        };
-        (scaled_w, scaled_h, orig)
-    } else {
-        (width, height, None)
-    };
-
-    // Format based on key type
-    let key = match key_type {
-        BucketKeyType::Aspect => {
-            let final_aspect = if target_pixel_area.is_some() {
-                final_width as f32 / final_height as f32
-            } else {
-                aspect.unwrap_or(width as f32 / height as f32)
-            };
-            format_aspect(final_aspect, round_to)
-        }
-        _ => key_type.format_dimensions(final_width, final_height),
-    };
-
-    (key, original_size)
-}
-
-// ===== BATCH ITERATION TRAIT =====
-
-trait BatchIterable<T> {
-    fn next_item(&mut self) -> PyResult<Option<T>>;
-
-    fn next_batch(&mut self) -> PyResult<Option<Vec<T>>> {
-        let batch_size = self.get_batch_size().unwrap_or(1);
-        let mut batch = Vec::with_capacity(batch_size);
-
-        for _ in 0..batch_size {
-            match self.next_item() {
-                Ok(Some(entry)) => batch.push(entry),
-                Ok(None) => break,
-                Err(e) => return Err(e),
-            }
-        }
-
-        if batch.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(batch))
-        }
-    }
-
-    fn get_batch_size(&self) -> Option<usize>;
-}
-
-// ===== GENERIC BATCH ITERATOR =====
-
-macro_rules! impl_batch_iterator {
-    ($name:ident, $py_name:literal, $loader_type:ty, $item_type:ty) => {
-        #[pyclass(name = $py_name)]
-        pub struct $name {
-            loader: Py<$loader_type>,
-        }
-
-        #[pymethods]
-        impl $name {
-            fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-                slf
-            }
-
-            fn __next__(&mut self, py: Python) -> PyResult<Option<Vec<$item_type>>> {
-                let mut loader = self.loader.borrow_mut(py);
-                loader.next_batch()
-            }
-        }
-    };
-}
-
+// Generate batch iterators using the macro
 impl_batch_iterator!(
     PyBatchIterator,
     "PyBatchIterator",
     PyTarDataLoader,
+    PyTarFileEntry
+);
+
+impl_batch_iterator!(
+    PyBucketBatchIterator,
+    "PyBucketBatchIterator",
+    PyBucketDataLoader,
     PyTarFileEntry
 );
 
@@ -464,15 +132,12 @@ impl PyTarDataLoader {
 
         let current_file_index = self.calculate_current_file_index();
 
-        // Core state
         dict.set_item("current_shard", self.current_shard)?;
         dict.set_item("current_file_index", current_file_index)?;
         dict.set_item("buffer_position", self.buffer_position)?;
 
-        // Configuration
         self.config.to_state_dict(dict)?;
 
-        // Dataset info
         dict.set_item("source", &self.source)?;
         dict.set_item("metadata_source", &self.metadata_source)?;
 
@@ -485,7 +150,6 @@ impl PyTarDataLoader {
     }
 
     fn load_state_dict(&mut self, state_dict: &PyDict) -> PyResult<()> {
-        // Validate version
         if let Ok(Some(version_item)) = state_dict.get_item("version") {
             if let Ok(version) = version_item.extract::<i32>() {
                 if version > 4 {
@@ -497,7 +161,6 @@ impl PyTarDataLoader {
             }
         }
 
-        // Load core state
         let mut new_shard = self.current_shard;
         let mut new_file_index = 0;
 
@@ -512,7 +175,7 @@ impl PyTarDataLoader {
             }
         }
 
-        // Load configuration
+        // Load configuration fields individually to preserve existing values
         if let Ok(Some(item)) = state_dict.get_item("load_file_data") {
             if let Ok(v) = item.extract::<bool>() {
                 self.config.load_file_data = v;
@@ -548,19 +211,16 @@ impl PyTarDataLoader {
             }
         }
 
-        // Load metadata source
         if let Ok(Some(item)) = state_dict.get_item("metadata_source") {
             if let Ok(v) = item.extract::<Option<String>>() {
                 self.metadata_source = v;
             }
         }
 
-        // Ensure metadata is loaded for the target shard
         if new_shard < self.dataset.lock().unwrap().num_shards() {
             ensure_shard_metadata_with_retry(&mut self.dataset.lock().unwrap(), new_shard)?;
         }
 
-        // Clear buffer and set position
         self.entry_buffer.clear();
         self.buffer_position = 0;
         self.current_shard = new_shard;
@@ -578,11 +238,9 @@ impl PyTarDataLoader {
     ) -> PyResult<Self> {
         let config = DataLoaderConfig::from_state_dict(state_dict);
 
-        // Determine the dataset source
         let source_obj = Self::determine_source_from_state_dict(py, state_dict, dataset_or_path)?;
         let source = source_obj.as_ref(py);
 
-        // Create new dataloader
         let mut loader = Self::new(
             source,
             config.load_file_data,
@@ -593,7 +251,6 @@ impl PyTarDataLoader {
             config.batch_size,
         )?;
 
-        // Load the state
         loader.load_state_dict(state_dict)?;
         Ok(loader)
     }
@@ -857,7 +514,7 @@ impl PyTarDataLoader {
     }
 }
 
-// Implementation methods for PyTarDataLoader
+// Implementation methods for PyTarDataLoader (continued in same file for now)
 impl PyTarDataLoader {
     pub(crate) fn load_file_by_info(
         &self,
@@ -994,7 +651,6 @@ impl PyTarDataLoader {
                 }
                 remaining -= num_files;
             } else {
-                // This should not happen after ensure_shard_metadata_with_retry
                 return Err(WebshartError::MetadataNotFound(format!(
                     "Metadata for shard {} could not be loaded",
                     shard_idx
@@ -1003,8 +659,6 @@ impl PyTarDataLoader {
             }
         }
 
-        // If idx was larger than total files, it will point to the last shard with remaining index.
-        // The caller should handle this out-of-bounds case.
         Ok((num_shards.saturating_sub(1), remaining))
     }
 
@@ -1182,18 +836,7 @@ impl PyTarDataLoader {
         is_remote: bool,
         token: Option<String>,
     ) -> Result<Vec<u8>> {
-        let loader: Box<dyn FileLoader> = if is_remote {
-            Box::new(RemoteFileLoader {
-                url: tar_path.to_string(),
-                token,
-                runtime: self.runtime.clone(),
-            })
-        } else {
-            Box::new(LocalFileLoader {
-                tar_path: tar_path.to_string(),
-            })
-        };
-
+        let loader = create_file_loader(tar_path, is_remote, token, self.runtime.clone());
         loader.load_file(file_info)
     }
 
@@ -1268,11 +911,9 @@ impl PyTarDataLoader {
             return Ok(());
         }
 
-        // Calculate range to load
         let start_idx = self.next_file_to_load;
         let end_idx = std::cmp::min(start_idx + self.config.buffer_size, total_files);
 
-        // Get ALL files and sort them to ensure consistent ordering
         let mut all_files: Vec<(String, crate::metadata::FileInfo)> = Vec::new();
         for idx in 0..total_files {
             if let Some((filename, file_info)) = metadata.get_file_by_index(idx) {
@@ -1282,7 +923,6 @@ impl PyTarDataLoader {
 
         all_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Collect the files we need
         let mut file_entries = Vec::new();
         for idx in start_idx..end_idx {
             if idx < all_files.len() {
@@ -1297,7 +937,6 @@ impl PyTarDataLoader {
             return Ok(());
         }
 
-        // Load the files using a unified strategy
         self.load_file_batch(tar_path, token, file_entries)?;
         self.next_file_to_load = end_idx;
 
@@ -1310,14 +949,11 @@ impl PyTarDataLoader {
         token: Option<String>,
         file_entries: Vec<(String, crate::metadata::FileInfo)>,
     ) -> PyResult<()> {
-        // Determine if we're loading remote or local
         let is_remote = tar_path.starts_with("http");
 
         if is_remote && file_entries.len() > 1 {
-            // Try streaming approach for remote files
             self.load_files_remote_streaming(tar_path, token, file_entries)
         } else {
-            // Use individual loading for local files or single remote file
             for (filename, file_info) in file_entries {
                 let data = if self.config.load_file_data
                     && file_info.length <= self.config.max_file_size
@@ -1348,25 +984,20 @@ impl PyTarDataLoader {
             return Ok(());
         }
 
-        // Calculate the byte range we need to fetch
         let first_offset = file_entries[0].1.offset;
         let last_entry = &file_entries[file_entries.len() - 1];
         let last_end = last_entry.1.offset + last_entry.1.length;
 
-        // Calculate total range size
         let range_size = last_end - first_offset;
 
-        // If the range is too large, fall back to chunked approach
         let chunk_size_bytes = self.config.chunk_size_mb * 1024 * 1024;
         if range_size > chunk_size_bytes as u64 {
             return self.load_files_remote_chunked(url, token, file_entries);
         }
 
-        // Clone what we need for the async block
         let load_file_data = self.config.load_file_data;
         let max_file_size = self.config.max_file_size;
 
-        // Perform the fetch in the async block
         let fetch_result = self.runtime.block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -1405,7 +1036,6 @@ impl PyTarDataLoader {
 
         match fetch_result {
             Ok(data) => {
-                // Extract each file from the downloaded data
                 for (filename, file_info) in file_entries {
                     let relative_offset = (file_info.offset - first_offset) as usize;
                     let length = file_info.length as usize;
@@ -1425,10 +1055,7 @@ impl PyTarDataLoader {
                 }
                 Ok(())
             }
-            Err(_) => {
-                // Fall back to individual requests
-                self.load_file_batch(url, token, file_entries)
-            }
+            Err(_) => self.load_file_batch(url, token, file_entries),
         }
     }
 
@@ -1445,7 +1072,6 @@ impl PyTarDataLoader {
             let mut chunk_size = 0u64;
             let mut chunk_end = processed;
 
-            // Build a chunk up to chunk_size_bytes
             for i in processed..file_entries.len() {
                 let entry_size = file_entries[i].1.length;
                 if chunk_size + entry_size > chunk_size_bytes as u64 && chunk_end > processed {
@@ -1455,7 +1081,6 @@ impl PyTarDataLoader {
                 chunk_end = i + 1;
             }
 
-            // Process this chunk
             let chunk_entries = file_entries[processed..chunk_end].to_vec();
             self.load_files_remote_streaming(url.clone(), token.clone(), chunk_entries)?;
 
@@ -1467,21 +1092,6 @@ impl PyTarDataLoader {
 }
 
 // ===== BUCKET DATA LOADER =====
-
-#[derive(Debug, Clone)]
-pub struct BucketEntry {
-    pub shard_idx: usize,
-    pub filename: String,
-    pub file_info: crate::metadata::FileInfo,
-    pub original_size: Option<(u32, u32)>,
-}
-
-impl_batch_iterator!(
-    PyBucketBatchIterator,
-    "PyBucketBatchIterator",
-    PyBucketDataLoader,
-    PyTarFileEntry
-);
 
 #[pyclass(name = "BucketDataLoader")]
 pub struct PyBucketDataLoader {
@@ -1958,6 +1568,3 @@ pub fn scale_dimensions(
 ) -> (u32, u32) {
     scale_dimensions_with_multiple(width, height, target_pixel_area, target_resolution_multiple)
 }
-
-// Re-export PyDiscoveredDataset for use with dataloader
-pub use crate::discovery::PyDiscoveredDataset;

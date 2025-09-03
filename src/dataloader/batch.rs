@@ -334,5 +334,52 @@ impl PyBatchOperations {
     }
 }
 
+pub trait BatchIterable<T> {
+    fn next_item(&mut self) -> PyResult<Option<T>>;
+
+    fn next_batch(&mut self) -> PyResult<Option<Vec<T>>> {
+        let batch_size = self.get_batch_size().unwrap_or(1);
+        let mut batch = Vec::with_capacity(batch_size);
+
+        for _ in 0..batch_size {
+            match self.next_item() {
+                Ok(Some(entry)) => batch.push(entry),
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
+    }
+
+    fn get_batch_size(&self) -> Option<usize>;
+}
+
+#[macro_export]
+macro_rules! impl_batch_iterator {
+    ($name:ident, $py_name:literal, $loader_type:ty, $item_type:ty) => {
+        #[pyclass(name = $py_name)]
+        pub struct $name {
+            loader: Py<$loader_type>,
+        }
+
+        #[pymethods]
+        impl $name {
+            fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+                slf
+            }
+
+            fn __next__(&mut self, py: Python) -> PyResult<Option<Vec<$item_type>>> {
+                let mut loader = self.loader.borrow_mut(py);
+                loader.next_batch()
+            }
+        }
+    };
+}
+
 // Re-export from discovery module
 use crate::discovery::PyDiscoveredDataset;
