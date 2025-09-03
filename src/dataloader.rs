@@ -45,6 +45,33 @@ impl_batch_iterator!(
 );
 
 // ===== TAR DATA LOADER =====
+#[pyclass]
+pub struct PyRangeIterator {
+    loader: Py<PyTarDataLoader>,
+    start: usize,
+    end: usize,
+    current: usize,
+}
+
+#[pymethods]
+impl PyRangeIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyTarFileEntry>> {
+        if slf.current >= slf.end {
+            return Ok(None);
+        }
+
+        slf.current += 1;
+
+        Python::with_gil(|py| {
+            let mut loader = slf.loader.borrow_mut(py);
+            loader.next_entry()
+        })
+    }
+}
 
 #[pyclass(name = "TarDataLoader")]
 pub struct PyTarDataLoader {
@@ -57,6 +84,8 @@ pub struct PyTarDataLoader {
     next_file_to_load: usize,
     source: String,
     metadata_source: Option<String>,
+    ranges: Option<Vec<(usize, usize)>>,
+    current_range_idx: usize,
 }
 
 impl BatchIterable<PyTarFileEntry> for PyTarDataLoader {
@@ -124,6 +153,8 @@ impl PyTarDataLoader {
             buffer_position: 0,
             metadata_source,
             next_file_to_load: 0,
+            current_range_idx: 0,
+            ranges: None,
             source,
         })
     }
@@ -284,6 +315,29 @@ impl PyTarDataLoader {
         Ok(dict.into())
     }
 
+    /// Create an iterator for a specific range
+    pub fn iter_range(
+        mut slf: PyRefMut<'_, Self>,
+        start: usize,
+        end: usize,
+    ) -> PyResult<PyRangeIterator> {
+        if start >= end {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "start must be less than end",
+            ));
+        }
+
+        // Skip to start position
+        slf.skip(start)?;
+
+        Ok(PyRangeIterator {
+            loader: slf.into(),
+            start,
+            end,
+            current: start,
+        })
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -364,6 +418,30 @@ impl PyTarDataLoader {
     #[setter]
     fn set_batch_size(&mut self, batch_size: Option<usize>) {
         self.config.batch_size = batch_size;
+    }
+
+    fn set_ranges(&mut self, ranges: Vec<(usize, usize)>) -> PyResult<()> {
+        // Validate ranges
+        for (start, end) in &ranges {
+            if start >= end {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid range: start {} must be less than end {}",
+                    start, end
+                )));
+            }
+        }
+
+        self.ranges = Some(ranges);
+        self.current_range_idx = 0;
+
+        // Jump to first range start
+        if let Some(ranges) = &self.ranges {
+            if !ranges.is_empty() {
+                self.skip(ranges[0].0)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn get_metadata(&self, shard_idx: usize, py: Python) -> PyResult<PyObject> {
@@ -544,7 +622,13 @@ impl PyTarDataLoader {
             Vec::new()
         };
 
-        Ok(create_tar_entry(file_path.to_string(), file_info, data))
+        Ok(create_tar_entry(
+            file_path.to_string(),
+            file_info,
+            data,
+            Some(shard_idx),
+            None,
+        ))
     }
 
     pub(crate) fn get_shard_aspect_buckets_internal(
@@ -633,6 +717,12 @@ impl PyTarDataLoader {
         }
         files_processed += current_file_index_in_shard;
         Ok(files_processed)
+    }
+
+    fn calculate_global_file_index(&self) -> PyResult<usize> {
+        let mut dataset = self.dataset.lock().unwrap();
+        let current_file_index_in_shard = self.calculate_current_file_index();
+        self.calculate_files_processed(&mut dataset, current_file_index_in_shard)
     }
 
     fn find_shard_for_index(&self, idx: usize) -> PyResult<(usize, usize)> {
@@ -869,6 +959,29 @@ impl PyTarDataLoader {
     }
 
     fn next_entry(&mut self) -> PyResult<Option<PyTarFileEntry>> {
+        if let Some(ranges) = &self.ranges {
+            // Check if we're within current range
+            let current_idx = self.calculate_global_file_index()?;
+
+            if self.current_range_idx >= ranges.len() {
+                return Ok(None);
+            }
+
+            let (_, range_end) = ranges[self.current_range_idx];
+
+            // If we've exceeded current range, move to next
+            if current_idx >= range_end {
+                self.current_range_idx += 1;
+
+                // Skip to next range start if available
+                if self.current_range_idx < ranges.len() {
+                    let (next_start, _) = ranges[self.current_range_idx];
+                    self.skip(next_start)?;
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
         if self.buffer_position < self.entry_buffer.len() {
             let entry = self.entry_buffer[self.buffer_position].clone();
             self.buffer_position += 1;
@@ -982,7 +1095,7 @@ impl PyTarDataLoader {
         if is_remote && file_entries.len() > 1 {
             self.load_files_remote_streaming(tar_path, token, file_entries)
         } else {
-            for (filename, file_info) in file_entries {
+            for (idx, (filename, file_info)) in file_entries.into_iter().enumerate() {
                 let data = if self.config.load_file_data
                     && file_info.length <= self.config.max_file_size
                 {
@@ -995,8 +1108,13 @@ impl PyTarDataLoader {
                     Vec::new()
                 };
 
-                self.entry_buffer
-                    .push(create_tar_entry(filename, &file_info, data));
+                self.entry_buffer.push(create_tar_entry(
+                    filename,
+                    &file_info,
+                    data,
+                    Some(self.current_shard),
+                    Some(self.next_file_to_load + idx),
+                ));
             }
             Ok(())
         }
@@ -1030,7 +1148,7 @@ impl PyTarDataLoader {
                     drop(cache_clone);
 
                     // Process all files from the cached shard
-                    for (filename, file_info) in file_entries {
+                    for (idx, (filename, file_info)) in file_entries.into_iter().enumerate() {
                         let data = if self.config.load_file_data
                             && file_info.length <= self.config.max_file_size
                         {
@@ -1042,9 +1160,13 @@ impl PyTarDataLoader {
                         } else {
                             Vec::new()
                         };
-
-                        self.entry_buffer
-                            .push(create_tar_entry(filename, &file_info, data));
+                        self.entry_buffer.push(create_tar_entry(
+                            filename,
+                            &file_info,
+                            data,
+                            Some(self.current_shard),
+                            Some(self.next_file_to_load + idx),
+                        ));
                     }
                     return Ok(());
                 }
@@ -1070,7 +1192,7 @@ impl PyTarDataLoader {
         let load_file_data = self.config.load_file_data;
         let max_file_size = self.config.max_file_size;
 
-        let fetch_result = self.runtime.block_on(async {
+        let fetch_result: Result<Vec<u8>> = self.runtime.block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
@@ -1102,13 +1224,13 @@ impl PyTarDataLoader {
                         ))
                     }
                 }
-                Err(e) => Err(WebshartError::Http(e)),
+                Err(e) => Err(WebshartError::from(e)),
             }
         });
 
         match fetch_result {
             Ok(data) => {
-                for (filename, file_info) in file_entries {
+                for (idx, (filename, file_info)) in file_entries.into_iter().enumerate() {
                     let relative_offset = (file_info.offset - first_offset) as usize;
                     let length = file_info.length as usize;
 
@@ -1122,8 +1244,13 @@ impl PyTarDataLoader {
                         Vec::new()
                     };
 
-                    self.entry_buffer
-                        .push(create_tar_entry(filename, &file_info, file_data));
+                    self.entry_buffer.push(create_tar_entry(
+                        filename,
+                        &file_info,
+                        file_data,
+                        Some(self.current_shard),
+                        Some(self.next_file_to_load + idx),
+                    ));
                 }
                 Ok(())
             }
