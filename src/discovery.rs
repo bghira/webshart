@@ -1,3 +1,4 @@
+use crate::dataloader::shard_cache::ShardCache;
 use crate::error::{Result, WebshartError};
 use crate::metadata::ShardMetadata;
 use crate::metadata_resolver::MetadataResolver;
@@ -42,6 +43,7 @@ pub struct DiscoveredDataset {
     cache_dir: Option<PathBuf>,
     /// Track if we've hit rate limits
     rate_limit_delay: Option<Duration>,
+    pub shard_cache: Option<Arc<ShardCache>>,
 }
 
 impl DiscoveredDataset {
@@ -53,6 +55,19 @@ impl DiscoveredDataset {
     /// Get the HuggingFace token if available
     pub fn get_hf_token(&self) -> Option<String> {
         self.discovery_token.clone()
+    }
+
+    pub async fn enable_shard_cache(
+        &mut self,
+        location: PathBuf,
+        cache_limit_gb: f64,
+        parallel_downloads: usize,
+    ) -> Result<()> {
+        let mut cache = ShardCache::new(location, cache_limit_gb, parallel_downloads);
+        cache.ensure_cache_dir().await?;
+        cache.initialize_from_disk().await?;
+        self.shard_cache = Some(Arc::new(cache));
+        Ok(())
     }
 
     /// Enable metadata caching and optionally pre-load some shards
@@ -605,6 +620,7 @@ impl DatasetDiscovery {
             rate_limit_delay: None,
             is_remote: false,
             shards,
+            shard_cache: None,
             discovery_token: self.hf_token.clone(),
             cached_total_size: None,
             cached_total_files: None,
@@ -778,6 +794,7 @@ impl DatasetDiscovery {
             rate_limit_delay: None,
             is_remote: true,
             shards: all_shards,
+            shard_cache: None,
             discovery_token: self.hf_token.clone(),
             cached_total_size: cached_size,
             cached_total_files: final_cached_files,
@@ -1260,6 +1277,22 @@ impl PyDiscoveredDataset {
     fn open_shard(&mut self, shard_index: usize) -> PyResult<PyShardReader> {
         let reader = self.inner.open_shard(shard_index)?;
         Ok(PyShardReader { inner: reader })
+    }
+
+    #[pyo3(signature = (location, cache_limit_gb=25.0, parallel_downloads=4))]
+    fn enable_shard_cache(
+        &mut self,
+        location: &str,
+        cache_limit_gb: f64,
+        parallel_downloads: usize,
+    ) -> PyResult<()> {
+        let runtime = Runtime::new()?;
+        runtime.block_on(async {
+            self.inner
+                .enable_shard_cache(PathBuf::from(location), cache_limit_gb, parallel_downloads)
+                .await
+        })?;
+        Ok(())
     }
 
     #[pyo3(signature = (location, init_shard_count=4))]

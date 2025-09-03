@@ -16,6 +16,7 @@ mod batch;
 mod config;
 mod entry_types;
 mod file_loading;
+pub mod shard_cache;
 use crate::impl_batch_iterator;
 use crate::metadata::ensure_shard_metadata_with_retry;
 pub use aspect_buckets::{AspectBucketIterator, AspectBuckets, scale_dimensions_with_multiple};
@@ -836,6 +837,33 @@ impl PyTarDataLoader {
         is_remote: bool,
         token: Option<String>,
     ) -> Result<Vec<u8>> {
+        let dataset = self.dataset.lock().unwrap();
+
+        // If we have a shard cache and this is remote, try to get cached version
+        if is_remote && dataset.shard_cache.is_some() {
+            let shard_name = tar_path.rsplit('/').next().unwrap_or(tar_path);
+            let cache = dataset.shard_cache.as_ref().unwrap().clone();
+            drop(dataset); // Release lock before async operation
+
+            // Try to get/download to cache
+            if let Ok(cached_path) =
+                self.runtime
+                    .block_on(cache.cache_shard(shard_name, tar_path, token.clone()))
+            {
+                // Use the cached local file
+                let loader = create_file_loader(
+                    &cached_path.to_string_lossy(),
+                    false, // it's local now
+                    None,  // no token needed for local
+                    self.runtime.clone(),
+                );
+                return loader.load_file(file_info);
+            }
+        } else {
+            drop(dataset);
+        }
+
+        // Fallback to original behavior
         let loader = create_file_loader(tar_path, is_remote, token, self.runtime.clone());
         loader.load_file(file_info)
     }
@@ -982,6 +1010,50 @@ impl PyTarDataLoader {
     ) -> PyResult<()> {
         if file_entries.is_empty() {
             return Ok(());
+        }
+
+        // Check if we have shard cache
+        let dataset = self.dataset.lock().unwrap();
+        if let Some(cache) = &dataset.shard_cache {
+            let shard_name = url.rsplit('/').next().unwrap_or(&url);
+            let cache_clone = cache.clone();
+            drop(dataset);
+
+            // Try to cache the entire shard first
+            match self
+                .runtime
+                .block_on(cache_clone.cache_shard(shard_name, &url, token.clone()))
+            {
+                Ok(cached_path) => {
+                    // Load from cached file instead
+                    let cached_url = cached_path.to_string_lossy().to_string();
+                    drop(cache_clone);
+
+                    // Process all files from the cached shard
+                    for (filename, file_info) in file_entries {
+                        let data = if self.config.load_file_data
+                            && file_info.length <= self.config.max_file_size
+                        {
+                            self.load_single_file_data(&cached_url, &file_info, false, None)
+                                .unwrap_or_else(|e| {
+                                    eprintln!("Failed to load {}: {}", filename, e);
+                                    Vec::new()
+                                })
+                        } else {
+                            Vec::new()
+                        };
+
+                        self.entry_buffer
+                            .push(create_tar_entry(filename, &file_info, data));
+                    }
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Cache failed, continue with original streaming approach
+                }
+            }
+        } else {
+            drop(dataset);
         }
 
         let first_offset = file_entries[0].1.offset;

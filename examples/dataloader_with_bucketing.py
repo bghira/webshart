@@ -12,12 +12,17 @@ dataset = discover_dataset(
 )
 print("Enabling cache.")
 dataset.enable_metadata_cache(location=os.path.join(os.getcwd(), "metadata_cache"))
+dataset.enable_shard_cache(
+    location=os.path.join(os.getcwd(), "shard_cache"), cache_limit_gb=25.0
+)
 print("Cache enabled. Creating loader.")
 loader = BucketDataLoader(dataset, batch_size=4)
 print("Loader OK.")
 
 processed = 0
+import time
 
+timer_start = time.time()
 print("- Starting to iterate over dataloader. -")
 for batch in loader.iter_batches():
     print(f"Processing batch: {batch}")
@@ -25,4 +30,4 @@ for batch in loader.iter_batches():
     if processed >= 100:
         break
 
-print(f"✅ Processed {processed} batches.")
+print(f"✅ Processed {processed} batches in {time.time() - timer_start:.2f} seconds.")
