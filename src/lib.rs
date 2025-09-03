@@ -8,7 +8,6 @@ mod error;
 mod extract;
 mod metadata;
 mod metadata_resolver;
-mod streaming;
 // Re-export main types
 pub use aspect_buckets::AspectBucketIterator;
 pub use batch::{BatchOperations, BatchResult, FileReadRequest};
@@ -17,7 +16,6 @@ pub use discovery::{DatasetDiscovery, DiscoveredDataset};
 pub use error::{Result, WebshartError};
 pub use extract::MetadataExtractor;
 pub use metadata::{FileInfo, ShardMetadata};
-pub use streaming::{StreamConfig, TarFileEntry, TarStreamer};
 
 /// A Python module implemented in Rust for fast webdataset shard reading
 #[pymodule]
