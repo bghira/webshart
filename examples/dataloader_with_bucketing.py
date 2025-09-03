@@ -1,0 +1,33 @@
+from webshart import BucketDataLoader, discover_dataset
+from huggingface_hub import get_token
+import os
+import pickle
+
+hf_token = get_token()
+dataset = discover_dataset(
+    source="laion/conceptual-captions-12m-webdataset",
+    metadata="webshart/conceptual-captions-12m-webdataset-metadata",
+    # subfolder="data",
+    hf_token=hf_token,
+)
+print("Enabling cache.")
+dataset.enable_metadata_cache(location=os.path.join(os.getcwd(), "metadata_cache"))
+print(
+    "Cache enabled. Create loader. If we see 'Processing shard' here, there is a bug with the lazy loading since it has not reached the iterator yet."
+)
+loader = BucketDataLoader(dataset)
+print("Loader OK.")
+
+processed = 0
+
+print(
+    "- Starting to iterate over dataloader. We should now see processing entry, not processing shard. -"
+)
+for entry in loader:
+    print(f"Processing entry: {entry}")
+    data = entry.data
+    processed += 1
+    if processed >= 100:
+        break
+
+print(f"✅ Processed {processed} files.")

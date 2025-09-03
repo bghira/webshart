@@ -55,28 +55,27 @@ impl AspectBucketIterator {
 }
 
 pub fn scale_dimensions_with_multiple(
-    width: u32, 
-    height: u32, 
+    width: u32,
+    height: u32,
     target_pixel_area: u32,
-    multiple: u32
+    multiple: u32,
 ) -> (u32, u32) {
     // Target resolution is the desired total area (width * height)
-    let aspect_ratio = width as f64 / height as f64;
+    // let aspect_ratio = width as f64 / height as f64;
     let current_area = (width as f64) * (height as f64);
     let scale_factor = (target_pixel_area as f64 / current_area).sqrt();
-    
+
     // Calculate new dimensions maintaining aspect ratio
     let new_width = (width as f64 * scale_factor).round() as u32;
     let new_height = (height as f64 * scale_factor).round() as u32;
-    
+
     // Round to nearest multiple
     let rounded_width = ((new_width as f32 / multiple as f32).round() * multiple as f32) as u32;
     let rounded_height = ((new_height as f32 / multiple as f32).round() * multiple as f32) as u32;
-    
+
     // Ensure minimum size is at least the multiple
     (rounded_width.max(multiple), rounded_height.max(multiple))
 }
-
 
 /// Formats an aspect ratio with optional rounding
 pub fn format_aspect(aspect: f32, round_to: Option<usize>) -> String {
