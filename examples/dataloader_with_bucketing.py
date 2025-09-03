@@ -12,9 +12,7 @@ dataset = discover_dataset(
 )
 print("Enabling cache.")
 dataset.enable_metadata_cache(location=os.path.join(os.getcwd(), "metadata_cache"))
-print(
-    "Cache enabled. Create loader. If we see 'Processing shard' here, there is a bug with the lazy loading since it has not reached the iterator yet."
-)
+print("Cache enabled. Creating loader.")
 loader = BucketDataLoader(dataset)
 print("Loader OK.")
 
