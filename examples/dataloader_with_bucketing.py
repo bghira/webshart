@@ -13,7 +13,7 @@ dataset = discover_dataset(
 print("Enabling cache.")
 dataset.enable_metadata_cache(location=os.path.join(os.getcwd(), "metadata_cache"))
 print("Cache enabled. Creating loader.")
-loader = BucketDataLoader(dataset)
+loader = BucketDataLoader(dataset, batch_size=4)
 print("Loader OK.")
 
 processed = 0
