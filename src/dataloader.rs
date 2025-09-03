@@ -68,23 +68,21 @@ pub struct PyTarDataLoader {
     current_shard: usize,
     entry_buffer: Vec<PyTarFileEntry>,
     buffer_position: usize,
-    buffer_size: usize,      // How many entries to load at once
-    chunk_size_bytes: usize, // NEW: Size of byte chunks to stream
+    buffer_size: usize,
+    chunk_size_bytes: usize,
     load_file_data: bool,
     max_file_size: u64,
-    // Tracks the global file index within the current shard
-    // This represents the index of the next file to be loaded from the shard
     next_file_to_load: usize,
-    // Store the original source and hf_token for state persistence
     source: String,
     hf_token: Option<String>,
     metadata_source: Option<String>,
+    batch_size: Option<usize>,
 }
 
 #[pymethods]
 impl PyTarDataLoader {
     #[new]
-    #[pyo3(signature = (dataset_or_path, load_file_data=true, max_file_size=50_000_000, buffer_size=100, hf_token=None, chunk_size_mb=10))]
+    #[pyo3(signature = (dataset_or_path, load_file_data=true, max_file_size=50_000_000, buffer_size=100, hf_token=None, chunk_size_mb=10, batch_size=None))]
     fn new(
         dataset_or_path: &PyAny,
         load_file_data: bool,
@@ -92,6 +90,7 @@ impl PyTarDataLoader {
         buffer_size: usize,
         hf_token: Option<String>,
         chunk_size_mb: usize,
+        batch_size: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().expect("Failed to create runtime"));
 
@@ -132,6 +131,7 @@ impl PyTarDataLoader {
             next_file_to_load: 0,
             source,
             hf_token,
+            batch_size,
         })
     }
 
@@ -166,6 +166,7 @@ impl PyTarDataLoader {
         dict.set_item("source", &self.source)?;
         dict.set_item("metadata_source", &self.metadata_source)?;
         dict.set_item("hf_token", &self.hf_token)?;
+        dict.set_item("batch_size", &self.batch_size)?;
 
         // Dataset info
         let dataset = self.dataset.lock().unwrap();
@@ -173,7 +174,7 @@ impl PyTarDataLoader {
         dict.set_item("is_remote", dataset.is_remote)?;
 
         // Version for future compatibility
-        dict.set_item("version", 3)?;
+        dict.set_item("version", 4)?;
 
         Ok(dict.into())
     }
@@ -183,7 +184,7 @@ impl PyTarDataLoader {
         // Validate version
         if let Ok(Some(version_item)) = state_dict.get_item("version") {
             if let Ok(version) = version_item.extract::<i32>() {
-                if version > 3 {
+                if version > 4 {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                         "Unsupported state dict version: {}",
                         version
@@ -226,6 +227,11 @@ impl PyTarDataLoader {
         if let Ok(Some(item)) = state_dict.get_item("max_file_size") {
             if let Ok(v) = item.extract::<u64>() {
                 self.max_file_size = v;
+            }
+        }
+        if let Ok(Some(item)) = state_dict.get_item("batch_size") {
+            if let Ok(v) = item.extract::<Option<usize>>() {
+                self.batch_size = v;
             }
         }
 
@@ -285,6 +291,10 @@ impl PyTarDataLoader {
             Some(item) => item.extract::<Option<String>>().unwrap_or(None),
             None => None,
         };
+        let batch_size = match state_dict.get_item("batch_size")? {
+            Some(item) => item.extract::<Option<usize>>().unwrap_or(None),
+            None => None,
+        };
 
         // Determine the dataset source
         let source = if let Some(dataset_or_path) = dataset_or_path {
@@ -342,6 +352,7 @@ impl PyTarDataLoader {
                     buffer_size,
                     hf_token,
                     chunk_size_mb,
+                    batch_size,
                 );
             }
 
@@ -357,6 +368,7 @@ impl PyTarDataLoader {
             buffer_size,
             hf_token,
             chunk_size_mb,
+            batch_size,
         )?;
 
         // Load the state
@@ -401,6 +413,7 @@ impl PyTarDataLoader {
                 0.0
             },
         )?;
+        dict.set_item("batch_size", self.batch_size)?;
 
         Ok(dict.into())
     }
@@ -411,6 +424,36 @@ impl PyTarDataLoader {
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyTarFileEntry>> {
         slf.next_entry()
+    }
+
+    /// Get the next batch of entries
+    fn next_batch(&mut self) -> PyResult<Option<Vec<PyTarFileEntry>>> {
+        let batch_size = self.batch_size.unwrap_or(1);
+        let mut batch = Vec::with_capacity(batch_size);
+
+        for _ in 0..batch_size {
+            match self.next_entry() {
+                Ok(Some(entry)) => batch.push(entry),
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
+    }
+
+    /// Create an iterator that yields batches
+    fn iter_batches(slf: PyRef<'_, Self>) -> PyResult<PyBatchIterator> {
+        if slf.batch_size.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "batch_size must be set to use iter_batches()",
+            ));
+        }
+        Ok(PyBatchIterator { loader: slf.into() })
     }
 
     #[getter]
@@ -456,6 +499,11 @@ impl PyTarDataLoader {
         self.max_file_size
     }
 
+    #[getter]
+    fn batch_size(&self) -> Option<usize> {
+        self.batch_size
+    }
+
     #[setter]
     fn set_buffer_size(&mut self, size: usize) {
         self.buffer_size = size.max(1);
@@ -469,6 +517,11 @@ impl PyTarDataLoader {
     #[setter]
     fn set_chunk_size_mb(&mut self, size_mb: usize) {
         self.chunk_size_bytes = size_mb.max(1) * 1024 * 1024;
+    }
+
+    #[setter]
+    fn set_batch_size(&mut self, batch_size: Option<usize>) {
+        self.batch_size = batch_size;
     }
 
     fn get_metadata(&self, shard_idx: usize, py: Python) -> PyResult<PyObject> {
@@ -760,6 +813,24 @@ impl PyTarDataLoader {
         };
 
         Py::new(py, iterator).map(|py_iter| py_iter.to_object(py))
+    }
+}
+
+// Batch iterator for PyTarDataLoader
+#[pyclass(name = "TarBatchIterator")]
+pub struct PyBatchIterator {
+    loader: Py<PyTarDataLoader>,
+}
+
+#[pymethods]
+impl PyBatchIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<Vec<PyTarFileEntry>>> {
+        let mut loader = self.loader.borrow_mut(py);
+        loader.next_batch()
     }
 }
 
@@ -1317,87 +1388,6 @@ pub fn scale_dimensions(
     scale_dimensions_with_multiple(width, height, target_pixel_area, target_resolution_multiple)
 }
 
-#[pyclass(name = "BatchDataLoader")]
-pub struct PyBatchDataLoader {
-    base_loader: PyTarDataLoader,
-    batch_size: usize,
-}
-
-#[pymethods]
-impl PyBatchDataLoader {
-    #[new]
-    #[pyo3(signature = (dataset_or_path, batch_size=32, load_file_data=true, max_file_size=50_000_000, entry_buffer_size=1000, hf_token=None, chunk_size_mb=10))]
-    fn new(
-        dataset_or_path: &PyAny,
-        batch_size: usize,
-        load_file_data: bool,
-        max_file_size: u64,
-        entry_buffer_size: usize,
-        hf_token: Option<String>,
-        chunk_size_mb: usize,
-    ) -> PyResult<Self> {
-        let base_loader = PyTarDataLoader::new(
-            dataset_or_path,
-            load_file_data,
-            max_file_size,
-            entry_buffer_size,
-            hf_token,
-            chunk_size_mb,
-        )?;
-
-        Ok(Self {
-            base_loader,
-            batch_size,
-        })
-    }
-
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Vec<PyTarFileEntry>>> {
-        let mut batch = Vec::with_capacity(slf.batch_size);
-
-        for _ in 0..slf.batch_size {
-            match slf.base_loader.next_entry() {
-                Ok(Some(entry)) => batch.push(entry),
-                Ok(None) => break,
-                Err(e) => return Err(e),
-            }
-        }
-
-        if batch.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(batch))
-        }
-    }
-
-    fn reset(&mut self) -> PyResult<()> {
-        self.base_loader.reset()
-    }
-
-    /// Get the current state of the batch dataloader
-    fn state_dict(&self, py: Python) -> PyResult<PyObject> {
-        let dict = self.base_loader.state_dict(py)?;
-        if let Ok(dict) = dict.downcast::<PyDict>(py) {
-            dict.set_item("batch_size", self.batch_size)?;
-        }
-        Ok(dict)
-    }
-
-    /// Load state from a dictionary
-    fn load_state_dict(&mut self, state_dict: &PyDict) -> PyResult<()> {
-        self.base_loader.load_state_dict(state_dict)?;
-        if let Ok(Some(item)) = state_dict.get_item("batch_size") {
-            if let Ok(batch_size) = item.extract::<usize>() {
-                self.batch_size = batch_size;
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct BucketEntry {
     pub shard_idx: usize,
@@ -1413,7 +1403,6 @@ pub enum BucketSamplingStrategy {
     FullyRandom,         // Random sampling across all buckets
 }
 
-
 #[pyclass(name = "BucketDataLoader")]
 pub struct PyBucketDataLoader {
     dataset: Arc<Mutex<DiscoveredDataset>>,
@@ -1422,7 +1411,7 @@ pub struct PyBucketDataLoader {
     // Bucket data - now built lazily
     buckets: BTreeMap<String, Vec<BucketEntry>>,
     bucket_keys: Vec<String>,
-    
+
     // Track which shards have been processed
     processed_shards: Vec<bool>,
     next_shard_to_process: usize,
@@ -1449,10 +1438,13 @@ pub struct PyBucketDataLoader {
     source: String,
     hf_token: Option<String>,
     metadata_source: Option<String>,
-    
+
     // Lazy loading configuration
     lazy_load: bool,
-    shard_batch_size: usize,  // How many shards to process at once
+    shard_batch_size: usize, // How many shards to process at once
+
+    // Batch loading support
+    batch_size: Option<usize>,
 }
 
 #[pymethods]
@@ -1470,7 +1462,8 @@ impl PyBucketDataLoader {
         hf_token=None,
         chunk_size_mb=10,
         lazy_load=true,
-        shard_batch_size=10
+        shard_batch_size=10,
+        batch_size=None
     ))]
     fn new(
         dataset_or_path: &PyAny,
@@ -1485,6 +1478,7 @@ impl PyBucketDataLoader {
         chunk_size_mb: usize,
         lazy_load: bool,
         shard_batch_size: usize,
+        batch_size: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Arc::new(Runtime::new().expect("Failed to create runtime"));
 
@@ -1546,11 +1540,14 @@ impl PyBucketDataLoader {
             metadata_source,
             lazy_load,
             shard_batch_size: shard_batch_size.max(1),
+            batch_size,
         };
 
         // For non-lazy mode or fully random sampling, build all buckets upfront
         if !lazy_load || sampling == BucketSamplingStrategy::FullyRandom {
-            println!("[webshart] Non-lazy mode or fully random sampling: building all buckets upfront");
+            println!(
+                "[webshart] Non-lazy mode or fully random sampling: building all buckets upfront"
+            );
             loader.build_all_buckets()?;
         } else {
             println!("[webshart] Lazy mode enabled: buckets will be built on demand");
@@ -1569,15 +1566,45 @@ impl PyBucketDataLoader {
         slf.next_entry()
     }
 
+    /// Get the next batch of entries
+    fn next_batch(&mut self) -> PyResult<Option<Vec<PyTarFileEntry>>> {
+        let batch_size = self.batch_size.unwrap_or(1);
+        let mut batch = Vec::with_capacity(batch_size);
+
+        for _ in 0..batch_size {
+            match self.next_entry() {
+                Ok(Some(entry)) => batch.push(entry),
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
+    }
+
+    /// Create an iterator that yields batches
+    fn iter_batches(slf: PyRef<'_, Self>) -> PyResult<PyBucketBatchIterator> {
+        if slf.batch_size.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "batch_size must be set to use iter_batches()",
+            ));
+        }
+        Ok(PyBucketBatchIterator { loader: slf.into() })
+    }
+
     fn reset(&mut self) -> PyResult<()> {
         self.current_bucket_idx = 0;
         self.current_entry_idx = 0;
         self.random_position = 0;
         self.next_shard_to_process = 0;
-        
+
         // Reset processed shards tracking
         self.processed_shards.fill(false);
-        
+
         // Clear buckets for lazy rebuilding
         self.buckets.clear();
         self.bucket_keys.clear();
@@ -1599,8 +1626,12 @@ impl PyBucketDataLoader {
         dict.set_item("num_buckets", self.buckets.len())?;
         dict.set_item("sampling_strategy", format!("{:?}", self.sampling_strategy))?;
         dict.set_item("lazy_load", self.lazy_load)?;
-        dict.set_item("shards_processed", self.processed_shards.iter().filter(|&&x| x).count())?;
+        dict.set_item(
+            "shards_processed",
+            self.processed_shards.iter().filter(|&&x| x).count(),
+        )?;
         dict.set_item("total_shards", self.processed_shards.len())?;
+        dict.set_item("batch_size", self.batch_size)?;
 
         let mut total_files = 0;
         let mut min_files = usize::MAX;
@@ -1647,6 +1678,16 @@ impl PyBucketDataLoader {
         }
     }
 
+    #[getter]
+    fn batch_size(&self) -> Option<usize> {
+        self.batch_size
+    }
+
+    #[setter]
+    fn set_batch_size(&mut self, batch_size: Option<usize>) {
+        self.batch_size = batch_size;
+    }
+
     fn skip_to_bucket(&mut self, bucket_key: &str) -> PyResult<()> {
         // In lazy mode, we might need to load more shards to find this bucket
         if self.lazy_load && !self.buckets.contains_key(bucket_key) {
@@ -1658,7 +1699,7 @@ impl PyBucketDataLoader {
                 }
             }
         }
-        
+
         if let Some(idx) = self.bucket_keys.iter().position(|k| k == bucket_key) {
             self.current_bucket_idx = idx;
             self.current_entry_idx = 0;
@@ -1673,14 +1714,33 @@ impl PyBucketDataLoader {
 
     fn __repr__(&self) -> String {
         format!(
-            "BucketDataLoader(buckets={}, strategy={:?}, current_bucket={}, lazy={}, shards_processed={}/{})",
+            "BucketDataLoader(buckets={}, strategy={:?}, current_bucket={}, lazy={}, shards_processed={}/{}, batch_size={:?})",
             self.buckets.len(),
             self.sampling_strategy,
             self.current_bucket_idx,
             self.lazy_load,
             self.processed_shards.iter().filter(|&&x| x).count(),
-            self.processed_shards.len()
+            self.processed_shards.len(),
+            self.batch_size
         )
+    }
+}
+
+// Batch iterator for PyBucketDataLoader
+#[pyclass(name = "BucketBatchIterator")]
+pub struct PyBucketBatchIterator {
+    loader: Py<PyBucketDataLoader>,
+}
+
+#[pymethods]
+impl PyBucketBatchIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python) -> PyResult<Option<Vec<PyTarFileEntry>>> {
+        let mut loader = self.loader.borrow_mut(py);
+        loader.next_batch()
     }
 }
 
@@ -1714,36 +1774,41 @@ impl PyBucketDataLoader {
 
     fn ensure_buckets_available(&mut self) -> PyResult<()> {
         // Check if we need more buckets
-        if self.current_bucket_idx >= self.bucket_keys.len() && 
-           self.next_shard_to_process < self.processed_shards.len() {
+        if self.current_bucket_idx >= self.bucket_keys.len()
+            && self.next_shard_to_process < self.processed_shards.len()
+        {
             // Process next batch of shards
             self.process_shard_batch()?;
         }
-        
+
         Ok(())
     }
 
     fn process_shard_batch(&mut self) -> PyResult<()> {
         let start = self.next_shard_to_process;
         let end = (start + self.shard_batch_size).min(self.processed_shards.len());
-        
+
         if start >= end {
             return Ok(());
         }
-        
-        println!("[webshart] Processing shards {}-{} (lazy loading)", start + 1, end);
-        
+
+        println!(
+            "[webshart] Processing shards {}-{} (lazy loading)",
+            start + 1,
+            end
+        );
+
         for shard_idx in start..end {
             if !self.processed_shards[shard_idx] {
                 self.add_shard_to_buckets(shard_idx)?;
             }
         }
-        
+
         self.next_shard_to_process = end;
-        
+
         // Update bucket keys after adding new shards
         self.update_bucket_keys();
-        
+
         Ok(())
     }
 
@@ -1766,21 +1831,23 @@ impl PyBucketDataLoader {
                     .push(entry);
             }
         }
-        
+
         self.processed_shards[shard_idx] = true;
         Ok(())
     }
 
     fn update_bucket_keys(&mut self) {
         // Update bucket keys to include any new buckets
-        let mut new_keys: Vec<String> = self.buckets.keys()
+        let mut new_keys: Vec<String> = self
+            .buckets
+            .keys()
             .filter(|k| !self.bucket_keys.contains(k))
             .cloned()
             .collect();
-        
+
         new_keys.sort();
         self.bucket_keys.extend(new_keys);
-        
+
         // Apply randomization to new entries if needed
         match self.sampling_strategy {
             BucketSamplingStrategy::RandomWithinBuckets => {
@@ -1843,6 +1910,7 @@ impl PyBucketDataLoader {
             source: self.source.clone(),
             hf_token: self.hf_token.clone(),
             metadata_source: self.metadata_source.clone(),
+            batch_size: None,
         };
 
         loader.get_shard_aspect_buckets_internal(
@@ -1859,7 +1927,7 @@ impl PyBucketDataLoader {
         if self.lazy_load {
             self.ensure_buckets_available()?;
         }
-        
+
         match self.sampling_strategy {
             BucketSamplingStrategy::Sequential => self.next_sequential(),
             BucketSamplingStrategy::RandomWithinBuckets => self.next_random_within_buckets(),
@@ -1957,7 +2025,6 @@ impl PyBucketDataLoader {
             data,
         }))
     }
-
 
     fn load_file_remote(
         &self,
