@@ -25,4 +25,4 @@ for batch in loader.iter_batches():
     if processed >= 100:
         break
 
-print(f"✅ Processed {processed} files.")
+print(f"✅ Processed {processed} batches.")
