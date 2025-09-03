@@ -19,8 +19,8 @@ print("Loader OK.")
 processed = 0
 
 print("- Starting to iterate over dataloader. -")
-for entry in loader.iter_batches():
-    print(f"Processing entry: {entry}")
+for batch in loader.iter_batches():
+    print(f"Processing batch: {batch}")
     processed += 1
     if processed >= 100:
         break
