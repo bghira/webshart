@@ -18,9 +18,7 @@ print("Loader OK.")
 
 processed = 0
 
-print(
-    "- Starting to iterate over dataloader. We should now see processing entry, not processing shard. -"
-)
+print("- Starting to iterate over dataloader. -")
 for entry in loader:
     print(f"Processing entry: {entry}")
     data = entry.data
