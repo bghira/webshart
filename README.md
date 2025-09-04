@@ -142,6 +142,10 @@ I discovered after creating this library that [cheesechaser](https://github.com/
 - more informative API for caching and other Rust implementation details
 - multi-gpu/multi-node friendly dataloader
 
+## Projects using webshart
+
+- [CaptionFlow](https://github.com/bghira/CaptionFlow) uses this library to solve memory use and seek performance issues typical to webdatasets
+
 ## License
 
 MIT
