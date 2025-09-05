@@ -24,6 +24,7 @@ processed = 0
 
 for entry in loader:
     data = entry.data
+    print(f"Entry: {entry.job_id}")
     processed += 1
 
     # Save checkpoint every 50 files
