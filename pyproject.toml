@@ -40,3 +40,5 @@ Issues = "https://github.com/bghira/webshart/issues"
 python-source = "python"
 module-name = "webshart._webshart"
 
+[dependencies]
+tqdm = "^4.67.1"
