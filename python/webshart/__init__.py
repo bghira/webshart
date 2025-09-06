@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional, Union, List, Tuple, Any
 import argparse
 import sys
-from .cache_wait import CacheWaitContext
+from .cache_wait import CacheWaitContext, iter_with_cache_wait, next_with_cache_wait
 
 
 from webshart._webshart import (
@@ -28,6 +28,9 @@ __all__ = [
     "BatchOperations",
     "discover_datasets_batch",
     "read_files_batch",
+    "CacheWaitContext",
+    "iter_with_cache_wait",
+    "next_with_cache_wait",
 ]
 
 
@@ -64,7 +67,53 @@ def discover_dataset(
         return discovery.discover_huggingface(source, subfolder=subfolder)
 
 
-# Batch convenience functions
+def extract_metadata(args):
+    """Extract metadata from unindexed webdataset shards."""
+    extractor = MetadataExtractor(hf_token=args.hf_token)
+
+    # Parse range if provided
+    shard_range = None
+    if args.range:
+        try:
+            parts = args.range.split(",")
+            if len(parts) != 2:
+                raise ValueError("Range must be in format 'start,end'")
+            start = int(parts[0])
+            end = int(parts[1])
+            if start < 0 or end < start:
+                raise ValueError(
+                    "Invalid range: start must be >= 0 and end must be >= start"
+                )
+            shard_range = (start, end)
+            print(f"Processing shards in range [{start}, {end})")
+        except Exception as e:
+            print(f"✗ Error parsing range: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        if shard_range:
+            extractor.extract_metadata(
+                source=args.source,
+                destination=args.destination,
+                checkpoint_dir=args.checkpoint_dir,
+                max_workers=args.max_workers,
+                shard_range=shard_range,
+                include_image_geometry=args.include_image_geometry,
+            )
+        else:
+            extractor.extract_metadata(
+                source=args.source,
+                destination=args.destination,
+                checkpoint_dir=args.checkpoint_dir,
+                max_workers=args.max_workers,
+                include_image_geometry=args.include_image_geometry,
+            )
+        print(f"✓ Metadata extraction complete for {args.source}")
+    except Exception as e:
+        print(f"✗ Error extracting metadata: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def discover_datasets_batch(
     sources: List[str],
     hf_token: Optional[str] = None,
@@ -215,53 +264,6 @@ class BatchProcessor:
                 results.extend(batch_data)
 
         return results
-
-
-def extract_metadata(args):
-    """Extract metadata from unindexed webdataset shards."""
-    extractor = MetadataExtractor(hf_token=args.hf_token)
-
-    # Parse range if provided
-    shard_range = None
-    if args.range:
-        try:
-            parts = args.range.split(",")
-            if len(parts) != 2:
-                raise ValueError("Range must be in format 'start,end'")
-            start = int(parts[0])
-            end = int(parts[1])
-            if start < 0 or end < start:
-                raise ValueError(
-                    "Invalid range: start must be >= 0 and end must be >= start"
-                )
-            shard_range = (start, end)
-            print(f"Processing shards in range [{start}, {end})")
-        except Exception as e:
-            print(f"✗ Error parsing range: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    try:
-        if shard_range:
-            extractor.extract_metadata(
-                source=args.source,
-                destination=args.destination,
-                checkpoint_dir=args.checkpoint_dir,
-                max_workers=args.max_workers,
-                shard_range=shard_range,
-                include_image_geometry=args.include_image_geometry,
-            )
-        else:
-            extractor.extract_metadata(
-                source=args.source,
-                destination=args.destination,
-                checkpoint_dir=args.checkpoint_dir,
-                max_workers=args.max_workers,
-                include_image_geometry=args.include_image_geometry,
-            )
-        print(f"✓ Metadata extraction complete for {args.source}")
-    except Exception as e:
-        print(f"✗ Error extracting metadata: {e}", file=sys.stderr)
-        sys.exit(1)
 
 
 def main():
