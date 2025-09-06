@@ -1,6 +1,7 @@
 // dataloader/shard_cache.rs
 use crate::dataloader::file_loading::FileLoader;
 use crate::error::{Result, WebshartError};
+use fs2::FileExt;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,6 +9,14 @@ use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
+
+/// a RAII guard that holds a shared lock on a shard file.
+/// te lock is released when this struct is dropped.
+#[derive(Debug)]
+pub struct ShardLockGuard {
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
 
 #[derive(Debug, Clone)]
 pub struct ShardCache {
@@ -44,6 +53,21 @@ impl ShardCache {
 
     pub async fn is_cached(&self, shard_name: &str) -> bool {
         self.get_cached_shard_path(shard_name).exists()
+    }
+
+    pub async fn lock_shard_for_reading(&self, shard_name: &str) -> Result<ShardLockGuard> {
+        let path = self.get_cached_shard_path(shard_name);
+
+        let file = std::fs::File::open(&path).map_err(|e| WebshartError::Io(e))?;
+
+        file.lock_shared().map_err(|e| {
+            WebshartError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to acquire shared lock: {}", e),
+            ))
+        })?;
+
+        Ok(ShardLockGuard { file })
     }
 
     pub async fn cache_shard(
@@ -177,24 +201,60 @@ impl ShardCache {
         let mut queue = self.lru_queue.lock().unwrap();
         let mut current_size = self.current_size_bytes.lock().unwrap();
 
+        let mut shards_to_skip = Vec::new();
+
         while *current_size + needed_bytes > self.cache_limit_bytes && !queue.is_empty() {
             if let Some(shard_to_evict) = queue.pop_front() {
-                if let Some(size) = sizes.remove(&shard_to_evict) {
-                    *current_size -= size;
+                // Try to acquire exclusive lock on the file
+                let path = self.get_cached_shard_path(&shard_to_evict);
 
-                    // Delete the file
-                    let path = self.get_cached_shard_path(&shard_to_evict);
-                    drop(sizes);
-                    drop(queue);
-                    drop(current_size);
+                // Check if we can lock the file for exclusive access
+                let can_evict = match std::fs::File::open(&path) {
+                    Ok(file) => {
+                        // Try to acquire exclusive lock (non-blocking)
+                        match file.try_lock_exclusive() {
+                            Ok(_) => {
+                                // We got the lock, unlock immediately since we're just checking
+                                let _ = file.unlock();
+                                true
+                            }
+                            Err(_) => {
+                                // File is locked by another process
+                                false
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // File doesn't exist or can't be opened, safe to remove from metadata
+                        true
+                    }
+                };
 
-                    let _ = fs::remove_file(path).await;
+                if can_evict {
+                    if let Some(size) = sizes.remove(&shard_to_evict) {
+                        *current_size -= size;
 
-                    sizes = self.shard_sizes.lock().unwrap();
-                    queue = self.lru_queue.lock().unwrap();
-                    current_size = self.current_size_bytes.lock().unwrap();
+                        // Delete the file
+                        drop(sizes);
+                        drop(queue);
+                        drop(current_size);
+
+                        let _ = fs::remove_file(path).await;
+
+                        sizes = self.shard_sizes.lock().unwrap();
+                        queue = self.lru_queue.lock().unwrap();
+                        current_size = self.current_size_bytes.lock().unwrap();
+                    }
+                } else {
+                    // File is locked, keep it and try other files
+                    shards_to_skip.push(shard_to_evict);
                 }
             }
+        }
+
+        // Put skipped shards back at the front of the queue
+        for shard in shards_to_skip.into_iter().rev() {
+            queue.push_front(shard);
         }
 
         Ok(())
