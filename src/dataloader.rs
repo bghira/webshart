@@ -2,7 +2,7 @@ use crate::FileInfo;
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset, PyDiscoveredDataset};
 use crate::error::{Result, WebshartError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use rand::{rng, seq::SliceRandom};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -359,6 +359,323 @@ impl PyTarDataLoader {
         Ok(PyBatchIterator { loader: slf.into() })
     }
 
+    fn will_block(&self) -> PyResult<bool> {
+        // If we have entries in buffer, won't block
+        if self.buffer_position < self.entry_buffer.len() {
+            return Ok(false);
+        }
+        let dataset = self.dataset.lock().unwrap();
+        if !dataset.is_remote || dataset.shard_cache.is_none() {
+            return Ok(false);
+        }
+        if self.current_shard >= dataset.num_shards() {
+            return Ok(false);
+        }
+        let shard_name = dataset.shards[self.current_shard]
+            .tar_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let cache = dataset.shard_cache.as_ref().unwrap().clone();
+
+        drop(dataset);
+        let is_cached = self.runtime.block_on(cache.is_cached(&shard_name));
+        Ok(!is_cached)
+    }
+
+    fn prepare_shard_by_name(&self, filename: &str) -> PyResult<bool> {
+        let dataset = self.dataset.lock().unwrap();
+
+        if !dataset.is_remote || dataset.shard_cache.is_none() {
+            return Ok(false);
+        }
+
+        let shard_idx = self.find_shard_by_filename(&dataset, filename)?;
+        let shard = &dataset.shards[shard_idx];
+        let tar_path = shard.tar_path.clone();
+        let shard_name = tar_path.rsplit('/').next().unwrap_or(&tar_path).to_string();
+        let token = dataset.get_hf_token();
+        let cache = dataset.shard_cache.as_ref().unwrap().clone();
+
+        // Drop the dataset lock before any async/await or spawn
+        drop(dataset);
+
+        // Check cache status before spawning
+        let is_cached = self.runtime.block_on({
+            let cache = cache.clone();
+            let shard_name = shard_name.clone();
+            async move { cache.is_cached(&shard_name).await }
+        });
+        if is_cached {
+            return Ok(false);
+        }
+
+        // Clone all data needed for the async block before spawning
+        let runtime = self.runtime.clone();
+        let shard_name_cloned = shard_name.clone();
+        let tar_path_cloned = tar_path.clone();
+        let token_cloned = token.clone();
+        let cache_cloned = cache.clone();
+
+        // All clones above are Send, so nothing non-Send is captured
+        runtime.spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                match cache_cloned
+                    .cache_shard(&shard_name_cloned, &tar_path_cloned, token_cloned)
+                    .await
+                {
+                    Ok(_) => {
+                        println!("[webshart] Pre-cached shard: {}", shard_name_cloned);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[webshart] Failed to pre-cache shard {}: {}",
+                            shard_name_cloned, e
+                        );
+                    }
+                }
+            })
+        });
+
+        Ok(true)
+    }
+
+    fn prepare_next_shard(&self) -> PyResult<bool> {
+        let dataset = self.dataset.lock().unwrap();
+
+        if !dataset.is_remote || dataset.shard_cache.is_none() {
+            return Ok(false);
+        }
+
+        if self.current_shard >= dataset.num_shards() {
+            return Ok(false);
+        }
+
+        let shard = &dataset.shards[self.current_shard];
+        let tar_path = shard.tar_path.clone();
+        let shard_name = tar_path.rsplit('/').next().unwrap_or(&tar_path).to_string();
+        let token = dataset.get_hf_token();
+        let cache = dataset.shard_cache.as_ref().unwrap().clone();
+
+        // Drop the dataset lock before any async/await or spawn
+        drop(dataset);
+
+        // Check cache status before spawning
+        let is_cached = self.runtime.block_on({
+            let cache = cache.clone();
+            let shard_name = shard_name.clone();
+            async move { cache.is_cached(&shard_name).await }
+        });
+        if is_cached {
+            return Ok(false);
+        }
+
+        // Clone all data needed for the async block before spawning
+        let runtime = self.runtime.clone();
+        let shard_name_cloned = shard_name.clone();
+        let tar_path_cloned = tar_path.clone();
+        let token_cloned = token.clone();
+        let cache_cloned = cache.clone();
+
+        // All clones above are Send, so nothing non-Send is captured
+        runtime.spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                match cache_cloned
+                    .cache_shard(&shard_name_cloned, &tar_path_cloned, token_cloned)
+                    .await
+                {
+                    Ok(_) => {
+                        println!("[webshart] Pre-cached shard: {}", shard_name_cloned);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[webshart] Failed to pre-cache shard {}: {}",
+                            shard_name_cloned, e
+                        );
+                    }
+                }
+            })
+        });
+
+        Ok(true)
+    }
+
+    /// Get information about which shard will be loaded next
+    fn get_next_shard_info(&self, py: Python) -> PyResult<Option<PyObject>> {
+        if self.buffer_position < self.entry_buffer.len() {
+            return Ok(None); // Still have buffered entries
+        }
+
+        let dataset = self.dataset.lock().unwrap();
+
+        if self.current_shard >= dataset.num_shards() {
+            return Ok(None); // No more shards
+        }
+
+        let shard = &dataset.shards[self.current_shard];
+        let dict = PyDict::new(py);
+
+        dict.set_item("index", self.current_shard)?;
+        dict.set_item("name", &shard.name)?;
+        dict.set_item("tar_path", &shard.tar_path)?;
+
+        if dataset.is_remote && dataset.shard_cache.is_some() {
+            let shard_name = shard
+                .tar_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&shard.tar_path)
+                .to_string();
+            let cache = dataset.shard_cache.as_ref().unwrap().clone();
+            drop(dataset);
+
+            let is_cached = self.runtime.block_on(cache.is_cached(&shard_name));
+            dict.set_item("is_cached", is_cached)?;
+        } else {
+            dict.set_item("is_cached", true)?; // Local files are always "cached"
+        }
+
+        Ok(Some(dict.into()))
+    }
+
+    /// Get information about a specific shard's cache status
+    fn get_shard_cache_status(&self, py: Python, filename: &str) -> PyResult<PyObject> {
+        let dataset = self.dataset.lock().unwrap();
+
+        let shard_idx = self.find_shard_by_filename(&dataset, filename)?;
+        let shard = &dataset.shards[shard_idx];
+
+        let dict = PyDict::new(py);
+        dict.set_item("index", shard_idx)?;
+        dict.set_item("name", &shard.name)?;
+        dict.set_item("tar_path", &shard.tar_path)?;
+
+        if dataset.is_remote && dataset.shard_cache.is_some() {
+            let shard_filename = shard
+                .tar_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&shard.tar_path)
+                .to_string();
+            let cache = dataset.shard_cache.as_ref().unwrap().clone();
+            drop(dataset);
+
+            let (is_cached, size) = self.runtime.block_on(async {
+                let is_cached = cache.is_cached(&shard_filename).await;
+                let size = cache
+                    .get_cached_file_size(&shard_filename)
+                    .await
+                    .unwrap_or(0);
+                (is_cached, size)
+            });
+            dict.set_item("is_cached", is_cached)?;
+            dict.set_item("cur_filesize", size)?;
+        } else {
+            drop(dataset);
+            dict.set_item("is_cached", true)?; // Local files are always "cached"
+        }
+
+        Ok(dict.into())
+    }
+
+    #[pyo3(signature = (lookahead=5))]
+    fn get_lookahead_cache_status(&self, py: Python, lookahead: usize) -> PyResult<PyObject> {
+        let dataset = self.dataset.lock().unwrap();
+        let list = PyList::empty(py);
+
+        let start_shard = self.current_shard;
+        let end_shard = (start_shard + lookahead).min(dataset.num_shards());
+
+        for shard_idx in start_shard..end_shard {
+            let shard = &dataset.shards[shard_idx];
+            let dict = PyDict::new(py);
+
+            dict.set_item("index", shard_idx)?;
+            dict.set_item("name", &shard.name)?;
+
+            if dataset.is_remote && dataset.shard_cache.is_some() {
+                let shard_name = shard.tar_path.rsplit('/').next().unwrap_or(&shard.tar_path);
+                let cache = dataset.shard_cache.as_ref().unwrap().clone();
+                let is_cached = self.runtime.block_on(cache.is_cached(shard_name));
+                dict.set_item("is_cached", is_cached)?;
+            } else {
+                dict.set_item("is_cached", true)?;
+            }
+
+            list.append(dict)?;
+        }
+
+        Ok(list.into())
+    }
+
+    #[pyo3(signature = (num_shards=1))]
+    fn prepare_shards_ahead(&self, num_shards: usize) -> PyResult<Vec<String>> {
+        let dataset = self.dataset.lock().unwrap();
+        let mut started_caching = Vec::new();
+
+        if !dataset.is_remote || dataset.shard_cache.is_none() {
+            return Ok(started_caching);
+        }
+
+        let start_shard = self.current_shard;
+        let end_shard = (start_shard + num_shards).min(dataset.num_shards());
+
+        for shard_idx in start_shard..end_shard {
+            let shard = &dataset.shards[shard_idx];
+            let tar_path = shard.tar_path.clone();
+            let shard_name = tar_path.rsplit('/').next().unwrap_or(&tar_path).to_string();
+            let token = dataset.get_hf_token();
+            let cache = dataset.shard_cache.as_ref().unwrap().clone();
+
+            // Check if already cached
+            let is_cached = self.runtime.block_on(cache.is_cached(&shard_name));
+            if !is_cached {
+                // Spawn async task to cache the shard
+                let runtime = self.runtime.clone();
+                let shard_name_clone = shard_name.clone();
+                let tar_path_clone = tar_path.clone();
+                let token_clone = token.clone();
+                let cache_clone = cache.clone();
+                runtime.spawn_blocking(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        match cache_clone
+                            .cache_shard(&shard_name_clone, &tar_path_clone, token_clone)
+                            .await
+                        {
+                            Ok(_) => {
+                                println!("[webshart] Pre-cached shard: {}", shard_name_clone);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[webshart] Failed to pre-cache shard {}: {}",
+                                    shard_name_clone, e
+                                );
+                            }
+                        }
+                    })
+                });
+
+                started_caching.push(shard_name);
+            }
+        }
+
+        drop(dataset);
+        Ok(started_caching)
+    }
+
     // Getters
     #[getter]
     fn num_shards(&self) -> usize {
@@ -368,6 +685,22 @@ impl PyTarDataLoader {
     #[getter]
     fn current_shard_index(&self) -> usize {
         self.current_shard
+    }
+
+    #[getter]
+    fn current_shard_filename(&self) -> String {
+        let dataset = self.dataset.lock().unwrap();
+        if self.current_shard < dataset.shards.len() {
+            let shard = &dataset.shards[self.current_shard];
+            shard
+                .tar_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&shard.tar_path)
+                .to_string()
+        } else {
+            String::new()
+        }
     }
 
     #[getter]
@@ -593,7 +926,6 @@ impl PyTarDataLoader {
     }
 }
 
-// Implementation methods for PyTarDataLoader (continued in same file for now)
 impl PyTarDataLoader {
     pub(crate) fn load_file_by_info(
         &self,
@@ -888,7 +1220,7 @@ impl PyTarDataLoader {
 
         let buckets_dict = PyDict::new(py);
         for (key, files) in bucket.buckets {
-            let files_list = pyo3::types::PyList::new(
+            let files_list = PyList::new(
                 py,
                 files
                     .into_iter()
@@ -907,7 +1239,7 @@ impl PyTarDataLoader {
                             file_dict.set_item("aspect", a).unwrap();
                         }
                         if let Some((orig_w, orig_h)) = original_size {
-                            let orig_list = pyo3::types::PyList::new(py, &[orig_w, orig_h]);
+                            let orig_list = PyList::new(py, &[orig_w, orig_h]);
                             file_dict.set_item("original_size", orig_list).unwrap();
                         }
                         file_dict
@@ -1290,8 +1622,6 @@ impl PyTarDataLoader {
     }
 }
 
-// ===== BUCKET DATA LOADER =====
-
 #[pyclass(name = "BucketDataLoader")]
 pub struct PyBucketDataLoader {
     tar_loader: Py<PyTarDataLoader>,
@@ -1550,7 +1880,6 @@ impl PyBucketDataLoader {
     }
 }
 
-// Implementation methods for PyBucketDataLoader
 impl PyBucketDataLoader {
     fn build_all_buckets(&mut self, py: Python) -> PyResult<()> {
         let num_shards = self.tar_loader.borrow(py).num_shards();

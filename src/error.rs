@@ -30,6 +30,9 @@ pub enum WebshartError {
 
     #[error("Rate limit exceeded")]
     RateLimited,
+
+    #[error("Cache miss: {0}")]
+    CacheMiss(String),
 }
 
 pub type Result<T> = std::result::Result<T, WebshartError>;
