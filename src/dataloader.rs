@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use fs2::FileExt;
 
 // Import from modules
 mod aspect_buckets;
@@ -24,7 +25,7 @@ use aspect_buckets::{BucketKeyType, BucketSamplingStrategy, calculate_bucket_key
 pub use batch::{BatchIterable, BatchOperations, BatchResult, FileReadRequest, PyBatchOperations};
 use config::DataLoaderConfig;
 pub use entry_types::{BucketEntry, PyTarFileEntry, create_tar_entry};
-use file_loading::{FileLoader, create_file_loader};
+use file_loading::{FileLoader, create_file_loader, create_cached_file_loader};
 
 // Re-export the entry type as it's part of the public API
 pub use entry_types::PyTarFileEntry as TarFileEntry;
@@ -382,6 +383,28 @@ impl PyTarDataLoader {
         drop(dataset);
         let is_cached = self.runtime.block_on(cache.is_cached(&shard_name));
         Ok(!is_cached)
+    }
+
+    fn is_shard_locked(&self, shard_name: &str) -> bool {
+        let dataset = self.dataset.lock().unwrap();
+
+        if let Some(cache) = &dataset.shard_cache {
+            let cache_path = cache.get_cached_shard_path(shard_name);
+
+            // Try to acquire exclusive lock to check if it's in use
+            if let Ok(file) = std::fs::File::open(&cache_path) {
+                if file.try_lock_exclusive().is_ok() {
+                    let _ = file.unlock();
+                    false // Not locked
+                } else {
+                    true // Locked by someone
+                }
+            } else {
+                false // File doesn't exist
+            }
+        } else {
+            false
+        }
     }
 
     fn prepare_shard_by_name(&self, filename: &str) -> PyResult<bool> {
@@ -1272,20 +1295,17 @@ impl PyTarDataLoader {
                 self.runtime
                     .block_on(cache.cache_shard(shard_name, tar_path, token.clone()))
             {
-                // Use the cached local file
-                let loader = create_file_loader(
-                    &cached_path.to_string_lossy(),
-                    false, // it's local now
-                    None,  // no token needed for local
-                    self.runtime.clone(),
-                );
+                // Use the cached file loader which handles locking
+                let loader =
+                    create_cached_file_loader(cache, shard_name.to_string(), self.runtime.clone());
+
                 return loader.load_file(file_info);
             }
         } else {
             drop(dataset);
         }
 
-        // Fallback to original behavior
+        // Fallback to original behavior (no locking needed for non-cached files)
         let loader = create_file_loader(tar_path, is_remote, token, self.runtime.clone());
         loader.load_file(file_info)
     }
@@ -1452,6 +1472,73 @@ impl PyTarDataLoader {
         }
     }
 
+    fn load_file_batch_with_cache(
+        &mut self,
+        tar_path: String,
+        token: Option<String>,
+        file_entries: Vec<(String, crate::metadata::FileInfo)>,
+    ) -> PyResult<()> {
+        let dataset = self.dataset.lock().unwrap();
+
+        if let Some(cache) = &dataset.shard_cache {
+            let shard_name = tar_path.rsplit('/').next().unwrap_or(&tar_path);
+            let cache_clone = cache.clone();
+            drop(dataset);
+
+            // Try to cache the shard
+            if let Ok(cached_path) =
+                self.runtime
+                    .block_on(cache_clone.cache_shard(shard_name, &tar_path, token.clone()))
+            {
+                // Acquire lock once for the entire batch
+                if let Ok(_lock) = self
+                    .runtime
+                    .block_on(cache_clone.lock_shard_for_reading(shard_name))
+                {
+                    // Process all files while holding the lock
+                    let cached_path_str = cached_path.to_string_lossy().to_string();
+
+                    for (idx, (filename, file_info)) in file_entries.into_iter().enumerate() {
+                        let data = if self.config.load_file_data
+                            && file_info.length <= self.config.max_file_size
+                        {
+                            // Direct read - we already hold the lock
+                            let loader = create_file_loader(
+                                &cached_path_str,
+                                false, // local now
+                                None,
+                                self.runtime.clone(),
+                            );
+
+                            loader.load_file(&file_info).unwrap_or_else(|e| {
+                                eprintln!("Failed to load {}: {}", filename, e);
+                                Vec::new()
+                            })
+                        } else {
+                            Vec::new()
+                        };
+
+                        self.entry_buffer.push(create_tar_entry(
+                            filename,
+                            &file_info,
+                            data,
+                            Some(self.current_shard),
+                            Some(self.next_file_to_load + idx),
+                        ));
+                    }
+
+                    return Ok(());
+                    // Lock released here when _lock drops
+                }
+            }
+        } else {
+            drop(dataset);
+        }
+
+        // Fallback to original batch loading
+        self.load_file_batch(tar_path, token, file_entries)
+    }
+
     fn load_files_remote_streaming(
         &mut self,
         url: String,
@@ -1462,52 +1549,12 @@ impl PyTarDataLoader {
             return Ok(());
         }
 
-        // Check if we have shard cache
-        let dataset = self.dataset.lock().unwrap();
-        if let Some(cache) = &dataset.shard_cache {
-            let shard_name = url.rsplit('/').next().unwrap_or(&url);
-            let cache_clone = cache.clone();
-            drop(dataset);
-
-            // Try to cache the entire shard first
-            match self
-                .runtime
-                .block_on(cache_clone.cache_shard(shard_name, &url, token.clone()))
-            {
-                Ok(cached_path) => {
-                    // Load from cached file instead
-                    let cached_url = cached_path.to_string_lossy().to_string();
-                    drop(cache_clone);
-
-                    // Process all files from the cached shard
-                    for (idx, (filename, file_info)) in file_entries.into_iter().enumerate() {
-                        let data = if self.config.load_file_data
-                            && file_info.length <= self.config.max_file_size
-                        {
-                            self.load_single_file_data(&cached_url, &file_info, false, None)
-                                .unwrap_or_else(|e| {
-                                    eprintln!("Failed to load {}: {}", filename, e);
-                                    Vec::new()
-                                })
-                        } else {
-                            Vec::new()
-                        };
-                        self.entry_buffer.push(create_tar_entry(
-                            filename,
-                            &file_info,
-                            data,
-                            Some(self.current_shard),
-                            Some(self.next_file_to_load + idx),
-                        ));
-                    }
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Cache failed, continue with original streaming approach
-                }
-            }
-        } else {
-            drop(dataset);
+        // Try cache-aware loading first
+        if self
+            .load_file_batch_with_cache(url.clone(), token.clone(), file_entries.clone())
+            .is_ok()
+        {
+            return Ok(());
         }
 
         let first_offset = file_entries[0].1.offset;
@@ -1619,6 +1666,17 @@ impl PyTarDataLoader {
         }
 
         Ok(())
+    }
+
+    fn load_single_file_data_no_lock(
+        &self,
+        tar_path: &str,
+        file_info: &FileInfo,
+        is_remote: bool,
+        token: Option<String>,
+    ) -> Result<Vec<u8>> {
+        let loader = create_file_loader(tar_path, is_remote, token, self.runtime.clone());
+        loader.load_file(file_info)
     }
 }
 
