@@ -17,7 +17,7 @@ pub use metadata::{FileInfo, ShardMetadata};
 /// A Python module implemented in Rust for fast webdataset shard reading
 #[pymodule]
 fn _webshart(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     // Add Python classes
     m.add_class::<discovery::PyDatasetDiscovery>()?;
