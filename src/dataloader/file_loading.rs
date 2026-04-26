@@ -1,14 +1,32 @@
 use crate::{
     FileInfo,
-    dataloader::shard_cache::{ShardCache, ShardLockGuard},
+    dataloader::shard_cache::ShardCache,
     error::{Result, WebshartError},
 };
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
 pub trait FileLoader: Send + Sync {
     fn load_file(&self, file_info: &FileInfo) -> Result<Vec<u8>>;
+}
+
+pub(crate) fn file_http_client() -> Result<reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(8)
+        .build()
+        .map_err(WebshartError::from)?;
+
+    let _ = CLIENT.set(client);
+    Ok(CLIENT.get().expect("HTTP client initialized").clone())
 }
 
 pub struct LocalFileLoader {
@@ -97,18 +115,19 @@ impl RemoteFileLoader {
 impl FileLoader for RemoteFileLoader {
     fn load_file(&self, file_info: &FileInfo) -> Result<Vec<u8>> {
         self.runtime.block_on(async {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()?;
+            let client = file_http_client()?;
 
-            let mut request = client.get(&self.url).header(
-                "Range",
-                format!(
-                    "bytes={}-{}",
-                    file_info.offset,
-                    file_info.offset + file_info.length - 1
-                ),
-            );
+            let mut request = client
+                .get(&self.url)
+                .header(
+                    "Range",
+                    format!(
+                        "bytes={}-{}",
+                        file_info.offset,
+                        file_info.offset + file_info.length - 1
+                    ),
+                )
+                .timeout(Duration::from_secs(60));
 
             if let Some(token) = &self.token {
                 request = request.bearer_auth(token);

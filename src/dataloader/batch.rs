@@ -1,4 +1,5 @@
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset};
+use crate::dataloader::file_loading::file_http_client;
 use crate::error::{Result, WebshartError};
 use futures::future::join_all;
 use pyo3::prelude::*;
@@ -183,11 +184,12 @@ async fn read_file_remote(
     offset: u64,
     length: u64,
 ) -> Result<Vec<u8>> {
-    let client = reqwest::Client::new();
+    let client = file_http_client()?;
 
     let mut request = client
         .get(tar_url)
-        .header("Range", format!("bytes={}-{}", offset, offset + length - 1));
+        .header("Range", format!("bytes={}-{}", offset, offset + length - 1))
+        .timeout(std::time::Duration::from_secs(60));
 
     if let Some(token) = hf_token {
         request = request.bearer_auth(token);

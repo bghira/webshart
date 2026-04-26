@@ -83,6 +83,21 @@ impl ShardMetadata {
     pub fn files(&self) -> Vec<FileInfo> {
         self.files.iter().map(FileInfo::from).collect()
     }
+
+    /// Iterate over files without materializing the entire metadata table.
+    pub fn iter_files(&self) -> impl Iterator<Item = (&str, FileInfo)> + '_ {
+        self.files
+            .iter()
+            .map(|info| (info.path.as_str(), FileInfo::from(info)))
+    }
+
+    /// Return a bounded range of file entries without cloning unrelated files.
+    pub fn file_range(&self, start: usize, end: usize) -> Vec<(String, FileInfo)> {
+        self.files[start..end]
+            .iter()
+            .map(|info| (info.path.clone(), FileInfo::from(info)))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,8 +179,9 @@ impl ShardMetadata {
                 files,
                 includes_image_geometry,
             } => {
-                let file_vec: Vec<FileInfoInternal> =
+                let mut file_vec: Vec<FileInfoInternal> =
                     files.into_iter().map(FileInfoInternal::from).collect();
+                file_vec.sort_by(|a, b| a.path.cmp(&b.path));
 
                 Self {
                     path: path.unwrap_or_else(|| String::from("unknown")),

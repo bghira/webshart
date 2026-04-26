@@ -25,7 +25,7 @@ use aspect_buckets::{BucketKeyType, BucketSamplingStrategy, calculate_bucket_key
 pub use batch::{BatchIterable, BatchOperations, BatchResult, FileReadRequest, PyBatchOperations};
 use config::DataLoaderConfig;
 pub use entry_types::{BucketEntry, PyTarFileEntry, create_tar_entry};
-use file_loading::{FileLoader, create_file_loader, create_cached_file_loader};
+use file_loading::{create_cached_file_loader, create_file_loader, file_http_client};
 
 // Re-export the entry type as it's part of the public API
 pub use entry_types::PyTarFileEntry as TarFileEntry;
@@ -808,17 +808,13 @@ impl PyTarDataLoader {
             WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
         })?;
 
-        let files = shard
-            .metadata
-            .as_ref()
-            .map(|m| m.files())
-            .unwrap_or_default();
-
         let dict = PyDict::new(py);
 
-        for file_info in files.iter() {
-            let file_dict = pythonize::pythonize(py, file_info)?;
-            dict.set_item(&file_info.path, file_dict)?;
+        if let Some(metadata) = &shard.metadata {
+            for (_, file_info) in metadata.iter_files() {
+                let file_dict = pythonize::pythonize(py, &file_info)?;
+                dict.set_item(&file_info.path, file_dict)?;
+            }
         }
 
         Ok(dict.into())
@@ -1012,7 +1008,7 @@ impl PyTarDataLoader {
         let mut buckets: BTreeMap<String, Vec<(String, FileInfo, Option<(u32, u32)>)>> =
             BTreeMap::new();
 
-        for file_info in metadata.files() {
+        for (filename, file_info) in metadata.iter_files() {
             if let (Some(width), Some(height)) = (file_info.width, file_info.height) {
                 let target_resolution_multiple = target_resolution_multiple.unwrap_or(64);
 
@@ -1026,12 +1022,8 @@ impl PyTarDataLoader {
                     round_to,
                 );
 
-                let filename = file_info
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
                 buckets.entry(bucket_key).or_insert_with(Vec::new).push((
-                    filename,
+                    filename.to_string(),
                     file_info,
                     original_size,
                 ));
@@ -1291,7 +1283,7 @@ impl PyTarDataLoader {
             drop(dataset); // Release lock before async operation
 
             // Try to get/download to cache
-            if let Ok(cached_path) =
+            if let Ok(_cached_path) =
                 self.runtime
                     .block_on(cache.cache_shard(shard_name, tar_path, token.clone()))
             {
@@ -1335,20 +1327,37 @@ impl PyTarDataLoader {
             }
         }
         if self.buffer_position < self.entry_buffer.len() {
-            let entry = self.entry_buffer[self.buffer_position].clone();
-            self.buffer_position += 1;
-            return Ok(Some(entry));
+            return Ok(self.take_buffered_entry());
         }
 
         self.refill_buffer()?;
 
         if self.buffer_position < self.entry_buffer.len() {
-            let entry = self.entry_buffer[self.buffer_position].clone();
-            self.buffer_position += 1;
-            Ok(Some(entry))
+            Ok(self.take_buffered_entry())
         } else {
             Ok(None)
         }
+    }
+
+    fn take_buffered_entry(&mut self) -> Option<PyTarFileEntry> {
+        if self.buffer_position >= self.entry_buffer.len() {
+            return None;
+        }
+
+        let entry = &mut self.entry_buffer[self.buffer_position];
+        let result = PyTarFileEntry {
+            path: std::mem::take(&mut entry.path),
+            offset: entry.offset,
+            size: entry.size,
+            data: std::mem::take(&mut entry.data),
+            width: entry.width,
+            height: entry.height,
+            aspect: entry.aspect,
+            shard_idx: entry.shard_idx,
+            file_idx: entry.file_idx,
+        };
+        self.buffer_position += 1;
+        Some(result)
     }
 
     fn refill_buffer(&mut self) -> PyResult<()> {
@@ -1406,23 +1415,7 @@ impl PyTarDataLoader {
 
         let start_idx = self.next_file_to_load;
         let end_idx = std::cmp::min(start_idx + self.config.buffer_size, total_files);
-
-        let mut all_files: Vec<(String, crate::metadata::FileInfo)> = Vec::new();
-        for idx in 0..total_files {
-            if let Some((filename, file_info)) = metadata.get_file_by_index(idx) {
-                all_files.push((filename, file_info.clone()));
-            }
-        }
-
-        all_files.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut file_entries = Vec::new();
-        for idx in start_idx..end_idx {
-            if idx < all_files.len() {
-                let (filename, file_info) = &all_files[idx];
-                file_entries.push((filename.clone(), file_info.clone()));
-            }
-        }
+        let file_entries = metadata.file_range(start_idx, end_idx);
 
         drop(dataset);
 
@@ -1443,6 +1436,15 @@ impl PyTarDataLoader {
         file_entries: Vec<(String, crate::metadata::FileInfo)>,
     ) -> PyResult<()> {
         let is_remote = tar_path.starts_with("http");
+
+        if !self.config.load_file_data
+            || file_entries
+                .iter()
+                .all(|(_, file_info)| file_info.length > self.config.max_file_size)
+        {
+            self.push_entries_without_data(file_entries);
+            return Ok(());
+        }
 
         if is_remote && file_entries.len() > 1 {
             self.load_files_remote_streaming(tar_path, token, file_entries)
@@ -1472,71 +1474,80 @@ impl PyTarDataLoader {
         }
     }
 
-    fn load_file_batch_with_cache(
+    fn push_entries_without_data(
         &mut self,
-        tar_path: String,
-        token: Option<String>,
         file_entries: Vec<(String, crate::metadata::FileInfo)>,
-    ) -> PyResult<()> {
+    ) {
+        for (idx, (filename, file_info)) in file_entries.into_iter().enumerate() {
+            self.entry_buffer.push(create_tar_entry(
+                filename,
+                &file_info,
+                Vec::new(),
+                Some(self.current_shard),
+                Some(self.next_file_to_load + idx),
+            ));
+        }
+    }
+
+    fn try_load_file_batch_from_cache(
+        &mut self,
+        tar_path: &str,
+        token: Option<String>,
+        file_entries: &[(String, crate::metadata::FileInfo)],
+    ) -> PyResult<bool> {
         let dataset = self.dataset.lock().unwrap();
 
         if let Some(cache) = &dataset.shard_cache {
-            let shard_name = tar_path.rsplit('/').next().unwrap_or(&tar_path);
+            let shard_name = tar_path.rsplit('/').next().unwrap_or(tar_path);
             let cache_clone = cache.clone();
             drop(dataset);
 
             // Try to cache the shard
             if let Ok(cached_path) =
                 self.runtime
-                    .block_on(cache_clone.cache_shard(shard_name, &tar_path, token.clone()))
+                    .block_on(cache_clone.cache_shard(shard_name, tar_path, token.clone()))
             {
                 // Acquire lock once for the entire batch
                 if let Ok(_lock) = self
                     .runtime
                     .block_on(cache_clone.lock_shard_for_reading(shard_name))
                 {
-                    // Process all files while holding the lock
-                    let cached_path_str = cached_path.to_string_lossy().to_string();
+                    use std::io::{Read, Seek, SeekFrom};
 
-                    for (idx, (filename, file_info)) in file_entries.into_iter().enumerate() {
+                    let mut file = std::fs::File::open(&cached_path).map_err(WebshartError::Io)?;
+                    for (idx, (filename, file_info)) in file_entries.iter().enumerate() {
                         let data = if self.config.load_file_data
                             && file_info.length <= self.config.max_file_size
                         {
-                            // Direct read - we already hold the lock
-                            let loader = create_file_loader(
-                                &cached_path_str,
-                                false, // local now
-                                None,
-                                self.runtime.clone(),
-                            );
-
-                            loader.load_file(&file_info).unwrap_or_else(|e| {
-                                eprintln!("Failed to load {}: {}", filename, e);
-                                Vec::new()
-                            })
+                            let mut buffer = vec![0u8; file_info.length as usize];
+                            file.seek(SeekFrom::Start(file_info.offset))
+                                .and_then(|_| file.read_exact(&mut buffer))
+                                .map(|_| buffer)
+                                .unwrap_or_else(|e| {
+                                    eprintln!("Failed to load {}: {}", filename, e);
+                                    Vec::new()
+                                })
                         } else {
                             Vec::new()
                         };
 
                         self.entry_buffer.push(create_tar_entry(
-                            filename,
-                            &file_info,
+                            filename.clone(),
+                            file_info,
                             data,
                             Some(self.current_shard),
                             Some(self.next_file_to_load + idx),
                         ));
                     }
 
-                    return Ok(());
-                    // Lock released here when _lock drops
+                    return Ok(true);
                 }
             }
         } else {
             drop(dataset);
         }
 
-        // Fallback to original batch loading
-        self.load_file_batch(tar_path, token, file_entries)
+        Ok(false)
     }
 
     fn load_files_remote_streaming(
@@ -1549,11 +1560,7 @@ impl PyTarDataLoader {
             return Ok(());
         }
 
-        // Try cache-aware loading first
-        if self
-            .load_file_batch_with_cache(url.clone(), token.clone(), file_entries.clone())
-            .is_ok()
-        {
+        if self.try_load_file_batch_from_cache(&url, token.clone(), &file_entries)? {
             return Ok(());
         }
 
@@ -1572,14 +1579,12 @@ impl PyTarDataLoader {
         let max_file_size = self.config.max_file_size;
 
         let fetch_result: Result<Vec<u8>> = self.runtime.block_on(async {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .map_err(WebshartError::from)?;
+            let client = file_http_client()?;
 
             let mut request = client
                 .get(&url)
-                .header("Range", format!("bytes={}-{}", first_offset, last_end - 1));
+                .header("Range", format!("bytes={}-{}", first_offset, last_end - 1))
+                .timeout(Duration::from_secs(60));
 
             if let Some(ref token) = token {
                 request = request.bearer_auth(token);
