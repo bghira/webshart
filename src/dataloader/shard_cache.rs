@@ -1,9 +1,8 @@
 // dataloader/shard_cache.rs
-use crate::dataloader::file_loading::FileLoader;
 use crate::error::{Result, WebshartError};
 use fs2::FileExt;
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
 use tokio::fs::File;
