@@ -20,7 +20,9 @@ Webshart is a fast reader for webdataset tar files with separate JSON index file
 - **Selective downloads**: Only fetch the files you need
 - **True parallelism**: Read from multiple shards simultaneously
 - **Cloud-optimized**: Works efficiently with HTTP range requests
-- **Aspect bucketing**: Optionally include image geometry hints `width`, `height` and `aspect` for the ability to bucket by shape
+- **Aspect bucketing**: Optionally include image geometry hints `width`, `height` and `aspect` for the ability to bucket images by shape
+- **Logical sample APIs**: Treat `image.ext` + `image.json` pairs as one sample while still allowing raw file access
+- **Caption metadata**: Store captions in shard metadata under the plural `captions` key as either a string or a list of strings
 - **Custom DataLoader**: Includes state dict methods on the DataLoader so that you can resume training deterministically
 - **Rate-limit friendly**: Local caching allows high-frequency random seeking without encountering storage provider rate limits
 - **Instant start-up** with pre-sorted aspect buckets
@@ -33,12 +35,22 @@ Webshart is a fast reader for webdataset tar files with separate JSON index file
 import webshart
 
 # Find your dataset
-dataset = discover_dataset(
+dataset = webshart.discover_dataset(
     source="laion/conceptual-captions-12m-webdataset",
     # we're able to upload metadata separately so that we reduce load on huggingface infra.
     metadata="webshart/conceptual-captions-12m-webdataset-metadata",
 )
 print(f"Found {dataset.num_shards} shards")
+
+loader = webshart.TarDataLoader(dataset)
+
+# File-oriented access is still available.
+files = dataset.list_files_in_shard(0)
+
+# Sample-oriented access skips paired JSON sidecars.
+samples = dataset.list_samples_in_shard(0)
+entry = loader.load_sample(0, 0)
+print(entry.path, entry.captions, entry.json_metadata)
 ```
 
 ## Common Patterns
@@ -48,6 +60,8 @@ For real-world, working examples:
 - [Use as a DataLoader](/examples/dataloader.py)
 - [Retrieve data subset/range](/examples/retrieve_range.py)
 - [Get dataset statistics without downloading](/examples/dataset_stats.py)
+- [List aspect buckets](/examples/aspect_bucketing.py)
+- [Write captions into metadata](/examples/write_captions_to_metadata.py)
 
 ## Creating Indices for / Converting Existing Datasets
 
@@ -100,6 +114,105 @@ If you're creating a new dataset, generate indices during creation:
 ```
 
 The JSON index should have the same name as the tar file (e.g., `shard_0000.tar` → `shard_0000.json`).
+
+### Image + JSON Sidecar Samples
+
+Webshart supports webdataset shards that store each sample as an image-like payload plus a paired JSON sidecar:
+
+```text
+sample_0001.webp
+sample_0001.json
+sample_0002.webp
+sample_0002.json
+```
+
+When metadata is extracted or loaded, sidecars are attached to their paired sample entries:
+
+```json
+{
+  "files": {
+    "sample_0001.webp": {
+      "offset": 512,
+      "length": 102400,
+      "width": 1024,
+      "height": 1024,
+      "aspect": 1.0,
+      "json_path": "sample_0001.json",
+      "json_offset": 103424,
+      "json_length": 128,
+      "captions": "a product photo on a white background",
+      "json_metadata": {
+        "caption": "a product photo on a white background"
+      }
+    },
+    "sample_0001.json": {
+      "offset": 103424,
+      "length": 128
+    }
+  }
+}
+```
+
+Use file-oriented APIs when you want every archive member, including sidecars:
+
+```python
+dataset.list_files_in_shard(0)
+
+reader = dataset.open_shard(0)
+raw_file_bytes = reader.read_file(0)
+```
+
+Use sample-oriented APIs when you want training samples:
+
+```python
+dataset.list_samples_in_shard(0)
+dataset.get_shard_sample_count(0)
+
+reader = dataset.open_shard(0)
+image_bytes = reader.read_sample(0)
+json_bytes = reader.read_sample_json(0)
+
+entry = loader.load_sample(0, 0)
+print(entry.path)
+print(entry.captions)
+print(entry.json_data)
+```
+
+Captions are canonicalized to the plural `captions` metadata key. The value may be a single string, a list of strings, or absent.
+
+```python
+webshart.write_captions_to_metadata(
+    "shard_0000.json",
+    {
+        "sample_0001.webp": "a short caption",
+        "sample_0002": ["caption one", "caption two"],
+    },
+)
+```
+
+The writer updates existing webshart metadata JSON in place, removes old singular `caption` keys from updated samples, and leaves paired `.json` sidecar entries untouched.
+
+### Aspect Bucketing Samples
+
+`list_shard_aspect_buckets()` is file-oriented and buckets any indexed file that has `width` and `height`.
+
+For training pipelines, prefer `list_shard_sample_aspect_buckets()`:
+
+```python
+loader = webshart.TarDataLoader(dataset)
+buckets = loader.list_shard_sample_aspect_buckets(
+    [0],
+    key="geometry-tuple",
+    target_pixel_area=1024**2,
+)[0]["buckets"]
+
+for bucket_key, entries in buckets.items():
+    for item in entries:
+        virtual_id = f"webshart://0/{item['sample_idx']}/{item['filename']}"
+        image = loader.load_sample(0, item["sample_idx"])
+```
+
+This uses logical samples from `metadata.sample_range()` / `get_sample_by_index()` and excludes paired JSON sidecars before bucketing. Each bucket entry includes `sample_idx`, so callers can build stable IDs and load images directly with `loader.load_sample(shard_idx, sample_idx)`.
 
 ## Why is it fast?
 
