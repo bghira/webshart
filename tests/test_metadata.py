@@ -378,4 +378,6 @@ def test_sample_aspect_buckets_skip_paired_json_sidecars():
             "sample.json",
             "sample.webp",
         ]
+        assert all("sample_idx" not in entry for entry in file_bucket_entries)
         assert [entry["filename"] for entry in sample_bucket_entries] == ["sample.webp"]
+        assert sample_bucket_entries[0]["sample_idx"] == 0

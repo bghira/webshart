@@ -20,7 +20,9 @@ mod file_loading;
 pub mod shard_cache;
 use crate::impl_batch_iterator;
 use crate::metadata::ensure_shard_metadata_with_retry;
-pub use aspect_buckets::{AspectBucketIterator, AspectBuckets, scale_dimensions_with_multiple};
+pub use aspect_buckets::{
+    AspectBucketEntry, AspectBucketIterator, AspectBuckets, scale_dimensions_with_multiple,
+};
 use aspect_buckets::{BucketKeyType, BucketSamplingStrategy, calculate_bucket_key};
 pub use batch::{BatchIterable, BatchOperations, BatchResult, FileReadRequest, PyBatchOperations};
 use config::DataLoaderConfig;
@@ -1108,8 +1110,7 @@ impl PyTarDataLoader {
             .as_ref()
             .ok_or_else(|| WebshartError::MetadataNotFound("Metadata not loaded".to_string()))?;
 
-        let mut buckets: BTreeMap<String, Vec<(String, FileInfo, Option<(u32, u32)>)>> =
-            BTreeMap::new();
+        let mut buckets: BTreeMap<String, Vec<AspectBucketEntry>> = BTreeMap::new();
 
         for (filename, file_info) in metadata.iter_files() {
             if let (Some(width), Some(height)) = (file_info.width, file_info.height) {
@@ -1125,11 +1126,15 @@ impl PyTarDataLoader {
                     round_to,
                 );
 
-                buckets.entry(bucket_key).or_insert_with(Vec::new).push((
-                    filename.to_string(),
-                    file_info,
-                    original_size,
-                ));
+                buckets
+                    .entry(bucket_key)
+                    .or_insert_with(Vec::new)
+                    .push(AspectBucketEntry {
+                        filename: filename.to_string(),
+                        file_info,
+                        original_size,
+                        sample_idx: None,
+                    });
             }
         }
 
@@ -1163,10 +1168,13 @@ impl PyTarDataLoader {
             .as_ref()
             .ok_or_else(|| WebshartError::MetadataNotFound("Metadata not loaded".to_string()))?;
 
-        let mut buckets: BTreeMap<String, Vec<(String, FileInfo, Option<(u32, u32)>)>> =
-            BTreeMap::new();
+        let mut buckets: BTreeMap<String, Vec<AspectBucketEntry>> = BTreeMap::new();
 
-        for (filename, file_info) in metadata.sample_range(0, metadata.num_samples()) {
+        for (sample_idx, (filename, file_info)) in metadata
+            .sample_range(0, metadata.num_samples())
+            .into_iter()
+            .enumerate()
+        {
             if let (Some(width), Some(height)) = (file_info.width, file_info.height) {
                 let target_resolution_multiple = target_resolution_multiple.unwrap_or(64);
 
@@ -1183,7 +1191,12 @@ impl PyTarDataLoader {
                 buckets
                     .entry(bucket_key)
                     .or_insert_with(Vec::new)
-                    .push((filename, file_info, original_size));
+                    .push(AspectBucketEntry {
+                        filename,
+                        file_info,
+                        original_size,
+                        sample_idx: Some(sample_idx),
+                    });
             }
         }
 
@@ -1448,21 +1461,24 @@ impl PyTarDataLoader {
                 py,
                 files
                     .into_iter()
-                    .map(|(filename, file_info, original_size)| {
+                    .map(|entry| {
                         let file_dict = PyDict::new(py);
-                        file_dict.set_item("filename", filename).unwrap();
-                        file_dict.set_item("offset", file_info.offset).unwrap();
-                        file_dict.set_item("size", file_info.length).unwrap();
-                        if let Some(w) = file_info.width {
+                        file_dict.set_item("filename", entry.filename).unwrap();
+                        file_dict.set_item("offset", entry.file_info.offset).unwrap();
+                        file_dict.set_item("size", entry.file_info.length).unwrap();
+                        if let Some(sample_idx) = entry.sample_idx {
+                            file_dict.set_item("sample_idx", sample_idx).unwrap();
+                        }
+                        if let Some(w) = entry.file_info.width {
                             file_dict.set_item("width", w).unwrap();
                         }
-                        if let Some(h) = file_info.height {
+                        if let Some(h) = entry.file_info.height {
                             file_dict.set_item("height", h).unwrap();
                         }
-                        if let Some(a) = file_info.aspect {
+                        if let Some(a) = entry.file_info.aspect {
                             file_dict.set_item("aspect", a).unwrap();
                         }
-                        if let Some((orig_w, orig_h)) = original_size {
+                        if let Some((orig_w, orig_h)) = entry.original_size {
                             let orig_list = PyList::new(py, &[orig_w, orig_h]);
                             file_dict.set_item("original_size", orig_list).unwrap();
                         }
@@ -2254,12 +2270,12 @@ impl PyBucketDataLoader {
         )?;
 
         for (bucket_key, entries) in shard_buckets.buckets {
-            for (filename, file_info, original_size) in entries {
+            for bucket_entry in entries {
                 let entry = BucketEntry {
                     shard_idx,
-                    filename,
-                    file_info,
-                    original_size,
+                    filename: bucket_entry.filename,
+                    file_info: bucket_entry.file_info,
+                    original_size: bucket_entry.original_size,
                 };
 
                 self.buckets
