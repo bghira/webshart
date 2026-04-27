@@ -20,7 +20,9 @@ for shard in shards_to_bucket:
     - geometry-tuple: use the tuple (w, h)
     - geometry-list: use the list [w, h]
     """
-    buckets_info = loader.list_shard_aspect_buckets(
+    # Prefer the sample-oriented API for training pipelines. It excludes paired
+    # JSON sidecars before bucketing.
+    buckets_info = loader.list_shard_sample_aspect_buckets(
         [shard],
         key="geometry-tuple",
         target_pixel_area=1024
@@ -31,3 +33,4 @@ for shard in shards_to_bucket:
     #     print(f"Bucket {bucket_key}")
     #     print(f"- {len(buckets_info[bucket_key])} items")
     #     print(f"- Original size: {buckets_info[bucket_key][0]['original_size']}")
+    #     print(f"- Sample index: {buckets_info[bucket_key][0]['sample_idx']}")

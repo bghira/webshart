@@ -1,4 +1,4 @@
-use crate::FileInfo;
+use crate::{metadata::CaptionValue, FileInfo};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
@@ -12,6 +12,10 @@ pub struct PyTarFileEntry {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub aspect: Option<f32>,
+    pub json_path: Option<String>,
+    pub json_data: Option<Vec<u8>>,
+    pub captions: Option<CaptionValue>,
+    pub json_metadata: Option<serde_json::Value>,
     pub shard_idx: Option<usize>,
     pub file_idx: Option<usize>,
 }
@@ -53,6 +57,41 @@ impl PyTarFileEntry {
         self.aspect
     }
 
+    #[getter]
+    fn json_path(&self) -> Option<&str> {
+        self.json_path.as_deref()
+    }
+
+    #[getter]
+    fn json_data(&self) -> Option<Py<PyBytes>> {
+        Python::with_gil(|py| {
+            self.json_data
+                .as_ref()
+                .map(|data| PyBytes::new(py, data).into())
+        })
+    }
+
+    #[getter]
+    fn caption(&self) -> Option<&str> {
+        self.captions.as_ref().and_then(CaptionValue::first)
+    }
+
+    #[getter]
+    fn captions(&self, py: Python) -> PyResult<Option<PyObject>> {
+        match &self.captions {
+            Some(captions) => Ok(Some(pythonize::pythonize(py, captions)?)),
+            None => Ok(None),
+        }
+    }
+
+    #[getter]
+    fn json_metadata(&self, py: Python) -> PyResult<Option<PyObject>> {
+        match &self.json_metadata {
+            Some(value) => Ok(Some(pythonize::pythonize(py, value)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Get all metadata as a dictionary
     #[getter]
     fn metadata(&self, py: Python) -> PyResult<PyObject> {
@@ -69,6 +108,15 @@ impl PyTarFileEntry {
         }
         if let Some(a) = self.aspect {
             dict.set_item("aspect", a)?;
+        }
+        if let Some(json_path) = &self.json_path {
+            dict.set_item("json_path", json_path)?;
+        }
+        if let Some(captions) = &self.captions {
+            dict.set_item("captions", pythonize::pythonize(py, captions)?)?;
+        }
+        if let Some(value) = &self.json_metadata {
+            dict.set_item("json_metadata", pythonize::pythonize(py, value)?)?;
         }
 
         Ok(dict.into())
@@ -139,6 +187,10 @@ pub fn create_tar_entry(
         width: file_info.width,
         height: file_info.height,
         aspect: file_info.aspect,
+        json_path: file_info.json_path.clone(),
+        json_data: None,
+        captions: file_info.captions.clone(),
+        json_metadata: file_info.json_metadata.clone(),
         shard_idx,
         file_idx,
     }

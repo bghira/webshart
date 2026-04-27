@@ -1,9 +1,10 @@
 """Fast and memory-efficient webdataset shard reader with synchronous and batch support."""
 
 from pathlib import Path
-from typing import Optional, Union, List, Tuple, Any
+from typing import Optional, Union, List, Tuple, Any, Dict, Mapping, MutableMapping
 import argparse
 import sys
+import json
 from .cache_wait import CacheWaitContext, iter_with_cache_wait, next_with_cache_wait
 
 
@@ -31,7 +32,121 @@ __all__ = [
     "CacheWaitContext",
     "iter_with_cache_wait",
     "next_with_cache_wait",
+    "apply_captions_to_metadata",
+    "write_captions_to_metadata",
 ]
+
+
+CaptionValue = Union[str, List[str]]
+OptionalCaptionValue = Optional[CaptionValue]
+
+
+def _is_json_path(path: str) -> bool:
+    return Path(path).suffix.lower() == ".json"
+
+
+def _sample_lookup_keys(path: str) -> List[str]:
+    path_obj = Path(path)
+    stem_path = str(path_obj.with_suffix(""))
+    keys = [path, path_obj.name, stem_path, path_obj.stem]
+    return list(dict.fromkeys(str(key) for key in keys if key))
+
+
+def _normalize_captions(value: Any) -> OptionalCaptionValue:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        captions = [str(item) for item in value if item is not None and str(item)]
+        return captions or None
+    return str(value)
+
+
+def apply_captions_to_metadata(
+    metadata: MutableMapping[str, Any],
+    captions_by_sample: Mapping[str, OptionalCaptionValue],
+) -> int:
+    """Attach captions to a webshart metadata mapping in-place.
+
+    Captions are stored under the canonical plural ``captions`` key and may be a
+    single string or a list of strings. Existing singular ``caption`` keys are
+    removed from updated sample entries.
+    """
+    files = metadata.get("files")
+    if not isinstance(files, (dict, list)):
+        raise ValueError("webshart metadata must contain a 'files' dict or list")
+
+    normalized: Dict[str, CaptionValue] = {}
+    for sample, value in captions_by_sample.items():
+        captions = _normalize_captions(value)
+        if captions is None:
+            continue
+        for key in _sample_lookup_keys(str(sample)):
+            normalized[key] = captions
+
+    updated = 0
+
+    if isinstance(files, dict):
+        iterator = files.items()
+    else:
+        iterator = (
+            (entry.get("path") or entry.get("filename") or entry.get("fname"), entry)
+            for entry in files
+            if isinstance(entry, dict)
+        )
+
+    for path, entry in iterator:
+        if not path or not isinstance(entry, dict) or _is_json_path(str(path)):
+            continue
+
+        captions = next(
+            (
+                normalized[key]
+                for key in _sample_lookup_keys(str(path))
+                if key in normalized
+            ),
+            None,
+        )
+        if captions is None:
+            continue
+
+        entry.pop("caption", None)
+        entry["captions"] = captions
+        updated += 1
+
+    return updated
+
+
+def write_captions_to_metadata(
+    metadata_path: Union[str, Path],
+    captions_by_sample: Mapping[str, OptionalCaptionValue],
+    output_path: Optional[Union[str, Path]] = None,
+) -> int:
+    """Write captions into a webshart shard metadata JSON file.
+
+    Args:
+        metadata_path: Existing webshart metadata JSON file to read.
+        captions_by_sample: Mapping from sample path/stem to caption string or list.
+        output_path: Optional destination JSON file. Defaults to updating
+            ``metadata_path`` in place.
+
+    Returns:
+        Number of sample entries updated.
+    """
+    metadata_path = Path(metadata_path)
+    destination = Path(output_path) if output_path is not None else metadata_path
+
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+
+    updated = apply_captions_to_metadata(metadata, captions_by_sample)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    return updated
 
 
 def discover_dataset(

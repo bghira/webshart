@@ -20,5 +20,7 @@ dataset.print_summary(detailed=False)
 
 # Get info for specific shard
 file_count = dataset.get_shard_file_count(0)
+sample_count = dataset.get_shard_sample_count(0)
 shard_info = dataset.get_shard_by_name("data-0042")
 print(f"Shard 'data-0042' has {shard_info['num_files']} files")
+print(f"Shard 0 has {file_count} files and {sample_count} logical samples")
