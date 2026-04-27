@@ -2,7 +2,7 @@ use crate::FileInfo;
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset, PyDiscoveredDataset};
 use crate::error::{Result, WebshartError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use rand::{rng, seq::SliceRandom};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -820,6 +820,83 @@ impl PyTarDataLoader {
         Ok(dict.into())
     }
 
+    fn list_samples_in_shard(&self, shard_idx: usize, py: Python) -> PyResult<PyObject> {
+        let mut dataset = self.dataset.lock().unwrap();
+        ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+
+        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
+        })?;
+
+        let list = PyList::empty(py);
+        if let Some(metadata) = &shard.metadata {
+            for filename in metadata.sample_filenames() {
+                list.append(filename)?;
+            }
+        }
+
+        Ok(list.into())
+    }
+
+    fn load_sample(&self, shard_idx: usize, sample_idx: usize) -> PyResult<PyTarFileEntry> {
+        let mut dataset = self.dataset.lock().unwrap();
+        ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+
+        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
+        })?;
+
+        let metadata = shard
+            .metadata
+            .as_ref()
+            .ok_or_else(|| WebshartError::MetadataNotFound("Metadata not loaded".to_string()))?;
+
+        let (filename, file_info) = metadata.get_sample_by_index(sample_idx).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!(
+                "Sample index {} out of range for shard {}",
+                sample_idx, shard_idx
+            ))
+        })?;
+
+        let tar_path = shard.tar_path.clone();
+        let is_remote = dataset.is_remote;
+        let token = if is_remote {
+            dataset.get_hf_token()
+        } else {
+            None
+        };
+        drop(dataset);
+
+        let data = if self.config.load_file_data && file_info.length <= self.config.max_file_size {
+            self.load_single_file_data(&tar_path, &file_info, is_remote, token.clone())?
+        } else {
+            Vec::new()
+        };
+
+        let mut entry = create_tar_entry(
+            filename,
+            &file_info,
+            data,
+            Some(shard_idx),
+            Some(sample_idx),
+        );
+        entry.json_data = self.load_json_sidecar_bytes(&tar_path, &file_info, is_remote, token)?;
+        Ok(entry)
+    }
+
+    fn load_sample_json(
+        &self,
+        py: Python,
+        shard_idx: usize,
+        sample_idx: usize,
+    ) -> PyResult<Option<Py<PyBytes>>> {
+        let entry = self.load_sample(shard_idx, sample_idx)?;
+        Ok(entry
+            .json_data
+            .as_ref()
+            .map(|data| PyBytes::new(py, data).into()))
+    }
+
     fn reset(&mut self) -> PyResult<()> {
         self.current_shard = 0;
         self.entry_buffer.clear();
@@ -903,6 +980,32 @@ impl PyTarDataLoader {
         round_to: Option<usize>,
     ) -> PyResult<Vec<PyObject>> {
         let results = self.get_aspect_buckets_for_shards(
+            shard_indices,
+            key,
+            target_pixel_area,
+            Some(target_resolution_multiple),
+            round_to,
+        )?;
+
+        let py_results: Vec<PyObject> = results
+            .into_iter()
+            .map(|bucket| self.aspect_buckets_to_py_dict(py, bucket))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        Ok(py_results)
+    }
+
+    #[pyo3(signature = (shard_indices, key="aspect", target_pixel_area=None, target_resolution_multiple=64, round_to=Some(2)))]
+    pub fn list_shard_sample_aspect_buckets(
+        &self,
+        py: Python,
+        shard_indices: Vec<usize>,
+        key: &str,
+        target_pixel_area: Option<u32>,
+        target_resolution_multiple: u32,
+        round_to: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = self.get_sample_aspect_buckets_for_shards(
             shard_indices,
             key,
             target_pixel_area,
@@ -1027,6 +1130,60 @@ impl PyTarDataLoader {
                     file_info,
                     original_size,
                 ));
+            }
+        }
+
+        Ok(AspectBuckets {
+            buckets,
+            shard_idx,
+            shard_name,
+        })
+    }
+
+    pub(crate) fn get_shard_sample_aspect_buckets_internal(
+        &self,
+        shard_idx: usize,
+        key: &str,
+        target_pixel_area: Option<u32>,
+        target_resolution_multiple: Option<u32>,
+        round_to: Option<usize>,
+    ) -> PyResult<AspectBuckets> {
+        let key_type = BucketKeyType::parse(key)?;
+        let mut dataset = self.dataset.lock().unwrap();
+
+        ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+
+        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
+        })?;
+
+        let shard_name = shard.tar_path.clone();
+        let metadata = shard
+            .metadata
+            .as_ref()
+            .ok_or_else(|| WebshartError::MetadataNotFound("Metadata not loaded".to_string()))?;
+
+        let mut buckets: BTreeMap<String, Vec<(String, FileInfo, Option<(u32, u32)>)>> =
+            BTreeMap::new();
+
+        for (filename, file_info) in metadata.sample_range(0, metadata.num_samples()) {
+            if let (Some(width), Some(height)) = (file_info.width, file_info.height) {
+                let target_resolution_multiple = target_resolution_multiple.unwrap_or(64);
+
+                let (bucket_key, original_size) = calculate_bucket_key(
+                    &key_type,
+                    width,
+                    height,
+                    file_info.aspect,
+                    target_pixel_area,
+                    target_resolution_multiple,
+                    round_to,
+                );
+
+                buckets
+                    .entry(bucket_key)
+                    .or_insert_with(Vec::new)
+                    .push((filename, file_info, original_size));
             }
         }
 
@@ -1228,6 +1385,58 @@ impl PyTarDataLoader {
         }
     }
 
+    fn get_sample_aspect_buckets_for_shards(
+        &self,
+        shard_indices: Vec<usize>,
+        key: &str,
+        target_pixel_area: Option<u32>,
+        target_resolution_multiple: Option<u32>,
+        round_to: Option<usize>,
+    ) -> PyResult<Vec<AspectBuckets>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async {
+                    let mut results = Vec::new();
+
+                    for shard_idx in shard_indices {
+                        match self.get_shard_sample_aspect_buckets_internal(
+                            shard_idx,
+                            key,
+                            target_pixel_area,
+                            target_resolution_multiple,
+                            round_to,
+                        ) {
+                            Ok(buckets) => results.push(buckets),
+                            Err(e) => return Err(e),
+                        }
+                    }
+
+                    Ok(results)
+                })
+            })
+        } else {
+            self.runtime.block_on(async {
+                let mut results = Vec::new();
+
+                for shard_idx in shard_indices {
+                    match self.get_shard_sample_aspect_buckets_internal(
+                        shard_idx,
+                        key,
+                        target_pixel_area,
+                        target_resolution_multiple,
+                        round_to,
+                    ) {
+                        Ok(buckets) => results.push(buckets),
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                Ok(results)
+            })
+        }
+    }
+
     fn aspect_buckets_to_py_dict(&self, py: Python, bucket: AspectBuckets) -> PyResult<PyObject> {
         let dict = PyDict::new(py);
         dict.set_item("shard_idx", bucket.shard_idx)?;
@@ -1302,6 +1511,36 @@ impl PyTarDataLoader {
         loader.load_file(file_info)
     }
 
+    fn load_json_sidecar_bytes(
+        &self,
+        tar_path: &str,
+        file_info: &FileInfo,
+        is_remote: bool,
+        token: Option<String>,
+    ) -> PyResult<Option<Vec<u8>>> {
+        if let (Some(offset), Some(length)) = (file_info.json_offset, file_info.json_length) {
+            let json_info = FileInfo {
+                path: file_info.json_path.clone(),
+                offset,
+                length,
+                sha256: None,
+                width: None,
+                height: None,
+                aspect: None,
+                json_path: None,
+                json_offset: None,
+                json_length: None,
+                captions: None,
+                json_metadata: None,
+            };
+
+            let data = self.load_single_file_data(tar_path, &json_info, is_remote, token)?;
+            Ok(Some(data))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn next_entry(&mut self) -> PyResult<Option<PyTarFileEntry>> {
         if let Some(ranges) = &self.ranges {
             // Check if we're within current range
@@ -1353,6 +1592,10 @@ impl PyTarDataLoader {
             width: entry.width,
             height: entry.height,
             aspect: entry.aspect,
+            json_path: entry.json_path.clone(),
+            json_data: entry.json_data.clone(),
+            captions: entry.captions.clone(),
+            json_metadata: entry.json_metadata.clone(),
             shard_idx: entry.shard_idx,
             file_idx: entry.file_idx,
         };

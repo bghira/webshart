@@ -450,6 +450,54 @@ impl ShardReader {
         }
     }
 
+    /// Read a logical sample by index within this shard, excluding paired JSON sidecars.
+    pub fn read_sample(&self, sample_index: usize) -> Result<Vec<u8>> {
+        let (filename, file_info) =
+            self.metadata.get_sample_by_index(sample_index).ok_or_else(|| {
+                WebshartError::InvalidShardFormat(format!(
+                    "Sample index {} not found in metadata",
+                    sample_index
+                ))
+            })?;
+
+        if self.is_remote {
+            self.runtime.block_on(self.read_file_remote(
+                &filename,
+                file_info.offset,
+                file_info.length,
+            ))
+        } else {
+            self.read_file_local(&filename, file_info.offset, file_info.length)
+        }
+    }
+
+    /// Read the paired JSON metadata sidecar for a logical sample, if present.
+    pub fn read_sample_json(&self, sample_index: usize) -> Result<Option<Vec<u8>>> {
+        let (_filename, file_info) =
+            self.metadata.get_sample_by_index(sample_index).ok_or_else(|| {
+                WebshartError::InvalidShardFormat(format!(
+                    "Sample index {} not found in metadata",
+                    sample_index
+                ))
+            })?;
+
+        if let (Some(json_path), Some(offset), Some(length)) = (
+            file_info.json_path.as_deref(),
+            file_info.json_offset,
+            file_info.json_length,
+        ) {
+            if self.is_remote {
+                self.runtime
+                    .block_on(self.read_file_remote(json_path, offset, length))
+                    .map(Some)
+            } else {
+                self.read_file_local(json_path, offset, length).map(Some)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Read a file from remote tar archive using HTTP range requests
     async fn read_file_remote(&self, _filename: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
         let client = reqwest::Client::new();
@@ -504,9 +552,19 @@ impl ShardReader {
         self.metadata.filenames()
     }
 
+    /// Get list of logical sample filenames in this shard.
+    pub fn sample_filenames(&self) -> Vec<String> {
+        self.metadata.sample_filenames()
+    }
+
     /// Get number of files in this shard
     pub fn num_files(&self) -> usize {
         self.metadata.num_files()
+    }
+
+    /// Get number of logical samples in this shard.
+    pub fn num_samples(&self) -> usize {
+        self.metadata.num_samples()
     }
 }
 
@@ -1227,6 +1285,7 @@ impl PyDiscoveredDataset {
 
                 if let Some(metadata) = &shard.metadata {
                     dict.set_item("num_files", metadata.num_files())?;
+                    dict.set_item("num_samples", metadata.num_samples())?;
                     dict.set_item("size", metadata.filesize)?;
                 }
 
@@ -1248,6 +1307,30 @@ impl PyDiscoveredDataset {
             if let Some(shard) = self.inner.shards.get(shard_index) {
                 if let Some(metadata) = &shard.metadata {
                     let filenames = metadata.filenames();
+                    let list = PyList::new(py, filenames);
+                    Ok(list.into())
+                } else {
+                    Err(pyo3::exceptions::PyValueError::new_err(
+                        "Failed to load shard metadata",
+                    ))
+                }
+            } else {
+                Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Shard index {} out of range",
+                    shard_index
+                )))
+            }
+        })
+    }
+
+    fn list_samples_in_shard(&mut self, shard_index: usize) -> PyResult<Py<PyList>> {
+        // Ensure metadata is loaded for this shard
+        self.inner.ensure_shard_metadata(shard_index)?;
+
+        Python::with_gil(|py| {
+            if let Some(shard) = self.inner.shards.get(shard_index) {
+                if let Some(metadata) = &shard.metadata {
+                    let filenames = metadata.sample_filenames();
                     let list = PyList::new(py, filenames);
                     Ok(list.into())
                 } else {
@@ -1339,6 +1422,31 @@ impl PyDiscoveredDataset {
         if let Some(shard) = self.inner.shards.get(shard_index) {
             if let Some(metadata) = &shard.metadata {
                 Ok(metadata.num_files())
+            } else {
+                Err(pyo3::exceptions::PyValueError::new_err(
+                    "Failed to load shard metadata",
+                ))
+            }
+        } else {
+            Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Shard index {} out of range",
+                shard_index
+            )))
+        }
+    }
+
+    fn get_shard_sample_count(&mut self, shard_index: usize) -> PyResult<usize> {
+        if shard_index >= self.inner.shards.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Shard index {} out of range. Dataset has {} shards.",
+                shard_index,
+                self.inner.shards.len()
+            )));
+        }
+        self.inner.ensure_shard_metadata(shard_index)?;
+        if let Some(shard) = self.inner.shards.get(shard_index) {
+            if let Some(metadata) = &shard.metadata {
+                Ok(metadata.num_samples())
             } else {
                 Err(pyo3::exceptions::PyValueError::new_err(
                     "Failed to load shard metadata",
@@ -1567,8 +1675,17 @@ impl PyShardReader {
         self.inner.num_files()
     }
 
+    #[getter]
+    fn num_samples(&self) -> usize {
+        self.inner.num_samples()
+    }
+
     fn filenames(&self) -> Vec<String> {
         self.inner.filenames()
+    }
+
+    fn sample_filenames(&self) -> Vec<String> {
+        self.inner.sample_filenames()
     }
 
     fn read_file(&self, file_index: usize) -> PyResult<Py<PyBytes>> {
@@ -1576,7 +1693,23 @@ impl PyShardReader {
         Python::with_gil(|py| Ok(PyBytes::new(py, &data).into()))
     }
 
+    fn read_sample(&self, sample_index: usize) -> PyResult<Py<PyBytes>> {
+        let data = self.inner.read_sample(sample_index)?;
+        Python::with_gil(|py| Ok(PyBytes::new(py, &data).into()))
+    }
+
+    fn read_sample_json(&self, sample_index: usize) -> PyResult<Option<Py<PyBytes>>> {
+        match self.inner.read_sample_json(sample_index)? {
+            Some(data) => Python::with_gil(|py| Ok(Some(PyBytes::new(py, &data).into()))),
+            None => Ok(None),
+        }
+    }
+
     fn __repr__(&self) -> String {
-        format!("ShardReader(num_files={})", self.inner.num_files())
+        format!(
+            "ShardReader(num_files={}, num_samples={})",
+            self.inner.num_files(),
+            self.inner.num_samples()
+        )
     }
 }

@@ -25,6 +25,12 @@ fn is_image_file(path: &str) -> bool {
         || path_lower.ends_with(".ico")
 }
 
+fn is_json_file(path: &str) -> bool {
+    path.rsplit_once('.')
+        .map(|(_, ext)| ext.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+}
+
 fn extract_image_dimensions(data: &[u8]) -> Option<(u32, u32, f32)> {
     match imagesize::blob_size(data) {
         Ok(size) => {
@@ -715,6 +721,7 @@ impl MetadataExtractor {
             };
 
             let mut files = HashMap::new();
+            let mut json_by_path = HashMap::new();
             let mut file_count = 0;
             let mut archive = Archive::new(reader);
             let entries = archive.entries()?;
@@ -736,9 +743,10 @@ impl MetadataExtractor {
                             // Determine if we need to read the file data
                             let need_hash = hasher.is_some();
                             let need_dimensions = include_image_geometry && is_image_file(&path) && size > 0 && size < 50_000_000;
-                            let should_read = need_hash || need_dimensions;
+                            let need_json_metadata = is_json_file(&path) && size > 0 && size < 10_000_000;
+                            let should_read = need_hash || need_dimensions || need_json_metadata;
                             if should_read {
-                                if need_dimensions {
+                                if need_dimensions || need_json_metadata {
                                     file_data.reserve(size as usize);
                                 }
                                 let mut buffer = [0; 8192];
@@ -750,7 +758,7 @@ impl MetadataExtractor {
                                             if let Some(ref mut h) = hasher {
                                                 h.update(&buffer[..to_read]);
                                             }
-                                            if need_dimensions {
+                                            if need_dimensions || need_json_metadata {
                                                 file_data.extend_from_slice(&buffer[..to_read]);
                                             }
                                             total_read += to_read as u64;
@@ -782,6 +790,11 @@ impl MetadataExtractor {
                             } else {
                                 (0, 0, 0.0)
                             };
+                            if need_json_metadata && !file_data.is_empty() {
+                                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&file_data) {
+                                    json_by_path.insert(path.clone(), value);
+                                }
+                            }
                             files.insert(path.clone(), FileInfo {
                                 path: Some(path.clone()),
                                 offset: offset + 512,
@@ -790,6 +803,11 @@ impl MetadataExtractor {
                                 width: if width > 0 { Some(width) } else { None },
                                 height: if height > 0 { Some(height) } else { None },
                                 aspect: if aspect > 0.0 { Some(aspect) } else { None },
+                                json_path: None,
+                                json_offset: None,
+                                json_length: None,
+                                captions: None,
+                                json_metadata: None,
                             });
                             file_count += 1;
                             process_pb.inc(1);
@@ -802,7 +820,10 @@ impl MetadataExtractor {
             }
 
             process_pb.finish_with_message(format!("✓ Processed {} ({} files)", shard_name, file_count));
-            Ok::<HashMap<String, FileInfo>, WebshartError>(files)
+            Ok::<(HashMap<String, FileInfo>, HashMap<String, serde_json::Value>), WebshartError>((
+                files,
+                json_by_path,
+            ))
         }).await.map_err(|e| WebshartError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Task join error: {}", e)
@@ -811,14 +832,16 @@ impl MetadataExtractor {
         // Wait for stream task to complete
         let _ = stream_task.await;
 
-        Ok(ShardMetadata::from_format(ShardMetadataFormat::HashMap {
+        let mut metadata = ShardMetadata::from_format(ShardMetadataFormat::HashMap {
             path: Some(shard.name.clone()),
             filesize: actual_size,
             hash: None,
             hash_lfs: None,
-            files: result,
+            files: result.0,
             includes_image_geometry: self.include_image_geometry,
-        }))
+        });
+        metadata.attach_json_metadata(&result.1);
+        Ok(metadata)
     }
 
     fn extract_local_metadata(
@@ -831,6 +854,7 @@ impl MetadataExtractor {
         use tar::Archive;
 
         let mut files = HashMap::new();
+        let mut json_by_path = HashMap::new();
         let mut file_count = 0;
 
         // Create progress bar
@@ -874,10 +898,11 @@ impl MetadataExtractor {
                             && is_image_file(&path)
                             && size > 0
                             && size < 50_000_000;
-                        let should_read = need_hash || need_dimensions;
+                        let need_json_metadata = is_json_file(&path) && size > 0 && size < 10_000_000;
+                        let should_read = need_hash || need_dimensions || need_json_metadata;
 
                         if should_read {
-                            if need_dimensions {
+                            if need_dimensions || need_json_metadata {
                                 file_data.reserve(size as usize);
                             }
 
@@ -889,7 +914,7 @@ impl MetadataExtractor {
                                         if let Some(ref mut h) = hasher {
                                             h.update(&buffer[..n]);
                                         }
-                                        if need_dimensions {
+                                        if need_dimensions || need_json_metadata {
                                             file_data.extend_from_slice(&buffer[..n]);
                                         }
                                     }
@@ -922,6 +947,11 @@ impl MetadataExtractor {
                         } else {
                             (0, 0, 0.0)
                         };
+                        if need_json_metadata && !file_data.is_empty() {
+                            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&file_data) {
+                                json_by_path.insert(path.clone(), value);
+                            }
+                        }
 
                         files.insert(
                             path.clone(),
@@ -933,6 +963,11 @@ impl MetadataExtractor {
                                 width: if width > 0 { Some(width) } else { None },
                                 height: if height > 0 { Some(height) } else { None },
                                 aspect: if aspect > 0.0 { Some(aspect) } else { None },
+                                json_path: None,
+                                json_offset: None,
+                                json_length: None,
+                                captions: None,
+                                json_metadata: None,
                             },
                         );
 
@@ -986,14 +1021,16 @@ impl MetadataExtractor {
             None
         };
 
-        Ok(ShardMetadata::from_format(ShardMetadataFormat::HashMap {
+        let mut metadata = ShardMetadata::from_format(ShardMetadataFormat::HashMap {
             path: Some(shard.name.clone()),
             filesize: shard.size,
             hash: tar_hash.clone(),
             hash_lfs: tar_hash,
             files,
             includes_image_geometry: self.include_image_geometry,
-        }))
+        });
+        metadata.attach_json_metadata(&json_by_path);
+        Ok(metadata)
     }
 
     fn load_checkpoints(&self, dir: &str) -> Result<HashMap<String, ShardCheckpoint>> {
