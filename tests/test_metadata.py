@@ -254,6 +254,8 @@ def test_paired_json_sidecar_metadata_and_retrieval():
         tar_path = Path(tmpdir) / "data-0000.tar"
         sample_json = {
             "caption": "a small test image",
+            "text": "a small test image",
+            "captions": ["a small test image", "alternate view", "alternate view"],
             "tags": ["test", "captioned"],
         }
 
@@ -291,7 +293,10 @@ def test_paired_json_sidecar_metadata_and_retrieval():
 
         loader = webshart.TarDataLoader(dataset, load_file_data=False)
         shard_metadata = loader.get_metadata(0)
-        assert shard_metadata["sample.webp"]["captions"] == "a small test image"
+        assert shard_metadata["sample.webp"]["captions"] == [
+            "a small test image",
+            "alternate view",
+        ]
         assert "caption" not in shard_metadata["sample.webp"]
         assert shard_metadata["sample.webp"]["json_path"] == "sample.json"
         assert shard_metadata["sample.webp"]["json_metadata"] == sample_json
@@ -299,8 +304,8 @@ def test_paired_json_sidecar_metadata_and_retrieval():
         entry = loader.load_sample(0, 0)
         assert entry.path == "sample.webp"
         assert entry.caption == "a small test image"
-        assert entry.captions == "a small test image"
-        assert entry.metadata["captions"] == "a small test image"
+        assert entry.captions == ["a small test image", "alternate view"]
+        assert entry.metadata["captions"] == ["a small test image", "alternate view"]
         assert entry.metadata["json_path"] == "sample.json"
         assert json.loads(bytes(entry.json_data)) == sample_json
 
@@ -338,6 +343,22 @@ def test_write_captions_to_metadata_uses_plural_key():
         ]
         assert "caption" not in stored["files"]["sample.webp"]
         assert "captions" not in stored["files"]["sample.json"]
+
+
+def test_write_captions_to_metadata_skips_non_dict_file_entries():
+    """Test list-format metadata tolerates invalid/non-dict file entries."""
+    metadata = {
+        "files": [
+            None,
+            "invalid",
+            {"path": "sample.webp", "offset": 512, "length": 32},
+        ]
+    }
+
+    updated = webshart.apply_captions_to_metadata(metadata, {"sample": "caption"})
+
+    assert updated == 1
+    assert metadata["files"][2]["captions"] == "caption"
 
 
 def test_sample_aspect_buckets_skip_paired_json_sidecars():

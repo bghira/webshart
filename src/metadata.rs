@@ -117,6 +117,7 @@ pub struct ShardMetadata {
     pub hash_lfs: Option<String>,
     pub includes_image_geometry: bool,
     files: Vec<FileInfoInternal>, // Internal storage with guaranteed path
+    sample_indices: Vec<usize>,   // Logical samples, excluding paired JSON sidecars
 }
 
 impl ShardMetadata {
@@ -253,18 +254,28 @@ impl ShardMetadata {
         }
     }
 
-    fn is_sample_file(&self, info: &FileInfoInternal) -> bool {
-        if !Self::is_json_path(&info.path) {
-            return true;
-        }
-
-        let key = Self::sample_key(&info.path);
-        !self
+    fn rebuild_sample_index(&mut self) {
+        let non_json_keys: HashSet<String> = self
             .files
             .iter()
-            .any(|candidate| {
-                !Self::is_json_path(&candidate.path) && Self::sample_key(&candidate.path) == key
+            .filter(|info| !Self::is_json_path(&info.path))
+            .map(|info| Self::sample_key(&info.path))
+            .collect();
+
+        self.sample_indices = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, info)| {
+                let is_paired_json = Self::is_json_path(&info.path)
+                    && non_json_keys.contains(&Self::sample_key(&info.path));
+                if is_paired_json {
+                    None
+                } else {
+                    Some(idx)
+                }
             })
+            .collect();
     }
 
     fn extract_caption_value(value: &Value) -> Option<CaptionValue> {
@@ -280,15 +291,20 @@ impl ShardMetadata {
         ];
 
         let mut captions = Vec::new();
+        let mut seen = HashSet::new();
         if let Some(obj) = value.as_object() {
             for key in keys {
                 if let Some(field) = obj.get(key) {
                     match field {
-                        Value::String(text) if !text.is_empty() => captions.push(text.clone()),
+                        Value::String(text) if !text.is_empty() => {
+                            if seen.insert(text.clone()) {
+                                captions.push(text.clone());
+                            }
+                        }
                         Value::Array(items) => {
                             for item in items {
                                 if let Some(text) = item.as_str() {
-                                    if !text.is_empty() {
+                                    if !text.is_empty() && seen.insert(text.to_string()) {
                                         captions.push(text.to_string());
                                     }
                                 }
@@ -300,7 +316,6 @@ impl ShardMetadata {
             }
         }
 
-        captions.dedup();
         match captions.len() {
             0 => None,
             1 => Some(CaptionValue::Single(captions.remove(0))),
@@ -355,6 +370,7 @@ impl ShardMetadata {
                     hash_lfs,
                     includes_image_geometry,
                     files: file_vec,
+                    sample_indices: Vec::new(),
                 }
             }
             ShardMetadataFormat::Vec {
@@ -374,11 +390,13 @@ impl ShardMetadata {
                     hash_lfs: None,
                     includes_image_geometry,
                     files: file_vec,
+                    sample_indices: Vec::new(),
                 }
             }
         };
 
         metadata.infer_json_sidecars();
+        metadata.rebuild_sample_index();
         metadata
     }
 
@@ -402,37 +420,33 @@ impl ShardMetadata {
 
     /// Get the number of logical samples, excluding paired JSON sidecars.
     pub fn num_samples(&self) -> usize {
-        self.files
-            .iter()
-            .filter(|info| self.is_sample_file(info))
-            .count()
+        self.sample_indices.len()
     }
 
     /// Get sample filenames in order, excluding paired JSON sidecars.
     pub fn sample_filenames(&self) -> Vec<String> {
-        self.files
+        self.sample_indices
             .iter()
-            .filter(|info| self.is_sample_file(info))
+            .filter_map(|idx| self.files.get(*idx))
             .map(|info| info.path.clone())
             .collect()
     }
 
     /// Get sample by logical sample index, excluding paired JSON sidecars.
     pub fn get_sample_by_index(&self, index: usize) -> Option<(String, FileInfo)> {
-        self.files
-            .iter()
-            .filter(|info| self.is_sample_file(info))
-            .nth(index)
+        self.sample_indices
+            .get(index)
+            .and_then(|idx| self.files.get(*idx))
             .map(|info| (info.path.clone(), FileInfo::from(info)))
     }
 
     /// Return a bounded range of logical samples without cloning unrelated files.
     pub fn sample_range(&self, start: usize, end: usize) -> Vec<(String, FileInfo)> {
-        self.files
+        self.sample_indices
             .iter()
-            .filter(|info| self.is_sample_file(info))
             .skip(start)
             .take(end.saturating_sub(start))
+            .filter_map(|idx| self.files.get(*idx))
             .map(|info| (info.path.clone(), FileInfo::from(info)))
             .collect()
     }

@@ -93,6 +93,7 @@ def apply_captions_to_metadata(
         iterator = (
             (entry.get("path") or entry.get("filename") or entry.get("fname"), entry)
             for entry in files
+            if isinstance(entry, dict)
         )
 
     for path, entry in iterator:
