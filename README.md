@@ -241,6 +241,7 @@ I discovered after creating this library that [cheesechaser](https://github.com/
 
 - `NebulaeWis/e621-2024-webp-4Mpixel`
 - `picollect/danbooru2` (subfolder: `images`)
+- [`webshart/OpenVid-1M-webshart-indices`](https://huggingface.co/datasets/webshart/OpenVid-1M-webshart-indices) (indices for [`Dev-Jahn/OpenVid-1M-wds`](https://huggingface.co/datasets/Dev-Jahn/OpenVid-1M-wds))
 - Many picollect image datasets
 - Your dataset could be next! See "Creating Indices" above
 
