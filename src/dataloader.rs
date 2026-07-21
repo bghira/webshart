@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
-use fs2::FileExt;
 
 // Import from modules
 mod aspect_buckets;
@@ -27,7 +26,7 @@ use aspect_buckets::{BucketKeyType, BucketSamplingStrategy, calculate_bucket_key
 pub use batch::{BatchIterable, BatchOperations, BatchResult, FileReadRequest, PyBatchOperations};
 use config::DataLoaderConfig;
 pub use entry_types::{BucketEntry, PyTarFileEntry, create_tar_entry};
-use file_loading::{create_cached_file_loader, create_file_loader, file_http_client};
+use file_loading::{create_file_loader, file_http_client};
 
 // Re-export the entry type as it's part of the public API
 pub use entry_types::PyTarFileEntry as TarFileEntry;
@@ -391,19 +390,7 @@ impl PyTarDataLoader {
         let dataset = self.dataset.lock().unwrap();
 
         if let Some(cache) = &dataset.shard_cache {
-            let cache_path = cache.get_cached_shard_path(shard_name);
-
-            // Try to acquire exclusive lock to check if it's in use
-            if let Ok(file) = std::fs::File::open(&cache_path) {
-                if file.try_lock_exclusive().is_ok() {
-                    let _ = file.unlock();
-                    false // Not locked
-                } else {
-                    true // Locked by someone
-                }
-            } else {
-                false // File doesn't exist
-            }
+            cache.is_shard_locked(shard_name)
         } else {
             false
         }
@@ -1507,14 +1494,18 @@ impl PyTarDataLoader {
             let cache = dataset.shard_cache.as_ref().unwrap().clone();
             drop(dataset); // Release lock before async operation
 
-            // Try to get/download to cache
-            if let Ok(_cached_path) =
-                self.runtime
-                    .block_on(cache.cache_shard(shard_name, tar_path, token.clone()))
+            // Cache and acquire the read lock without an eviction race between
+            // those operations.
+            if let Ok((cached_path, _lock)) = self.runtime.block_on(
+                cache.cache_shard_for_reading(shard_name, tar_path, token.clone()),
+            )
             {
-                // Use the cached file loader which handles locking
-                let loader =
-                    create_cached_file_loader(cache, shard_name.to_string(), self.runtime.clone());
+                let loader = create_file_loader(
+                    &cached_path.to_string_lossy(),
+                    false,
+                    None,
+                    self.runtime.clone(),
+                );
 
                 return loader.load_file(file_info);
             }
@@ -1761,46 +1752,41 @@ impl PyTarDataLoader {
             let cache_clone = cache.clone();
             drop(dataset);
 
-            // Try to cache the shard
-            if let Ok(cached_path) =
-                self.runtime
-                    .block_on(cache_clone.cache_shard(shard_name, tar_path, token.clone()))
+            // Cache and acquire the read lock without an eviction race between
+            // those operations.
+            if let Ok((cached_path, _lock)) = self.runtime.block_on(
+                cache_clone.cache_shard_for_reading(shard_name, tar_path, token.clone()),
+            )
             {
-                // Acquire lock once for the entire batch
-                if let Ok(_lock) = self
-                    .runtime
-                    .block_on(cache_clone.lock_shard_for_reading(shard_name))
-                {
-                    use std::io::{Read, Seek, SeekFrom};
+                use std::io::{Read, Seek, SeekFrom};
 
-                    let mut file = std::fs::File::open(&cached_path).map_err(WebshartError::Io)?;
-                    for (idx, (filename, file_info)) in file_entries.iter().enumerate() {
-                        let data = if self.config.load_file_data
-                            && file_info.length <= self.config.max_file_size
-                        {
-                            let mut buffer = vec![0u8; file_info.length as usize];
-                            file.seek(SeekFrom::Start(file_info.offset))
-                                .and_then(|_| file.read_exact(&mut buffer))
-                                .map(|_| buffer)
-                                .unwrap_or_else(|e| {
-                                    eprintln!("Failed to load {}: {}", filename, e);
-                                    Vec::new()
-                                })
-                        } else {
-                            Vec::new()
-                        };
+                let mut file = std::fs::File::open(&cached_path).map_err(WebshartError::Io)?;
+                for (idx, (filename, file_info)) in file_entries.iter().enumerate() {
+                    let data = if self.config.load_file_data
+                        && file_info.length <= self.config.max_file_size
+                    {
+                        let mut buffer = vec![0u8; file_info.length as usize];
+                        file.seek(SeekFrom::Start(file_info.offset))
+                            .and_then(|_| file.read_exact(&mut buffer))
+                            .map(|_| buffer)
+                            .unwrap_or_else(|e| {
+                                eprintln!("Failed to load {}: {}", filename, e);
+                                Vec::new()
+                            })
+                    } else {
+                        Vec::new()
+                    };
 
-                        self.entry_buffer.push(create_tar_entry(
-                            filename.clone(),
-                            file_info,
-                            data,
-                            Some(self.current_shard),
-                            Some(self.next_file_to_load + idx),
-                        ));
-                    }
-
-                    return Ok(true);
+                    self.entry_buffer.push(create_tar_entry(
+                        filename.clone(),
+                        file_info,
+                        data,
+                        Some(self.current_shard),
+                        Some(self.next_file_to_load + idx),
+                    ));
                 }
+
+                return Ok(true);
             }
         } else {
             drop(dataset);
