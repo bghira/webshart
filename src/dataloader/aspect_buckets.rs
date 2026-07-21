@@ -1,6 +1,6 @@
-use crate::FileInfo;
 use crate::dataloader::PyTarDataLoader;
 use crate::error::{Result, WebshartError};
+use crate::FileInfo;
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
 
@@ -36,12 +36,12 @@ impl AspectBucketIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
         if slf.current_shard >= slf.num_shards {
             return Ok(None);
         }
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let shard_idx = slf.current_shard;
             slf.current_shard += 1;
             let loader = slf.loader.borrow(py);
@@ -54,11 +54,7 @@ impl AspectBucketIterator {
                 slf.round_to,
             )?;
 
-            if let Some(first) = result.first() {
-                Ok(Some(first.clone()))
-            } else {
-                Ok(None)
-            }
+            Ok(result.into_iter().next())
         })
     }
 }

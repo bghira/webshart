@@ -7,16 +7,24 @@ mod extract;
 mod metadata;
 mod metadata_resolver;
 // Re-export main types
+use dataloader::{scale_dimensions, PyBucketDataLoader, PyTarDataLoader, PyTarFileEntry};
 pub use dataloader::{AspectBucketIterator, BatchOperations, BatchResult, FileReadRequest};
-use dataloader::{PyBucketDataLoader, PyTarDataLoader, PyTarFileEntry, scale_dimensions};
 pub use discovery::{DatasetDiscovery, DiscoveredDataset};
 pub use error::{Result, WebshartError};
 pub use extract::MetadataExtractor;
 pub use metadata::{FileInfo, ShardMetadata};
 
+fn digest_to_hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// A Python module implemented in Rust for fast webdataset shard reading
 #[pymodule]
-fn _webshart(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _webshart(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     // Add Python classes
@@ -31,4 +39,14 @@ fn _webshart(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scale_dimensions, m)?)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::digest_to_hex;
+
+    #[test]
+    fn digest_to_hex_preserves_leading_zeroes() {
+        assert_eq!(digest_to_hex([0x00, 0x01, 0x0f, 0x10, 0xff]), "00010f10ff");
+    }
 }

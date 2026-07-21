@@ -1,3 +1,4 @@
+use crate::digest_to_hex;
 use crate::error::{Result, WebshartError};
 use crate::metadata::{FileInfo, ShardMetadata, ShardMetadataFormat};
 use futures::future::join_all;
@@ -777,7 +778,7 @@ impl MetadataExtractor {
                                 if size == 0 {
                                     Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
                                 } else if let Some(h) = hasher {
-                                    Some(format!("{:x}", h.finalize()))
+                                    Some(digest_to_hex(h.finalize()))
                                 } else {
                                     None
                                 }
@@ -898,7 +899,8 @@ impl MetadataExtractor {
                             && is_image_file(&path)
                             && size > 0
                             && size < 50_000_000;
-                        let need_json_metadata = is_json_file(&path) && size > 0 && size < 10_000_000;
+                        let need_json_metadata =
+                            is_json_file(&path) && size > 0 && size < 10_000_000;
                         let should_read = need_hash || need_dimensions || need_json_metadata;
 
                         if should_read {
@@ -933,7 +935,7 @@ impl MetadataExtractor {
                             if size == 0 {
                                 Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
                             } else if let Some(h) = hasher {
-                                Some(format!("{:x}", h.finalize()))
+                                Some(digest_to_hex(h.finalize()))
                             } else {
                                 None
                             }
@@ -948,7 +950,9 @@ impl MetadataExtractor {
                             (0, 0, 0.0)
                         };
                         if need_json_metadata && !file_data.is_empty() {
-                            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&file_data) {
+                            if let Ok(value) =
+                                serde_json::from_slice::<serde_json::Value>(&file_data)
+                            {
                                 json_by_path.insert(path.clone(), value);
                             }
                         }
@@ -1016,7 +1020,7 @@ impl MetadataExtractor {
                 }
             }
             hash_pb.finish_with_message(format!("✓ Hash computed for {}", shard.name));
-            Some(format!("{:x}", hasher.finalize()))
+            Some(digest_to_hex(hasher.finalize()))
         } else {
             None
         };

@@ -2,7 +2,7 @@ use crate::{metadata::CaptionValue, FileInfo};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
-#[pyclass(name = "TarFileEntry")]
+#[pyclass(name = "TarFileEntry", from_py_object)]
 #[derive(Clone)]
 pub struct PyTarFileEntry {
     pub path: String,
@@ -39,7 +39,7 @@ impl PyTarFileEntry {
 
     #[getter]
     fn data(&self) -> PyResult<Py<PyBytes>> {
-        Python::with_gil(|py| Ok(PyBytes::new(py, &self.data).into()))
+        Python::attach(|py| Ok(PyBytes::new(py, &self.data).unbind()))
     }
 
     #[getter]
@@ -64,10 +64,10 @@ impl PyTarFileEntry {
 
     #[getter]
     fn json_data(&self) -> Option<Py<PyBytes>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.json_data
                 .as_ref()
-                .map(|data| PyBytes::new(py, data).into())
+                .map(|data| PyBytes::new(py, data).unbind())
         })
     }
 
@@ -77,24 +77,24 @@ impl PyTarFileEntry {
     }
 
     #[getter]
-    fn captions(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn captions(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         match &self.captions {
-            Some(captions) => Ok(Some(pythonize::pythonize(py, captions)?)),
+            Some(captions) => Ok(Some(pythonize::pythonize(py, captions)?.unbind())),
             None => Ok(None),
         }
     }
 
     #[getter]
-    fn json_metadata(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn json_metadata(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         match &self.json_metadata {
-            Some(value) => Ok(Some(pythonize::pythonize(py, value)?)),
+            Some(value) => Ok(Some(pythonize::pythonize(py, value)?.unbind())),
             None => Ok(None),
         }
     }
 
     /// Get all metadata as a dictionary
     #[getter]
-    fn metadata(&self, py: Python) -> PyResult<PyObject> {
+    fn metadata(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("path", &self.path)?;
         dict.set_item("offset", self.offset)?;
@@ -119,7 +119,7 @@ impl PyTarFileEntry {
             dict.set_item("json_metadata", pythonize::pythonize(py, value)?)?;
         }
 
-        Ok(dict.into())
+        Ok(dict.into_any().unbind())
     }
 
     /// Get formatted job ID for tracking
