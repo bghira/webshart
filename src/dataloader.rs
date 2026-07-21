@@ -1,8 +1,8 @@
-use crate::FileInfo;
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset, PyDiscoveredDataset};
 use crate::error::{Result, WebshartError};
+use crate::FileInfo;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use rand::{rng, seq::SliceRandom};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,13 +19,13 @@ mod file_loading;
 pub mod shard_cache;
 use crate::impl_batch_iterator;
 use crate::metadata::ensure_shard_metadata_with_retry;
+use aspect_buckets::{calculate_bucket_key, BucketKeyType, BucketSamplingStrategy};
 pub use aspect_buckets::{
-    AspectBucketEntry, AspectBucketIterator, AspectBuckets, scale_dimensions_with_multiple,
+    scale_dimensions_with_multiple, AspectBucketEntry, AspectBucketIterator, AspectBuckets,
 };
-use aspect_buckets::{BucketKeyType, BucketSamplingStrategy, calculate_bucket_key};
 pub use batch::{BatchIterable, BatchOperations, BatchResult, FileReadRequest, PyBatchOperations};
 use config::DataLoaderConfig;
-pub use entry_types::{BucketEntry, PyTarFileEntry, create_tar_entry};
+pub use entry_types::{create_tar_entry, BucketEntry, PyTarFileEntry};
 use file_loading::{create_file_loader, file_http_client};
 
 // Re-export the entry type as it's part of the public API
@@ -68,7 +68,7 @@ impl PyRangeIterator {
 
         slf.current += 1;
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mut loader = slf.loader.borrow_mut(py);
             loader.next_entry()
         })
@@ -105,7 +105,7 @@ impl PyTarDataLoader {
     #[new]
     #[pyo3(signature = (dataset_or_path, load_file_data=true, max_file_size=50_000_000, buffer_size=100, hf_token=None, chunk_size_mb=10, batch_size=None))]
     fn new(
-        dataset_or_path: &PyAny,
+        dataset_or_path: &Bound<'_, PyAny>,
         load_file_data: bool,
         max_file_size: u64,
         buffer_size: usize,
@@ -161,7 +161,7 @@ impl PyTarDataLoader {
         })
     }
 
-    fn state_dict(&self, py: Python) -> PyResult<PyObject> {
+    fn state_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
 
         let current_file_index = self.calculate_current_file_index();
@@ -170,7 +170,7 @@ impl PyTarDataLoader {
         dict.set_item("current_file_index", current_file_index)?;
         dict.set_item("buffer_position", self.buffer_position)?;
 
-        self.config.to_state_dict(dict)?;
+        self.config.to_state_dict(&dict)?;
 
         dict.set_item("source", &self.source)?;
         dict.set_item("metadata_source", &self.metadata_source)?;
@@ -180,10 +180,10 @@ impl PyTarDataLoader {
         dict.set_item("is_remote", dataset.is_remote)?;
         dict.set_item("version", 4)?;
 
-        Ok(dict.into())
+        Ok(dict.into_any().unbind())
     }
 
-    fn load_state_dict(&mut self, state_dict: &PyDict) -> PyResult<()> {
+    fn load_state_dict(&mut self, state_dict: &Bound<'_, PyDict>) -> PyResult<()> {
         if let Ok(Some(version_item)) = state_dict.get_item("version") {
             if let Ok(version) = version_item.extract::<i32>() {
                 if version > 4 {
@@ -267,13 +267,13 @@ impl PyTarDataLoader {
     #[pyo3(signature = (state_dict, dataset_or_path=None))]
     fn from_state_dict(
         py: Python,
-        state_dict: &PyDict,
-        dataset_or_path: Option<&PyAny>,
+        state_dict: &Bound<'_, PyDict>,
+        dataset_or_path: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let config = DataLoaderConfig::from_state_dict(state_dict);
 
         let source_obj = Self::determine_source_from_state_dict(py, state_dict, dataset_or_path)?;
-        let source = source_obj.as_ref(py);
+        let source = source_obj.bind(py);
 
         let mut loader = Self::new(
             source,
@@ -289,7 +289,7 @@ impl PyTarDataLoader {
         Ok(loader)
     }
 
-    fn get_state_summary(&self, py: Python) -> PyResult<PyObject> {
+    fn get_state_summary(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
 
         let mut dataset = self.dataset.lock().unwrap();
@@ -314,7 +314,7 @@ impl PyTarDataLoader {
         )?;
         dict.set_item("batch_size", self.config.batch_size)?;
 
-        Ok(dict.into())
+        Ok(dict.into_any().unbind())
     }
 
     /// Create an iterator for a specific range
@@ -522,7 +522,7 @@ impl PyTarDataLoader {
     }
 
     /// Get information about which shard will be loaded next
-    fn get_next_shard_info(&self, py: Python) -> PyResult<Option<PyObject>> {
+    fn get_next_shard_info(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         if self.buffer_position < self.entry_buffer.len() {
             return Ok(None); // Still have buffered entries
         }
@@ -556,11 +556,11 @@ impl PyTarDataLoader {
             dict.set_item("is_cached", true)?; // Local files are always "cached"
         }
 
-        Ok(Some(dict.into()))
+        Ok(Some(dict.into_any().unbind()))
     }
 
     /// Get information about a specific shard's cache status
-    fn get_shard_cache_status(&self, py: Python, filename: &str) -> PyResult<PyObject> {
+    fn get_shard_cache_status(&self, py: Python, filename: &str) -> PyResult<Py<PyAny>> {
         let dataset = self.dataset.lock().unwrap();
 
         let shard_idx = self.find_shard_by_filename(&dataset, filename)?;
@@ -596,11 +596,11 @@ impl PyTarDataLoader {
             dict.set_item("is_cached", true)?; // Local files are always "cached"
         }
 
-        Ok(dict.into())
+        Ok(dict.into_any().unbind())
     }
 
     #[pyo3(signature = (lookahead=5))]
-    fn get_lookahead_cache_status(&self, py: Python, lookahead: usize) -> PyResult<PyObject> {
+    fn get_lookahead_cache_status(&self, py: Python, lookahead: usize) -> PyResult<Py<PyAny>> {
         let dataset = self.dataset.lock().unwrap();
         let list = PyList::empty(py);
 
@@ -626,7 +626,7 @@ impl PyTarDataLoader {
             list.append(dict)?;
         }
 
-        Ok(list.into())
+        Ok(list.into_any().unbind())
     }
 
     #[pyo3(signature = (num_shards=1))]
@@ -789,7 +789,7 @@ impl PyTarDataLoader {
         Ok(())
     }
 
-    fn get_metadata(&self, shard_idx: usize, py: Python) -> PyResult<PyObject> {
+    fn get_metadata(&self, shard_idx: usize, py: Python) -> PyResult<Py<PyAny>> {
         let mut dataset = self.dataset.lock().unwrap();
         ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
 
@@ -806,10 +806,10 @@ impl PyTarDataLoader {
             }
         }
 
-        Ok(dict.into())
+        Ok(dict.into_any().unbind())
     }
 
-    fn list_samples_in_shard(&self, shard_idx: usize, py: Python) -> PyResult<PyObject> {
+    fn list_samples_in_shard(&self, shard_idx: usize, py: Python) -> PyResult<Py<PyAny>> {
         let mut dataset = self.dataset.lock().unwrap();
         ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
 
@@ -824,7 +824,7 @@ impl PyTarDataLoader {
             }
         }
 
-        Ok(list.into())
+        Ok(list.into_any().unbind())
     }
 
     fn load_sample(&self, shard_idx: usize, sample_idx: usize) -> PyResult<PyTarFileEntry> {
@@ -883,7 +883,7 @@ impl PyTarDataLoader {
         Ok(entry
             .json_data
             .as_ref()
-            .map(|data| PyBytes::new(py, data).into()))
+            .map(|data| PyBytes::new(py, data).unbind()))
     }
 
     fn reset(&mut self) -> PyResult<()> {
@@ -967,7 +967,7 @@ impl PyTarDataLoader {
         target_pixel_area: Option<u32>,
         target_resolution_multiple: u32,
         round_to: Option<usize>,
-    ) -> PyResult<Vec<PyObject>> {
+    ) -> PyResult<Vec<Py<PyAny>>> {
         let results = self.get_aspect_buckets_for_shards(
             shard_indices,
             key,
@@ -976,7 +976,7 @@ impl PyTarDataLoader {
             round_to,
         )?;
 
-        let py_results: Vec<PyObject> = results
+        let py_results: Vec<Py<PyAny>> = results
             .into_iter()
             .map(|bucket| self.aspect_buckets_to_py_dict(py, bucket))
             .collect::<PyResult<Vec<_>>>()?;
@@ -993,7 +993,7 @@ impl PyTarDataLoader {
         target_pixel_area: Option<u32>,
         target_resolution_multiple: u32,
         round_to: Option<usize>,
-    ) -> PyResult<Vec<PyObject>> {
+    ) -> PyResult<Vec<Py<PyAny>>> {
         let results = self.get_sample_aspect_buckets_for_shards(
             shard_indices,
             key,
@@ -1002,7 +1002,7 @@ impl PyTarDataLoader {
             round_to,
         )?;
 
-        let py_results: Vec<PyObject> = results
+        let py_results: Vec<Py<PyAny>> = results
             .into_iter()
             .map(|bucket| self.aspect_buckets_to_py_dict(py, bucket))
             .collect::<PyResult<Vec<_>>>()?;
@@ -1018,7 +1018,7 @@ impl PyTarDataLoader {
         target_pixel_area: Option<u32>,
         target_resolution_multiple: u32,
         round_to: Option<usize>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let key_str = key.unwrap_or("aspect");
         let _key_type = BucketKeyType::parse(key_str)?;
 
@@ -1033,7 +1033,7 @@ impl PyTarDataLoader {
             num_shards,
         };
 
-        Py::new(py, iterator).map(|py_iter| py_iter.to_object(py))
+        Py::new(py, iterator).map(Py::into_any)
     }
 }
 
@@ -1286,11 +1286,11 @@ impl PyTarDataLoader {
 
     fn determine_source_from_state_dict<'py>(
         py: Python<'py>,
-        state_dict: &PyDict,
-        dataset_or_path: Option<&'py PyAny>,
-    ) -> PyResult<PyObject> {
+        state_dict: &Bound<'py, PyDict>,
+        dataset_or_path: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         if let Some(dataset_or_path) = dataset_or_path {
-            return Ok(dataset_or_path.to_object(py));
+            return Ok(dataset_or_path.clone().unbind());
         }
 
         let source_str = match state_dict.get_item("source")? {
@@ -1320,17 +1320,16 @@ impl PyTarDataLoader {
             let dataset = if Path::new(&source_str).exists() {
                 discovery.discover_local(Path::new(&source_str))?
             } else {
-                py.allow_threads(|| {
+                py.detach(|| {
                     Runtime::new()?.block_on(discovery.discover_huggingface(&source_str, None))
                 })?
             };
 
             let py_dataset = Py::new(py, PyDiscoveredDataset { inner: dataset })?;
-            return Ok(py_dataset.to_object(py));
+            return Ok(py_dataset.into_any());
         }
 
-        let py_source = py.eval(&format!("'{}'", source_str), None, None)?;
-        Ok(py_source.to_object(py))
+        Ok(PyString::new(py, &source_str).into_any().unbind())
     }
 
     fn get_aspect_buckets_for_shards(
@@ -1437,7 +1436,7 @@ impl PyTarDataLoader {
         }
     }
 
-    fn aspect_buckets_to_py_dict(&self, py: Python, bucket: AspectBuckets) -> PyResult<PyObject> {
+    fn aspect_buckets_to_py_dict(&self, py: Python, bucket: AspectBuckets) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("shard_idx", bucket.shard_idx)?;
         dict.set_item("shard_name", bucket.shard_name)?;
@@ -1446,37 +1445,37 @@ impl PyTarDataLoader {
         for (key, files) in bucket.buckets {
             let files_list = PyList::new(
                 py,
-                files
-                    .into_iter()
-                    .map(|entry| {
-                        let file_dict = PyDict::new(py);
-                        file_dict.set_item("filename", entry.filename).unwrap();
-                        file_dict.set_item("offset", entry.file_info.offset).unwrap();
-                        file_dict.set_item("size", entry.file_info.length).unwrap();
-                        if let Some(sample_idx) = entry.sample_idx {
-                            file_dict.set_item("sample_idx", sample_idx).unwrap();
-                        }
-                        if let Some(w) = entry.file_info.width {
-                            file_dict.set_item("width", w).unwrap();
-                        }
-                        if let Some(h) = entry.file_info.height {
-                            file_dict.set_item("height", h).unwrap();
-                        }
-                        if let Some(a) = entry.file_info.aspect {
-                            file_dict.set_item("aspect", a).unwrap();
-                        }
-                        if let Some((orig_w, orig_h)) = entry.original_size {
-                            let orig_list = PyList::new(py, &[orig_w, orig_h]);
-                            file_dict.set_item("original_size", orig_list).unwrap();
-                        }
-                        file_dict
-                    }),
-            );
+                files.into_iter().map(|entry| {
+                    let file_dict = PyDict::new(py);
+                    file_dict.set_item("filename", entry.filename).unwrap();
+                    file_dict
+                        .set_item("offset", entry.file_info.offset)
+                        .unwrap();
+                    file_dict.set_item("size", entry.file_info.length).unwrap();
+                    if let Some(sample_idx) = entry.sample_idx {
+                        file_dict.set_item("sample_idx", sample_idx).unwrap();
+                    }
+                    if let Some(w) = entry.file_info.width {
+                        file_dict.set_item("width", w).unwrap();
+                    }
+                    if let Some(h) = entry.file_info.height {
+                        file_dict.set_item("height", h).unwrap();
+                    }
+                    if let Some(a) = entry.file_info.aspect {
+                        file_dict.set_item("aspect", a).unwrap();
+                    }
+                    if let Some((orig_w, orig_h)) = entry.original_size {
+                        let orig_list = PyList::new(py, [orig_w, orig_h]).unwrap();
+                        file_dict.set_item("original_size", orig_list).unwrap();
+                    }
+                    file_dict
+                }),
+            )?;
             buckets_dict.set_item(key, files_list)?;
         }
 
         dict.set_item("buckets", buckets_dict)?;
-        Ok(dict.into())
+        Ok(dict.into_any().unbind())
     }
 
     fn load_single_file_data(
@@ -1496,10 +1495,11 @@ impl PyTarDataLoader {
 
             // Cache and acquire the read lock without an eviction race between
             // those operations.
-            if let Ok((cached_path, _lock)) = self.runtime.block_on(
-                cache.cache_shard_for_reading(shard_name, tar_path, token.clone()),
-            )
-            {
+            if let Ok((cached_path, _lock)) = self.runtime.block_on(cache.cache_shard_for_reading(
+                shard_name,
+                tar_path,
+                token.clone(),
+            )) {
                 let loader = create_file_loader(
                     &cached_path.to_string_lossy(),
                     false,
@@ -1754,9 +1754,9 @@ impl PyTarDataLoader {
 
             // Cache and acquire the read lock without an eviction race between
             // those operations.
-            if let Ok((cached_path, _lock)) = self.runtime.block_on(
-                cache_clone.cache_shard_for_reading(shard_name, tar_path, token.clone()),
-            )
+            if let Ok((cached_path, _lock)) = self
+                .runtime
+                .block_on(cache_clone.cache_shard_for_reading(shard_name, tar_path, token.clone()))
             {
                 use std::io::{Read, Seek, SeekFrom};
 
@@ -1953,7 +1953,7 @@ pub struct PyBucketDataLoader {
 
 impl BatchIterable<PyTarFileEntry> for PyBucketDataLoader {
     fn next_item(&mut self) -> PyResult<Option<PyTarFileEntry>> {
-        Python::with_gil(|py| self.next_entry(py))
+        Python::attach(|py| self.next_entry(py))
     }
 
     fn get_batch_size(&self) -> Option<usize> {
@@ -1981,7 +1981,7 @@ impl PyBucketDataLoader {
     ))]
     fn new(
         py: Python,
-        dataset_or_path: &PyAny,
+        dataset_or_path: &Bound<'_, PyAny>,
         key: &str,
         target_pixel_area: Option<u32>,
         target_resolution_multiple: u32,
@@ -2046,11 +2046,11 @@ impl PyBucketDataLoader {
     }
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyTarFileEntry>> {
-        Python::with_gil(|py| slf.next_entry(py))
+        Python::attach(|py| slf.next_entry(py))
     }
 
     fn next_batch(&mut self) -> PyResult<Option<Vec<PyTarFileEntry>>> {
-        Python::with_gil(|py| <Self as BatchIterable<PyTarFileEntry>>::next_batch(self))
+        Python::attach(|_py| <Self as BatchIterable<PyTarFileEntry>>::next_batch(self))
     }
 
     fn iter_batches(slf: PyRef<'_, Self>) -> PyResult<PyBucketBatchIterator> {
@@ -2084,7 +2084,7 @@ impl PyBucketDataLoader {
         Ok(())
     }
 
-    fn get_bucket_stats(&self, py: Python) -> PyResult<PyObject> {
+    fn get_bucket_stats(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
 
         dict.set_item("num_buckets", self.buckets.len())?;
@@ -2131,7 +2131,7 @@ impl PyBucketDataLoader {
         )?;
         dict.set_item("bucket_details", bucket_details)?;
 
-        Ok(dict.into())
+        Ok(dict.into_any().unbind())
     }
 
     fn get_current_bucket(&self) -> Option<String> {

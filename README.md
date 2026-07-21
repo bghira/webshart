@@ -247,7 +247,7 @@ I discovered after creating this library that [cheesechaser](https://github.com/
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.12+
 - Linux/macOS/Windows
 
 ## Roadmap

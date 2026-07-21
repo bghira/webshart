@@ -12,7 +12,7 @@ pub struct DataLoaderConfig {
 }
 
 impl DataLoaderConfig {
-    pub fn from_state_dict(state_dict: &PyDict) -> Self {
+    pub fn from_state_dict(state_dict: &Bound<'_, PyDict>) -> Self {
         Self {
             load_file_data: state_dict
                 .get_item("load_file_data")
@@ -51,7 +51,7 @@ impl DataLoaderConfig {
         }
     }
 
-    pub fn to_state_dict(&self, dict: &PyDict) -> PyResult<()> {
+    pub fn to_state_dict(&self, dict: &Bound<'_, PyDict>) -> PyResult<()> {
         dict.set_item("load_file_data", self.load_file_data)?;
         dict.set_item("max_file_size", self.max_file_size)?;
         dict.set_item("buffer_size", self.buffer_size)?;

@@ -1,4 +1,5 @@
 // dataloader/shard_cache.rs
+use crate::digest_to_hex;
 use crate::error::{Result, WebshartError};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -522,7 +523,7 @@ impl ShardCache {
 
     fn shard_key(shard_name: &str) -> String {
         let digest = Sha256::digest(shard_name.as_bytes());
-        format!("{:x}", digest)
+        digest_to_hex(digest)
     }
 
     fn lock_dir(&self) -> PathBuf {

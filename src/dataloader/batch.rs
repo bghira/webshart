@@ -1,5 +1,5 @@
-use crate::discovery::{DatasetDiscovery, DiscoveredDataset};
 use crate::dataloader::file_loading::file_http_client;
+use crate::discovery::{DatasetDiscovery, DiscoveredDataset};
 use crate::error::{Result, WebshartError};
 use futures::future::join_all;
 use pyo3::prelude::*;
@@ -243,13 +243,13 @@ impl PyBatchOperations {
             .inner
             .discover_datasets_batch(sources, hf_token, subfolders);
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let list = PyList::empty(py);
             for result in results {
                 match result {
                     BatchResult::Ok(dataset) => {
                         let py_dataset = PyDiscoveredDataset { inner: dataset };
-                        list.append(py_dataset.into_py(py))?;
+                        list.append(Py::new(py, py_dataset)?)?;
                     }
                     BatchResult::Err(_e) => {
                         list.append(py.None())?;
@@ -269,7 +269,7 @@ impl PyBatchOperations {
             .inner
             .load_metadata_batch(&mut dataset.inner, shard_indices);
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let list = PyList::empty(py);
             for result in results {
                 match result {
@@ -288,7 +288,7 @@ impl PyBatchOperations {
     fn read_files_batch(
         &self,
         py: Python,
-        datasets: &PyList,
+        datasets: &Bound<'_, PyList>,
         requests: Vec<(usize, usize, usize)>, // (dataset_idx, shard_idx, file_idx)
     ) -> PyResult<Py<PyList>> {
         // Extract mutable references to datasets
