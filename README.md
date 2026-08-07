@@ -53,6 +53,11 @@ entry = loader.load_sample(0, 0)
 print(entry.path, entry.captions, entry.json_metadata)
 ```
 
+`max_file_size` is a visibility limit for loader APIs. Files larger than the
+configured limit are omitted from iteration, batches, direct sample loading,
+and aspect buckets instead of being returned with empty data. Direct
+`load_sample()` calls return `None` for an oversized sample.
+
 ## Common Patterns
 
 For real-world, working examples:

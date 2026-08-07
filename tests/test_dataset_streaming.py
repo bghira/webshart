@@ -65,6 +65,44 @@ def discovered_dataset(mock_dataset_dir):
     return webshart.discover_dataset(mock_dataset_dir)
 
 
+@pytest.fixture
+def mixed_size_dataset_dir():
+    """Create one shard with oversized files interleaved with eligible files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tar_path = Path(tmpdir) / "mixed-0000.tar"
+        contents = {
+            "0-oversized.jpg": b"x" * 101,
+            "1-small.jpg": b"small-zero",
+            "2-oversized.jpg": b"y" * 150,
+            "3-small.jpg": b"z" * 100,
+        }
+
+        with tarfile.open(tar_path, "w") as tar:
+            for filename, data in contents.items():
+                info = tarfile.TarInfo(name=filename)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+        with tarfile.open(tar_path, "r") as tar:
+            files = {
+                member.name: {
+                    "offset": member.offset_data,
+                    "length": member.size,
+                    "width": 64,
+                    "height": 64,
+                    "aspect": 1.0,
+                }
+                for member in tar
+                if member.isfile()
+            }
+
+        (Path(tmpdir) / "mixed-0000.json").write_text(
+            json.dumps({"filesize": tar_path.stat().st_size, "files": files}),
+            encoding="utf-8",
+        )
+        yield tmpdir
+
+
 class TestTarDataLoader:
     """Test the TarDataLoader functionality."""
 
@@ -328,14 +366,60 @@ class TestDataLoaderIntegration:
         assert dataset.get_hf_token() == "test_token"
 
     def test_max_file_size_limit(self, mock_dataset_dir):
-        """Test max_file_size parameter."""
-        # Create a loader with very small max file size
+        """Oversized files are not yielded to callers."""
         loader = webshart.TarDataLoader(mock_dataset_dir, max_file_size=100)
 
-        entry = next(loader)
+        assert list(loader) == []
 
-        # File should not be loaded due to size limit
-        assert len(entry.data) == 0
+    def test_max_file_size_skips_oversized_files_without_skipping_shard(
+        self, mixed_size_dataset_dir
+    ):
+        """Filtering an empty buffer continues to later eligible files."""
+        loader = webshart.TarDataLoader(
+            mixed_size_dataset_dir,
+            max_file_size=100,
+            buffer_size=1,
+        )
+
+        entries = list(loader)
+
+        assert [entry.path for entry in entries] == ["1-small.jpg", "3-small.jpg"]
+        assert [entry.job_id for entry in entries] == [
+            "shard0000_file000001",
+            "shard0000_file000003",
+        ]
+        assert [bytes(entry.data) for entry in entries] == [b"small-zero", b"z" * 100]
+
+    def test_max_file_size_filters_metadata_direct_access_and_batches(
+        self, mixed_size_dataset_dir
+    ):
+        """Every loader-facing access path hides oversized files."""
+        loader = webshart.TarDataLoader(
+            mixed_size_dataset_dir,
+            load_file_data=False,
+            max_file_size=100,
+            buffer_size=1,
+            batch_size=1,
+        )
+
+        assert list(loader.get_metadata(0)) == ["1-small.jpg", "3-small.jpg"]
+        assert loader.list_samples_in_shard(0) == ["1-small.jpg", "3-small.jpg"]
+        assert loader.load_sample(0, 0) is None
+        assert loader.load_sample(0, 1).path == "1-small.jpg"
+
+        batches = list(loader.iter_batches())
+        assert [[entry.path for entry in batch] for batch in batches] == [
+            ["1-small.jpg"],
+            ["3-small.jpg"],
+        ]
+        assert all(bytes(entry.data) == b"" for batch in batches for entry in batch)
+
+        bucket_loader = webshart.BucketDataLoader(
+            mixed_size_dataset_dir,
+            max_file_size=100,
+            lazy_load=False,
+        )
+        assert [entry.path for entry in bucket_loader] == ["1-small.jpg", "3-small.jpg"]
 
     def test_entry_repr(self, discovered_dataset):
         """Test TarFileEntry __repr__ method."""
