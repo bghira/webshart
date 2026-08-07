@@ -56,7 +56,10 @@ print(entry.path, entry.captions, entry.json_metadata)
 `max_file_size` is a visibility limit for loader APIs. Files larger than the
 configured limit are omitted from iteration, batches, direct sample loading,
 and aspect buckets instead of being returned with empty data. Direct
-`load_sample()` calls return `None` for an oversized sample.
+`load_sample()` calls return `None` for an oversized sample. The loader's
+`list_samples_in_shard()` returns dictionaries containing `sample_idx` and
+`filename`, so filtered listings retain the stable index required by
+`load_sample()`.
 
 ## Common Patterns
 

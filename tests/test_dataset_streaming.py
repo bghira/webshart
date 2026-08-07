@@ -403,9 +403,16 @@ class TestDataLoaderIntegration:
         )
 
         assert list(loader.get_metadata(0)) == ["1-small.jpg", "3-small.jpg"]
-        assert loader.list_samples_in_shard(0) == ["1-small.jpg", "3-small.jpg"]
+        samples = loader.list_samples_in_shard(0)
+        assert samples == [
+            {"sample_idx": 1, "filename": "1-small.jpg"},
+            {"sample_idx": 3, "filename": "3-small.jpg"},
+        ]
         assert loader.load_sample(0, 0) is None
-        assert loader.load_sample(0, 1).path == "1-small.jpg"
+        assert [loader.load_sample(0, sample["sample_idx"]).path for sample in samples] == [
+            "1-small.jpg",
+            "3-small.jpg",
+        ]
 
         batches = list(loader.iter_batches())
         assert [[entry.path for entry in batch] for batch in batches] == [
