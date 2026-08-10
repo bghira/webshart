@@ -110,7 +110,7 @@ class TestTarDataLoaderStateDict:
     def test_from_state_dict(self, discovered_dataset):
         """Test creating loader from state dict."""
         loader1 = webshart.TarDataLoader(
-            discovered_dataset, buffer_size=10, load_file_data=False, max_file_size=1000
+            discovered_dataset, buffer_size=10, load_file_data=False, max_file_size=5000
         )
 
         # Read to middle of dataset
@@ -125,7 +125,7 @@ class TestTarDataLoaderStateDict:
         # Check configuration was restored
         assert loader2.buffer_size == 10
         assert not loader2.load_file_data
-        assert loader2.max_file_size == 1000
+        assert loader2.max_file_size == 5000
 
         # Check position was restored
         entry = next(loader2)
