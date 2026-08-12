@@ -117,7 +117,18 @@ pub struct ShardMetadata {
     pub hash_lfs: Option<String>,
     pub includes_image_geometry: bool,
     files: Vec<FileInfoInternal>, // Internal storage with guaranteed path
-    sample_indices: Vec<usize>,   // Logical samples, excluding paired JSON sidecars
+    sample_indices: Vec<usize>,   // Logical samples, excluding paired sidecars
+    txt_sidecar_indices: Vec<Option<usize>>, // Paired `.txt` member per logical sample
+}
+
+/// Counts used to describe how captions are represented in a shard.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptionLayoutCounts {
+    pub samples: usize,
+    pub captioned_samples: usize,
+    pub embedded_samples: usize,
+    pub json_sidecar_samples: usize,
+    pub txt_sidecar_samples: usize,
 }
 
 impl ShardMetadata {
@@ -210,25 +221,41 @@ impl ShardMetadata {
             .unwrap_or(false)
     }
 
+    fn is_txt_path(path: &str) -> bool {
+        path.rsplit_once('.')
+            .map(|(_, ext)| ext.eq_ignore_ascii_case("txt"))
+            .unwrap_or(false)
+    }
+
+    fn is_sidecar_path(path: &str) -> bool {
+        Self::is_json_path(path) || Self::is_txt_path(path)
+    }
+
     fn infer_json_sidecars(&mut self) {
         let mut json_by_key: HashMap<String, (String, u64, u64)> = HashMap::new();
-        let mut non_json_keys: HashSet<String> = HashSet::new();
+        let mut primary_keys: HashSet<String> = HashSet::new();
+        let mut txt_keys: HashSet<String> = HashSet::new();
 
         for file in &self.files {
             let key = Self::sample_key(&file.path);
             if Self::is_json_path(&file.path) {
                 json_by_key.insert(key, (file.path.clone(), file.offset, file.length));
+            } else if Self::is_txt_path(&file.path) {
+                txt_keys.insert(key);
             } else {
-                non_json_keys.insert(key);
+                primary_keys.insert(key);
             }
         }
 
+        let logical_sample_keys: HashSet<String> = primary_keys.union(&txt_keys).cloned().collect();
+
         for file in &mut self.files {
-            if Self::is_json_path(&file.path) {
+            let key = Self::sample_key(&file.path);
+            let is_paired_txt = Self::is_txt_path(&file.path) && primary_keys.contains(&key);
+            if Self::is_json_path(&file.path) || is_paired_txt {
                 continue;
             }
 
-            let key = Self::sample_key(&file.path);
             if let Some((json_path, json_offset, json_length)) = json_by_key.get(&key) {
                 if file.json_path.is_none() {
                     file.json_path = Some(json_path.clone());
@@ -245,7 +272,7 @@ impl ShardMetadata {
         for file in &mut self.files {
             if Self::is_json_path(&file.path) {
                 let key = Self::sample_key(&file.path);
-                if non_json_keys.contains(&key) {
+                if logical_sample_keys.contains(&key) {
                     file.json_path = None;
                     file.json_offset = None;
                     file.json_length = None;
@@ -255,6 +282,12 @@ impl ShardMetadata {
     }
 
     fn rebuild_sample_index(&mut self) {
+        let primary_keys: HashSet<String> = self
+            .files
+            .iter()
+            .filter(|info| !Self::is_sidecar_path(&info.path))
+            .map(|info| Self::sample_key(&info.path))
+            .collect();
         let non_json_keys: HashSet<String> = self
             .files
             .iter()
@@ -267,18 +300,40 @@ impl ShardMetadata {
             .iter()
             .enumerate()
             .filter_map(|(idx, info)| {
-                let is_paired_json = Self::is_json_path(&info.path)
-                    && non_json_keys.contains(&Self::sample_key(&info.path));
-                if is_paired_json {
+                let key = Self::sample_key(&info.path);
+                let is_paired_sidecar = (Self::is_txt_path(&info.path)
+                    && primary_keys.contains(&key))
+                    || (Self::is_json_path(&info.path) && non_json_keys.contains(&key));
+                if is_paired_sidecar {
                     None
                 } else {
                     Some(idx)
                 }
             })
             .collect();
+
+        let txt_by_key: HashMap<String, usize> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| {
+                Self::is_txt_path(&info.path)
+                    && primary_keys.contains(&Self::sample_key(&info.path))
+            })
+            .map(|(idx, info)| (Self::sample_key(&info.path), idx))
+            .collect();
+        self.txt_sidecar_indices = self
+            .sample_indices
+            .iter()
+            .map(|file_index| {
+                self.files
+                    .get(*file_index)
+                    .and_then(|info| txt_by_key.get(&Self::sample_key(&info.path)).copied())
+            })
+            .collect();
     }
 
-    fn extract_caption_value(value: &Value) -> Option<CaptionValue> {
+    pub(crate) fn extract_caption_value(value: &Value) -> Option<CaptionValue> {
         let keys = [
             "caption",
             "captions",
@@ -371,6 +426,7 @@ impl ShardMetadata {
                     includes_image_geometry,
                     files: file_vec,
                     sample_indices: Vec::new(),
+                    txt_sidecar_indices: Vec::new(),
                 }
             }
             ShardMetadataFormat::Vec {
@@ -391,6 +447,7 @@ impl ShardMetadata {
                     includes_image_geometry,
                     files: file_vec,
                     sample_indices: Vec::new(),
+                    txt_sidecar_indices: Vec::new(),
                 }
             }
         };
@@ -418,12 +475,12 @@ impl ShardMetadata {
         self.files.iter().map(|f| f.path.clone()).collect()
     }
 
-    /// Get the number of logical samples, excluding paired JSON sidecars.
+    /// Get the number of logical samples, excluding paired sidecars.
     pub fn num_samples(&self) -> usize {
         self.sample_indices.len()
     }
 
-    /// Get sample filenames in order, excluding paired JSON sidecars.
+    /// Get sample filenames in order, excluding paired sidecars.
     pub fn sample_filenames(&self) -> Vec<String> {
         self.sample_indices
             .iter()
@@ -432,12 +489,58 @@ impl ShardMetadata {
             .collect()
     }
 
-    /// Get sample by logical sample index, excluding paired JSON sidecars.
+    /// Get sample by logical sample index, excluding paired sidecars.
     pub fn get_sample_by_index(&self, index: usize) -> Option<(String, FileInfo)> {
         self.sample_indices
             .get(index)
             .and_then(|idx| self.files.get(*idx))
             .map(|info| (info.path.clone(), FileInfo::from(info)))
+    }
+
+    /// Get a paired `.txt` caption sidecar for a logical sample.
+    pub fn get_txt_sidecar_by_sample_index(&self, index: usize) -> Option<(String, FileInfo)> {
+        self.txt_sidecar_indices
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|file_index| self.files.get(file_index))
+            .map(|info| (info.path.clone(), FileInfo::from(info)))
+    }
+
+    /// Count caption layouts for the logical samples in this shard.
+    pub fn caption_layout_counts(&self) -> CaptionLayoutCounts {
+        let mut counts = CaptionLayoutCounts {
+            samples: self.num_samples(),
+            ..CaptionLayoutCounts::default()
+        };
+
+        for sample_index in 0..self.num_samples() {
+            let Some((_filename, file_info)) = self.get_sample_by_index(sample_index) else {
+                continue;
+            };
+            let has_txt = self.get_txt_sidecar_by_sample_index(sample_index).is_some();
+            let has_json = file_info.json_path.is_some();
+            let has_embedded = file_info.captions.is_some() && !has_txt && !has_json;
+
+            counts.txt_sidecar_samples += usize::from(has_txt);
+            counts.json_sidecar_samples += usize::from(has_json);
+            counts.embedded_samples += usize::from(has_embedded);
+            counts.captioned_samples += usize::from(has_txt || file_info.captions.is_some());
+        }
+
+        counts
+    }
+
+    /// Store captions on a logical sample entry.
+    pub fn set_sample_captions(&mut self, index: usize, captions: CaptionValue) -> bool {
+        let Some(file_index) = self.sample_indices.get(index).copied() else {
+            return false;
+        };
+        let Some(file_info) = self.files.get_mut(file_index) else {
+            return false;
+        };
+        file_info.captions = Some(captions);
+        true
     }
 
     /// Return a bounded range of logical samples without cloning unrelated files.

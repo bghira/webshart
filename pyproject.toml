@@ -28,6 +28,9 @@ dependencies = [
     "tqdm>=4.69.0,<5.0.0"
 ]
 
+[project.optional-dependencies]
+hub = ["huggingface-hub>=1.0.0,<2.0.0"]
+
 [project.scripts]
 webshart = "webshart:main"
 

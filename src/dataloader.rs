@@ -1,11 +1,13 @@
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset, PyDiscoveredDataset};
 use crate::error::{Result, WebshartError};
+use crate::metadata::{CaptionValue, ShardMetadata};
 use crate::FileInfo;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use rand::{rng, seq::SliceRandom};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -962,6 +964,9 @@ impl PyTarDataLoader {
                 sample_idx, shard_idx
             ))
         })?;
+        let txt_sidecar = metadata
+            .get_txt_sidecar_by_sample_index(sample_idx)
+            .map(|(_, file_info)| file_info);
 
         let tar_path = shard.tar_path.clone();
         let is_remote = dataset.is_remote;
@@ -989,8 +994,156 @@ impl PyTarDataLoader {
             Some(shard_idx),
             Some(sample_idx),
         );
-        entry.json_data = self.load_json_sidecar_bytes(&tar_path, &file_info, is_remote, token)?;
+        entry.json_data =
+            self.load_json_sidecar_bytes(&tar_path, &file_info, is_remote, token.clone())?;
+        entry.captions = self.load_caption_value(
+            &tar_path,
+            &file_info,
+            txt_sidecar.as_ref(),
+            entry.json_data.as_deref(),
+            is_remote,
+            token,
+        )?;
         Ok(Some(entry))
+    }
+
+    /// Load the first caption for a logical sample from metadata or a paired sidecar.
+    fn load_caption(&self, shard_idx: usize, sample_idx: usize) -> PyResult<Option<String>> {
+        let mut dataset = self.dataset.lock().unwrap();
+        ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+
+        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
+        })?;
+        let metadata = shard
+            .metadata
+            .as_ref()
+            .ok_or_else(|| WebshartError::MetadataNotFound("Metadata not loaded".to_string()))?;
+        let (_filename, file_info) = metadata.get_sample_by_index(sample_idx).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!(
+                "Sample index {} out of range for shard {}",
+                sample_idx, shard_idx
+            ))
+        })?;
+        let txt_sidecar = metadata
+            .get_txt_sidecar_by_sample_index(sample_idx)
+            .map(|(_, file_info)| file_info);
+        let tar_path = shard.tar_path.clone();
+        let is_remote = dataset.is_remote;
+        let token = if is_remote {
+            dataset.get_hf_token()
+        } else {
+            None
+        };
+        drop(dataset);
+
+        if file_info.length > self.config.max_file_size {
+            return Ok(None);
+        }
+
+        let captions = self.load_caption_value(
+            &tar_path,
+            &file_info,
+            txt_sidecar.as_ref(),
+            None,
+            is_remote,
+            token,
+        )?;
+        Ok(captions.and_then(|value| value.first().map(str::to_owned)))
+    }
+
+    /// Fold sidecar captions into normal webshart metadata JSON files.
+    #[pyo3(signature = (destination=None, shard_indices=None))]
+    fn coalesce_caption_metadata(
+        &self,
+        py: Python,
+        destination: Option<String>,
+        shard_indices: Option<Vec<usize>>,
+    ) -> PyResult<Py<PyAny>> {
+        let (num_shards, cache_dir) = {
+            let dataset = self.dataset.lock().unwrap();
+            (dataset.num_shards(), dataset.metadata_cache_dir())
+        };
+        let persist_to_cache = destination.is_none();
+        let destination = match destination {
+            Some(path) => Path::new(&path).to_path_buf(),
+            None => cache_dir.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "enable_metadata_cache() first or provide destination",
+                )
+            })?,
+        };
+        let shard_indices = shard_indices.unwrap_or_else(|| (0..num_shards).collect());
+        let mut output_paths = Vec::with_capacity(shard_indices.len());
+        let mut captioned_samples = 0usize;
+        let mut coalesced_samples = 0usize;
+
+        for shard_idx in shard_indices {
+            let (shard_name, tar_path, is_remote, token, mut metadata) = {
+                let mut dataset = self.dataset.lock().unwrap();
+                ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+                let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+                    WebshartError::InvalidShardFormat(format!(
+                        "Shard index {} out of range",
+                        shard_idx
+                    ))
+                })?;
+                let metadata = shard.metadata.clone().ok_or_else(|| {
+                    WebshartError::MetadataNotFound("Metadata not loaded".to_string())
+                })?;
+                (
+                    shard.name.clone(),
+                    shard.tar_path.clone(),
+                    dataset.is_remote,
+                    dataset.get_hf_token(),
+                    metadata,
+                )
+            };
+
+            for sample_idx in 0..metadata.num_samples() {
+                let Some((_filename, file_info)) = metadata.get_sample_by_index(sample_idx) else {
+                    continue;
+                };
+                let had_caption = file_info.captions.is_some();
+                let txt_sidecar = metadata
+                    .get_txt_sidecar_by_sample_index(sample_idx)
+                    .map(|(_, file_info)| file_info);
+                if let Some(captions) = self.load_caption_value(
+                    &tar_path,
+                    &file_info,
+                    txt_sidecar.as_ref(),
+                    None,
+                    is_remote,
+                    token.clone(),
+                )? {
+                    captioned_samples += 1;
+                    coalesced_samples += usize::from(!had_caption);
+                    metadata.set_sample_captions(sample_idx, captions);
+                }
+            }
+
+            let output_path = Self::metadata_output_path(&destination, &shard_name)?;
+            if persist_to_cache {
+                self.dataset
+                    .lock()
+                    .unwrap()
+                    .replace_shard_metadata(shard_idx, metadata, true)?;
+            } else {
+                Self::write_metadata_file(&output_path, &metadata)?;
+                self.dataset
+                    .lock()
+                    .unwrap()
+                    .replace_shard_metadata(shard_idx, metadata, false)?;
+            }
+            output_paths.push(output_path.to_string_lossy().to_string());
+        }
+
+        let result = PyDict::new(py);
+        result.set_item("shards", output_paths.len())?;
+        result.set_item("captioned_samples", captioned_samples)?;
+        result.set_item("coalesced_samples", coalesced_samples)?;
+        result.set_item("files", output_paths)?;
+        Ok(result.into_any().unbind())
     }
 
     fn load_sample_json(
@@ -1160,6 +1313,80 @@ impl PyTarDataLoader {
 }
 
 impl PyTarDataLoader {
+    fn metadata_output_path(destination: &Path, shard_name: &str) -> Result<PathBuf> {
+        let relative = Path::new(shard_name);
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(WebshartError::InvalidShardFormat(format!(
+                "Unsafe shard name for metadata export: {shard_name}"
+            )));
+        }
+        Ok(destination.join(relative).with_extension("json"))
+    }
+
+    fn write_metadata_file(path: &Path, metadata: &ShardMetadata) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(&temp_path, serde_json::to_vec_pretty(metadata)?)?;
+        fs::rename(temp_path, path)?;
+        Ok(())
+    }
+
+    fn caption_from_txt_bytes(data: Vec<u8>) -> PyResult<Option<CaptionValue>> {
+        let caption = String::from_utf8(data).map_err(|error| {
+            WebshartError::InvalidShardFormat(format!(
+                "Caption sidecar is not valid UTF-8: {error}"
+            ))
+        })?;
+        let caption = caption.trim();
+        if caption.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CaptionValue::Single(caption.to_string())))
+        }
+    }
+
+    fn load_caption_value(
+        &self,
+        tar_path: &str,
+        file_info: &FileInfo,
+        txt_sidecar: Option<&FileInfo>,
+        json_data: Option<&[u8]>,
+        is_remote: bool,
+        token: Option<String>,
+    ) -> PyResult<Option<CaptionValue>> {
+        if let Some(captions) = &file_info.captions {
+            return Ok(Some(captions.clone()));
+        }
+
+        if let Some(txt_info) = txt_sidecar {
+            if txt_info.length > self.config.max_file_size {
+                return Ok(None);
+            }
+            let data = self.load_single_file_data(tar_path, txt_info, is_remote, token)?;
+            return Self::caption_from_txt_bytes(data);
+        }
+
+        let owned_json_data;
+        let json_data = if let Some(data) = json_data {
+            Some(data)
+        } else {
+            owned_json_data =
+                self.load_json_sidecar_bytes(tar_path, file_info, is_remote, token)?;
+            owned_json_data.as_deref()
+        };
+
+        Ok(json_data
+            .and_then(|data| serde_json::from_slice(data).ok())
+            .as_ref()
+            .and_then(ShardMetadata::extract_caption_value))
+    }
+
     pub(crate) fn load_file_by_info(
         &self,
         shard_idx: usize,
