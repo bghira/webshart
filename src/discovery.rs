@@ -57,6 +57,34 @@ impl DiscoveredDataset {
         self.discovery_token.clone()
     }
 
+    pub(crate) fn metadata_cache_dir(&self) -> Option<PathBuf> {
+        self.cache_dir.clone()
+    }
+
+    pub(crate) fn replace_shard_metadata(
+        &mut self,
+        shard_index: usize,
+        metadata: ShardMetadata,
+        persist_to_cache: bool,
+    ) -> Result<()> {
+        let shard_name = self
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| {
+                WebshartError::InvalidShardFormat(format!(
+                    "Shard index {} out of range",
+                    shard_index
+                ))
+            })?
+            .name
+            .clone();
+        if persist_to_cache {
+            self.save_metadata_to_cache(&shard_name, &metadata)?;
+        }
+        self.shards[shard_index].metadata = Some(metadata);
+        Ok(())
+    }
+
     pub async fn enable_shard_cache(
         &mut self,
         location: PathBuf,
@@ -184,6 +212,9 @@ impl DiscoveredDataset {
     /// Save metadata to cache
     fn save_metadata_to_cache(&self, shard_name: &str, metadata: &ShardMetadata) -> Result<()> {
         if let Some(cache_path) = self.get_cached_metadata_path(shard_name) {
+            if let Some(parent) = cache_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             let json = serde_json::to_string_pretty(metadata)?;
             fs::write(&cache_path, json)?;
             println!("[webshart] Cached metadata for {}", shard_name);
@@ -259,7 +290,7 @@ impl DiscoveredDataset {
 
         // Use block_in_place to avoid blocking the async runtime
         let result = tokio::task::block_in_place(|| {
-            if self.is_remote {
+            if json_path.starts_with("http") {
                 self.runtime
                     .block_on(discovery.load_remote_metadata(&json_path))
             } else {
@@ -613,12 +644,22 @@ impl DatasetDiscovery {
     /// Set HuggingFace token
     pub fn with_hf_token(mut self, token: String) -> Self {
         self.hf_token = Some(token);
+        self.metadata_resolver = MetadataResolver::new(
+            self.metadata_resolver.get_source(),
+            self.hf_token.clone(),
+            self.runtime.clone(),
+        );
         self
     }
 
     /// Set optional token
     pub fn with_optional_token(mut self, token: Option<String>) -> Self {
         self.hf_token = token;
+        self.metadata_resolver = MetadataResolver::new(
+            self.metadata_resolver.get_source(),
+            self.hf_token.clone(),
+            self.runtime.clone(),
+        );
         self
     }
 
@@ -637,28 +678,57 @@ impl DatasetDiscovery {
         self
     }
 
+    fn collect_local_tar_paths(&self, directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                self.collect_local_tar_paths(&entry.path(), paths)?;
+            } else if file_type.is_file()
+                && self
+                    .shard_pattern
+                    .is_match(&entry.file_name().to_string_lossy())
+            {
+                paths.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+
     /// Discover shards in a local directory
     pub fn discover_local(&self, path: &Path) -> Result<DiscoveredDataset> {
         let mut shards = Vec::new();
+        let mut tar_paths = Vec::new();
+        self.collect_local_tar_paths(path, &mut tar_paths)?;
+        tar_paths.sort();
 
-        // Find all tar files
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let file_name = entry.file_name().to_string_lossy().to_string();
+        for tar_path_buf in tar_paths {
+            let file_name = tar_path_buf
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
 
             if let Some(captures) = self.shard_pattern.captures(&file_name) {
-                let base_name = captures.get(1).unwrap().as_str();
-                let tar_path = entry.path().to_string_lossy().to_string();
+                let leaf_name = captures.get(1).unwrap().as_str();
+                let relative_parent = tar_path_buf
+                    .parent()
+                    .and_then(|parent| parent.strip_prefix(path).ok())
+                    .filter(|parent| !parent.as_os_str().is_empty());
+                let relative_name = relative_parent
+                    .map(|parent| parent.join(leaf_name))
+                    .unwrap_or_else(|| PathBuf::from(leaf_name));
+                let relative_name = relative_name.to_string_lossy().replace('\\', "/");
+                let tar_path = tar_path_buf.to_string_lossy().to_string();
 
                 // Use resolver to find metadata path
-                let json_path = self
-                    .metadata_resolver
-                    .resolve_metadata_path(&tar_path, base_name, false);
+                let json_path =
+                    self.metadata_resolver
+                        .resolve_metadata_path(&tar_path, &relative_name, false);
 
                 // Check if metadata exists
                 if self.metadata_resolver.metadata_exists(&json_path, false) {
                     shards.push(ShardPair {
-                        name: base_name.to_string(),
+                        name: relative_name,
                         tar_path,
                         json_path,
                         metadata: None,
@@ -1349,6 +1419,67 @@ impl PyDiscoveredDataset {
         })
     }
 
+    /// Inspect shard indexes to determine how captions are represented.
+    #[pyo3(signature = (max_shards=None))]
+    fn probe_caption_layout(
+        &mut self,
+        py: Python,
+        max_shards: Option<usize>,
+    ) -> PyResult<Py<PyDict>> {
+        if max_shards == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_shards must be greater than zero",
+            ));
+        }
+
+        let total_shards = self.inner.num_shards();
+        let shards_scanned = max_shards.unwrap_or(total_shards).min(total_shards);
+        let mut samples = 0;
+        let mut captioned_samples = 0;
+        let mut embedded_samples = 0;
+        let mut json_sidecar_samples = 0;
+        let mut txt_sidecar_samples = 0;
+
+        for shard_index in 0..shards_scanned {
+            self.inner.ensure_shard_metadata(shard_index)?;
+            if let Some(metadata) = self.inner.shards[shard_index].metadata.as_ref() {
+                let counts = metadata.caption_layout_counts();
+                samples += counts.samples;
+                captioned_samples += counts.captioned_samples;
+                embedded_samples += counts.embedded_samples;
+                json_sidecar_samples += counts.json_sidecar_samples;
+                txt_sidecar_samples += counts.txt_sidecar_samples;
+            }
+        }
+
+        let source_count = usize::from(embedded_samples > 0)
+            + usize::from(json_sidecar_samples > 0)
+            + usize::from(txt_sidecar_samples > 0);
+        let layout = match source_count {
+            0 => "none",
+            1 if embedded_samples > 0 => "embedded",
+            1 if json_sidecar_samples > 0 => "json_sidecar",
+            1 => "txt_sidecar",
+            _ => "mixed",
+        };
+
+        let result = PyDict::new(py);
+        result.set_item("layout", layout)?;
+        result.set_item("shards_scanned", shards_scanned)?;
+        result.set_item("total_shards", total_shards)?;
+        result.set_item("complete", shards_scanned == total_shards)?;
+        result.set_item("samples", samples)?;
+        result.set_item("captioned_samples", captioned_samples)?;
+        result.set_item(
+            "uncaptioned_samples",
+            samples.saturating_sub(captioned_samples),
+        )?;
+        result.set_item("embedded_samples", embedded_samples)?;
+        result.set_item("json_sidecar_samples", json_sidecar_samples)?;
+        result.set_item("txt_sidecar_samples", txt_sidecar_samples)?;
+        Ok(result.unbind())
+    }
+
     fn find_file_location(&mut self, file_index: usize) -> PyResult<(usize, usize)> {
         match self.inner.find_shard_for_file(file_index)? {
             Some(location) => Ok(location),
@@ -1713,5 +1844,33 @@ impl PyShardReader {
             self.inner.num_files(),
             self.inner.num_samples()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatasetDiscovery;
+
+    #[test]
+    fn hub_token_propagates_to_metadata_resolver_in_either_builder_order() {
+        let token_then_source = DatasetDiscovery::new()
+            .with_optional_token(Some("token-one".to_string()))
+            .with_metadata_source(Some("owner/index".to_string()));
+        assert_eq!(
+            token_then_source.metadata_resolver.get_hf_token(),
+            Some("token-one")
+        );
+
+        let source_then_token = DatasetDiscovery::new()
+            .with_metadata_source(Some("owner/index".to_string()))
+            .with_optional_token(Some("token-two".to_string()));
+        assert_eq!(
+            source_then_token.metadata_resolver.get_hf_token(),
+            Some("token-two")
+        );
+        assert_eq!(
+            source_then_token.metadata_resolver.get_source().as_deref(),
+            Some("owner/index")
+        );
     }
 }

@@ -1,8 +1,10 @@
 """Tests for metadata handling in webshart."""
 
 import json
+import sys
 import tempfile
 import tarfile
+import types
 import pytest
 from pathlib import Path
 from io import BytesIO
@@ -308,6 +310,151 @@ def test_paired_json_sidecar_metadata_and_retrieval():
         assert entry.metadata["captions"] == ["a small test image", "alternate view"]
         assert entry.metadata["json_path"] == "sample.json"
         assert json.loads(bytes(entry.json_data)) == sample_json
+
+
+def test_txt_caption_probe_retrieval_and_metadata_export():
+    """Test `.txt` sidecars are logical captions rather than separate samples."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        tar_path = root / "data-0000.tar"
+        image_bytes = b"not really an image"
+        caption = "A caption from a text sidecar."
+
+        with tarfile.open(tar_path, "w") as tar:
+            image_info = tarfile.TarInfo("nested/sample.webp")
+            image_info.size = len(image_bytes)
+            tar.addfile(image_info, BytesIO(image_bytes))
+
+            caption_bytes = f"  {caption}\n".encode()
+            caption_info = tarfile.TarInfo("nested/sample.txt")
+            caption_info.size = len(caption_bytes)
+            tar.addfile(caption_info, BytesIO(caption_bytes))
+
+        webshart.MetadataExtractor().extract_metadata(
+            source=tmpdir,
+            destination=tmpdir,
+            max_workers=1,
+        )
+
+        dataset = webshart.discover_dataset(tmpdir)
+        assert dataset.list_files_in_shard(0) == [
+            "nested/sample.txt",
+            "nested/sample.webp",
+        ]
+        assert dataset.list_samples_in_shard(0) == ["nested/sample.webp"]
+        assert dataset.probe_caption_layout() == {
+            "layout": "txt_sidecar",
+            "shards_scanned": 1,
+            "total_shards": 1,
+            "complete": True,
+            "samples": 1,
+            "captioned_samples": 1,
+            "uncaptioned_samples": 0,
+            "embedded_samples": 0,
+            "json_sidecar_samples": 0,
+            "txt_sidecar_samples": 1,
+        }
+
+        loader = webshart.TarDataLoader(dataset, load_file_data=False)
+        assert loader.load_caption(0, 0) == caption
+        entry = loader.load_sample(0, 0)
+        assert entry.path == "nested/sample.webp"
+        assert entry.caption == caption
+        assert entry.captions == caption
+
+        export_dir = root / "caption-metadata"
+        result = loader.coalesce_caption_metadata(str(export_dir))
+        assert result["shards"] == 1
+        assert result["captioned_samples"] == 1
+        assert result["coalesced_samples"] == 1
+        assert result["files"] == [str(export_dir / "data-0000.json")]
+        exported = json.loads((export_dir / "data-0000.json").read_text())
+        assert exported["files"]["nested/sample.webp"]["captions"] == caption
+        assert "captions" not in exported["files"]["nested/sample.txt"]
+
+
+def test_caption_coalescing_can_persist_to_metadata_cache():
+    """Test an enabled metadata cache is the default coalescing destination."""
+    with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as cache:
+        tar_path = Path(tmpdir) / "data-0000.tar"
+        with tarfile.open(tar_path, "w") as tar:
+            for filename, data in [
+                ("sample.webp", b"image"),
+                ("sample.txt", b"cached caption"),
+            ]:
+                info = tarfile.TarInfo(filename)
+                info.size = len(data)
+                tar.addfile(info, BytesIO(data))
+
+        webshart.MetadataExtractor().extract_metadata(tmpdir, tmpdir, max_workers=1)
+        dataset = webshart.discover_dataset(tmpdir)
+        dataset.enable_metadata_cache(cache, init_shard_count=0)
+        loader = webshart.TarDataLoader(dataset, load_file_data=False)
+
+        result = loader.coalesce_caption_metadata()
+
+        assert result["coalesced_samples"] == 1
+        cached_path = Path(result["files"][0])
+        assert cached_path.is_file()
+        cached = json.loads(cached_path.read_text())
+        assert cached["files"]["sample.webp"]["captions"] == "cached caption"
+
+
+def test_txt_payload_with_json_sidecar_remains_a_logical_sample():
+    """A `.txt` member is only a caption sidecar when another payload shares its stem."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tar_path = Path(tmpdir) / "data-0000.tar"
+        with tarfile.open(tar_path, "w") as tar:
+            for filename, data in [
+                ("document.txt", b"document body"),
+                ("document.json", b'{"caption": "document caption"}'),
+            ]:
+                info = tarfile.TarInfo(filename)
+                info.size = len(data)
+                tar.addfile(info, BytesIO(data))
+
+        webshart.MetadataExtractor().extract_metadata(tmpdir, tmpdir, max_workers=1)
+        dataset = webshart.discover_dataset(tmpdir)
+
+        assert dataset.list_samples_in_shard(0) == ["document.txt"]
+        assert dataset.probe_caption_layout()["layout"] == "json_sidecar"
+        entry = webshart.TarDataLoader(dataset).load_sample(0, 0)
+        assert entry.path == "document.txt"
+        assert entry.caption == "document caption"
+
+
+def test_upload_caption_metadata_uses_dataset_repo(monkeypatch, tmp_path):
+    """The optional uploader keeps publication separate from cache generation."""
+    calls = []
+
+    class FakeApi:
+        def __init__(self, token):
+            calls.append(("token", token))
+
+        def upload_folder(self, **kwargs):
+            calls.append(("upload", kwargs))
+            return "commit-info"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=FakeApi),
+    )
+
+    result = webshart.upload_caption_metadata(
+        tmp_path,
+        "owner/metadata",
+        path_in_repo="indexes",
+        revision="captions",
+        hf_token="secret-token",
+    )
+
+    assert result == "commit-info"
+    assert calls[0] == ("token", "secret-token")
+    assert calls[1][1]["repo_id"] == "owner/metadata"
+    assert calls[1][1]["repo_type"] == "dataset"
+    assert calls[1][1]["path_in_repo"] == "indexes"
+    assert calls[1][1]["revision"] == "captions"
 
 
 def test_write_captions_to_metadata_uses_plural_key():

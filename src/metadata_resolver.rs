@@ -18,6 +18,14 @@ pub struct MetadataResolver {
 }
 
 impl MetadataResolver {
+    fn source_is_hub_repo(source: &str) -> bool {
+        !source.starts_with("http")
+            && !Path::new(source).exists()
+            && !Path::new(source).is_absolute()
+            && !source.starts_with('.')
+            && source.split('/').filter(|part| !part.is_empty()).count() == 2
+    }
+
     pub fn new(
         metadata_source: Option<String>,
         hf_token: Option<String>,
@@ -42,40 +50,37 @@ impl MetadataResolver {
             // Extract subfolder path from tar_path
             let subfolder = self.extract_subfolder(tar_path, is_remote);
 
-            if is_remote {
-                // If metadata source is a HF repo
-                if !metadata_source.starts_with("http") && metadata_source.contains('/') {
-                    let base_url = format!(
-                        "https://huggingface.co/datasets/{}/resolve/main",
-                        metadata_source
-                    );
-                    if let Some(sub) = subfolder {
-                        format!("{}/{}/{}.json", base_url, sub, base_name)
-                    } else {
-                        format!("{}/{}.json", base_url, base_name)
-                    }
-                } else if metadata_source.starts_with("http") {
-                    let base_url = metadata_source.trim_end_matches('/');
+            if Self::source_is_hub_repo(metadata_source) {
+                let base_url = format!(
+                    "https://huggingface.co/datasets/{}/resolve/main",
+                    metadata_source
+                );
+                if is_remote {
                     if let Some(sub) = subfolder {
                         format!("{}/{}/{}.json", base_url, sub, base_name)
                     } else {
                         format!("{}/{}.json", base_url, base_name)
                     }
                 } else {
-                    // Local path for remote dataset metadata
-                    let mut path = Path::new(metadata_source).to_path_buf();
+                    format!("{}/{}.json", base_url, base_name)
+                }
+            } else if metadata_source.starts_with("http") {
+                let base_url = metadata_source.trim_end_matches('/');
+                if is_remote {
+                    if let Some(sub) = subfolder {
+                        format!("{}/{}/{}.json", base_url, sub, base_name)
+                    } else {
+                        format!("{}/{}.json", base_url, base_name)
+                    }
+                } else {
+                    format!("{}/{}.json", base_url, base_name)
+                }
+            } else {
+                let mut path = Path::new(metadata_source).to_path_buf();
+                if is_remote {
                     if let Some(sub) = subfolder {
                         path = path.join(sub);
                     }
-                    path.join(format!("{}.json", base_name))
-                        .to_string_lossy()
-                        .to_string()
-                }
-            } else {
-                // Local metadata path
-                let mut path = Path::new(metadata_source).to_path_buf();
-                if let Some(sub) = subfolder {
-                    path = path.join(sub);
                 }
                 path.join(format!("{}.json", base_name))
                     .to_string_lossy()
@@ -83,12 +88,27 @@ impl MetadataResolver {
             }
         } else {
             // Default: co-located with tar
-            tar_path.replace(".tar", ".json")
+            if is_remote {
+                tar_path
+                    .strip_suffix(".tar")
+                    .map(|path| format!("{path}.json"))
+                    .unwrap_or_else(|| format!("{tar_path}.json"))
+            } else {
+                Path::new(tar_path)
+                    .with_extension("json")
+                    .to_string_lossy()
+                    .to_string()
+            }
         }
     }
 
     pub fn get_source(&self) -> Option<String> {
         self.metadata_source.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_hf_token(&self) -> Option<&str> {
+        self.hf_token.as_deref()
     }
 
     /// Extract subfolder from tar path
@@ -115,9 +135,9 @@ impl MetadataResolver {
     pub async fn load_metadata(
         &self,
         metadata_path: &str,
-        is_remote: bool,
+        _is_remote: bool,
     ) -> Result<ShardMetadata> {
-        if is_remote && metadata_path.starts_with("http") {
+        if metadata_path.starts_with("http") {
             self.load_remote_metadata(metadata_path).await
         } else {
             self.load_local_metadata(metadata_path)
@@ -125,8 +145,8 @@ impl MetadataResolver {
     }
 
     /// Check if metadata exists at the resolved location
-    pub fn metadata_exists(&self, metadata_path: &str, is_remote: bool) -> bool {
-        if is_remote && metadata_path.starts_with("http") {
+    pub fn metadata_exists(&self, metadata_path: &str, _is_remote: bool) -> bool {
+        if metadata_path.starts_with("http") {
             self.runtime
                 .block_on(self.check_remote_metadata(metadata_path))
         } else {

@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Any, Dict, Mapping, MutableMapping
 import argparse
+import os
 import sys
 import json
 from .cache_wait import CacheWaitContext, iter_with_cache_wait, next_with_cache_wait
@@ -34,6 +35,7 @@ __all__ = [
     "next_with_cache_wait",
     "apply_captions_to_metadata",
     "write_captions_to_metadata",
+    "upload_caption_metadata",
 ]
 
 
@@ -149,6 +151,38 @@ def write_captions_to_metadata(
     return updated
 
 
+def upload_caption_metadata(
+    metadata_dir: Union[str, Path],
+    repo_id: str,
+    *,
+    path_in_repo: str = "",
+    revision: str = "main",
+    hf_token: Optional[str] = None,
+    commit_message: str = "Add coalesced webshart caption metadata",
+):
+    """Upload exported caption metadata to a Hugging Face dataset repository.
+
+    This is deliberately separate from coalescing: callers can inspect the
+    generated JSON before performing the external write.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise ImportError(
+            "Hub uploads require huggingface-hub; install webshart[hub]"
+        ) from exc
+
+    return HfApi(token=hf_token).upload_folder(
+        folder_path=str(metadata_dir),
+        repo_id=repo_id,
+        repo_type="dataset",
+        path_in_repo=path_in_repo,
+        revision=revision,
+        commit_message=commit_message,
+        allow_patterns=["*.json", "**/*.json"],
+    )
+
+
 def discover_dataset(
     source: str,
     hf_token: Optional[str] = None,
@@ -172,6 +206,7 @@ def discover_dataset(
     Returns:
         DiscoveredDataset object with all shards discovered
     """
+    hf_token = hf_token or os.environ.get("HF_TOKEN")
     discovery = DatasetDiscovery(hf_token=hf_token, metadata_source=metadata)
 
     # Check if it's a local path
@@ -184,7 +219,7 @@ def discover_dataset(
 
 def extract_metadata(args):
     """Extract metadata from unindexed webdataset shards."""
-    extractor = MetadataExtractor(hf_token=args.hf_token)
+    extractor = MetadataExtractor(hf_token=args.hf_token or os.environ.get("HF_TOKEN"))
 
     # Parse range if provided
     shard_range = None
@@ -227,6 +262,50 @@ def extract_metadata(args):
     except Exception as e:
         print(f"✗ Error extracting metadata: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def optimize_captions(args):
+    """Coalesce sidecar captions into exportable per-shard metadata."""
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+    dataset = discover_dataset(
+        args.source,
+        hf_token=hf_token,
+        subfolder=args.subfolder,
+        metadata=args.metadata,
+    )
+    if args.shard_cache_dir:
+        dataset.enable_shard_cache(
+            args.shard_cache_dir,
+            cache_limit_gb=args.shard_cache_gb,
+            parallel_downloads=args.parallel_downloads,
+        )
+
+    shard_indices = None
+    if args.range:
+        start, end = (int(part) for part in args.range.split(",", 1))
+        if start < 0 or end < start:
+            raise ValueError("range must be start,end with 0 <= start <= end")
+        shard_indices = list(range(start, min(end, dataset.num_shards)))
+
+    loader = TarDataLoader(dataset, load_file_data=False)
+    result = loader.coalesce_caption_metadata(
+        destination=args.destination,
+        shard_indices=shard_indices,
+    )
+    print(
+        f"Coalesced {result['coalesced_samples']} captions across "
+        f"{result['shards']} shards into {args.destination}"
+    )
+
+    if args.push_to_hub:
+        commit = upload_caption_metadata(
+            args.destination,
+            args.push_to_hub,
+            path_in_repo=args.path_in_repo,
+            revision=args.revision,
+            hf_token=hf_token,
+        )
+        print(f"Uploaded caption metadata: {commit}")
 
 
 def discover_datasets_batch(
@@ -426,10 +505,35 @@ def main():
         help="Include image geometry (width, height, aspect ratio) in metadata extraction",
     )
 
+    optimize_parser = subparsers.add_parser(
+        "optimize-captions",
+        help="Fold .txt/.json sidecar captions into webshart metadata indexes",
+    )
+    optimize_parser.add_argument("--source", required=True)
+    optimize_parser.add_argument("--destination", required=True)
+    optimize_parser.add_argument("--metadata", help="Separate local or Hub metadata source")
+    optimize_parser.add_argument("--subfolder")
+    optimize_parser.add_argument("--hf-token")
+    optimize_parser.add_argument("--range", help="Half-open shard range: start,end")
+    optimize_parser.add_argument("--shard-cache-dir")
+    optimize_parser.add_argument("--shard-cache-gb", type=float, default=25.0)
+    optimize_parser.add_argument("--parallel-downloads", type=int, default=4)
+    optimize_parser.add_argument(
+        "--push-to-hub", metavar="REPO_ID", help="Upload the export to a dataset repository"
+    )
+    optimize_parser.add_argument("--path-in-repo", default="")
+    optimize_parser.add_argument("--revision", default="main")
+
     args = parser.parse_args()
 
     if args.command == "extract-metadata":
         extract_metadata(args)
+    elif args.command == "optimize-captions":
+        try:
+            optimize_captions(args)
+        except Exception as exc:
+            print(f"✗ Error optimizing captions: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)

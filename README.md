@@ -123,15 +123,23 @@ If you're creating a new dataset, generate indices during creation:
 
 The JSON index should have the same name as the tar file (e.g., `shard_0000.tar` → `shard_0000.json`).
 
-### Image + JSON Sidecar Samples
+### Caption layouts and sidecars
 
-Webshart supports webdataset shards that store each sample as an image-like payload plus a paired JSON sidecar:
+Webshart recognizes both JSON metadata sidecars and plain-text caption sidecars:
 
 ```text
 sample_0001.webp
 sample_0001.json
 sample_0002.webp
-sample_0002.json
+sample_0002.txt
+```
+
+Paired `.json` and `.txt` members are excluded from logical sample indexes. You
+can inspect the layout from shard metadata without downloading tar members:
+
+```python
+layout = dataset.probe_caption_layout(max_shards=16)
+print(layout["layout"])  # embedded, json_sidecar, txt_sidecar, mixed, or none
 ```
 
 When metadata is extracted or loaded, sidecars are attached to their paired sample entries:
@@ -184,6 +192,9 @@ entry = loader.load_sample(0, 0)
 print(entry.path)
 print(entry.captions)
 print(entry.json_data)
+
+# Direct caption lookup also handles paired .txt sidecars.
+caption = loader.load_caption(0, 0)
 ```
 
 Captions are canonicalized to the plural `captions` metadata key. The value may be a single string, a list of strings, or absent.
@@ -199,6 +210,40 @@ webshart.write_captions_to_metadata(
 ```
 
 The writer updates existing webshart metadata JSON in place, removes old singular `caption` keys from updated samples, and leaves paired `.json` sidecar entries untouched.
+
+To avoid repeated `.txt` range reads, fold all sidecar captions into standard
+webshart metadata files. If metadata caching is enabled, omitting the destination
+persists the enriched indexes in webshart's cache:
+
+```python
+dataset.enable_metadata_cache("cache/metadata", init_shard_count=0)
+loader = webshart.TarDataLoader(dataset, load_file_data=False)
+loader.coalesce_caption_metadata()
+
+# Or create a portable export tree for copying or upload.
+loader.coalesce_caption_metadata("caption-metadata")
+webshart.upload_caption_metadata(
+    "caption-metadata",
+    "organization/dataset-metadata",
+    hf_token="hf_...",
+)
+```
+
+The CLI provides the same operation. `--shard-cache-dir` lets coalescing reuse
+full cached shards instead of issuing one range read per sidecar:
+
+```bash
+webshart optimize-captions \
+  --source organization/dataset \
+  --metadata organization/dataset-metadata \
+  --destination caption-metadata \
+  --shard-cache-dir cache/shards \
+  --push-to-hub organization/dataset-metadata
+```
+
+Hub reads accept `hf_token=` and also honor `HF_TOKEN`. This includes gated
+datasets and separately hosted metadata. Local discovery recursively pairs tar
+and JSON indexes, preserving their relative subdirectories.
 
 ### Aspect Bucketing Samples
 
