@@ -53,6 +53,33 @@ entry = loader.load_sample(0, 0)
 print(entry.path, entry.captions, entry.json_metadata)
 ```
 
+### Paired datasets
+
+Two datasets can remain independently loadable while also exposing an opt-in
+join by logical sample key. This works especially well for preference,
+reference, and slider-training data stored in two subfolders of one repository:
+
+```python
+paired = webshart.discover_paired_dataset(
+    "webshart/suno-various-94k",
+    left_subfolder="original",
+    right_subfolder="covers",
+)
+
+print(paired.num_pairs)
+print(paired.get_pair(0))
+
+loader = webshart.PairedTarDataLoader(paired)
+sample = loader.load_pair(0)
+print(sample.key, sample.left, sample.right)
+```
+
+The normal contract is unchanged: calling `discover_dataset(...,
+subfolder="original")` or `subfolder="covers"` returns a standalone dataset.
+Pair indexing is lazy, preserves left-dataset order, and validates identical key
+sets by default. Pass `strict=False` to use only the intersection and inspect
+`unmatched_left` / `unmatched_right`.
+
 `max_file_size` is a visibility limit for loader APIs. Files larger than the
 configured limit are omitted from iteration, batches, direct sample loading,
 and aspect buckets instead of being returned with empty data. Direct
