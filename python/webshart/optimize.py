@@ -1,4 +1,4 @@
-"""Rolling conversion of loose payload/sidecar pairs into indexed webshart shards."""
+"""Rolling conversion of loose or legacy tar datasets into webshart shards."""
 
 from __future__ import annotations
 
@@ -80,8 +80,11 @@ class OptimizationState:
     max_shard_size_bytes: int
     payload_extensions: list[str]
     total_samples: int
+    input_layout: str = "loose"
     next_sample_index: int = 0
     next_shard_index: int = 0
+    next_source_archive_index: int = 0
+    next_source_member_offset: int = 0
     captioned_samples: int = 0
     uncaptioned_samples: int = 0
     bytes_sharded: int = 0
@@ -165,7 +168,7 @@ def _list_hub_files(
     subfolder: str,
     revision: str,
     token: Optional[str],
-) -> list[SourceFile]:
+) -> tuple[list[SourceFile], str]:
     HfApi, _, _, _, _ = _require_hub()
     api = HfApi(token=token)
     info = api.dataset_info(
@@ -179,7 +182,7 @@ def _list_hub_files(
         relative = _relative_source_path(entry.rfilename, subfolder)
         if relative is not None:
             files.append(SourceFile(relative, -1))
-    return files
+    return files, info.sha
 
 
 def _build_samples(
@@ -230,6 +233,16 @@ def _manifest_sha256(samples: Sequence[LooseSample]) -> str:
     return digest.hexdigest()
 
 
+def _file_manifest_sha256(files: Sequence[SourceFile]) -> str:
+    digest = sha256()
+    for file in files:
+        digest.update(file.path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(file.size).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 @contextmanager
 def _open_source_file(
     file: SourceFile,
@@ -238,9 +251,12 @@ def _open_source_file(
     source_subfolder: str,
     source_revision: str,
     token: Optional[str],
+    offset: int = 0,
 ) -> Iterator[BinaryIO]:
     if file.local_path is not None:
         with file.local_path.open("rb") as handle:
+            if offset:
+                handle.seek(offset)
             yield handle
         return
 
@@ -257,8 +273,14 @@ def _open_source_file(
     headers = {"Accept-Encoding": "identity", "User-Agent": "webshart/optimize-dataset"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request) as response:
+        if offset and getattr(response, "status", None) != 206:
+            raise ValueError(
+                f"source server ignored the resume range for {file.path!r}"
+            )
         yield response
 
 
@@ -396,6 +418,129 @@ def _add_to_tar(
         archive.addfile(info, handle)
 
 
+def _normalized_tar_member_path(name: str) -> Optional[str]:
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"unsafe path in source tar: {name!r}")
+    parts = [part for part in path.parts if part not in {"", "."}]
+    return str(PurePosixPath(*parts)) if parts else None
+
+
+def _filename_caption(path: str) -> Optional[str]:
+    caption = PurePosixPath(path).stem.replace("_", " ").strip()
+    return caption or None
+
+
+def _write_legacy_tar_shard(
+    tar_path: Path,
+    archives: Sequence[SourceFile],
+    state: OptimizationState,
+    *,
+    payload_extensions: Sequence[str],
+    max_shard_size_bytes: int,
+    source_repo: Optional[str],
+    source_subfolder: str,
+    source_revision: str,
+    token: Optional[str],
+    progress: Any,
+) -> tuple[int, dict[str, CaptionValue]]:
+    """Stream legacy tar members into one deterministic output shard."""
+    captions: dict[str, CaptionValue] = {}
+    shard_size = 1024
+    shard_samples = 0
+    shard_full = False
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as output:
+        while state.next_source_archive_index < len(archives) and not shard_full:
+            source_archive = archives[state.next_source_archive_index]
+            source_archive_size = _source_file_size(
+                source_archive,
+                source_repo=source_repo,
+                source_subfolder=source_subfolder,
+                source_revision=source_revision,
+                token=token,
+            )
+            base_offset = state.next_source_member_offset
+            with _open_source_file(
+                source_archive,
+                source_repo=source_repo,
+                source_subfolder=source_subfolder,
+                source_revision=source_revision,
+                token=token,
+                offset=base_offset,
+            ) as source_handle:
+                with tarfile.open(fileobj=source_handle, mode="r|") as source_tar:
+                    for member in source_tar:
+                        member_offset = base_offset + member.offset
+                        next_offset = (
+                            base_offset
+                            + member.offset_data
+                            + ((member.size + 511) // 512) * 512
+                        )
+                        if next_offset > source_archive_size:
+                            progress.write(
+                                "Skipping truncated tail member "
+                                f"{member.name!r} in {source_archive.path!r}"
+                            )
+                            break
+                        member_path = _normalized_tar_member_path(member.name)
+                        if (
+                            not member.isfile()
+                            or member_path is None
+                            or PurePosixPath(member_path).suffix.lower()
+                            not in payload_extensions
+                        ):
+                            state.next_source_member_offset = next_offset
+                            continue
+
+                        member_size = _tar_member_size(member.size)
+                        if (
+                            shard_samples
+                            and shard_size + member_size > max_shard_size_bytes
+                        ):
+                            state.next_source_member_offset = member_offset
+                            shard_full = True
+                            break
+
+                        archive_prefix = str(
+                            PurePosixPath(source_archive.path).with_suffix("")
+                        )
+                        output_path = str(PurePosixPath(archive_prefix, member_path))
+                        info = tarfile.TarInfo(output_path)
+                        info.size = member.size
+                        info.mode = 0o644
+                        info.mtime = 0
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ""
+                        info.gname = ""
+                        payload = source_tar.extractfile(member)
+                        if payload is None:
+                            raise ValueError(
+                                f"unable to read {member.name!r} from {source_archive.path!r}"
+                            )
+                        output.addfile(info, payload)
+
+                        caption = _filename_caption(member_path)
+                        if caption is not None:
+                            captions[output_path] = caption
+                            state.captioned_samples += 1
+                        else:
+                            state.uncaptioned_samples += 1
+                        state.next_sample_index += 1
+                        state.bytes_sharded += member.size
+                        state.next_source_member_offset = next_offset
+                        shard_size += member_size
+                        shard_samples += 1
+                        progress.update(1)
+
+            if not shard_full:
+                state.next_source_archive_index += 1
+                state.next_source_member_offset = 0
+
+    return shard_samples, captions
+
+
 def _apply_sidecar_metadata(
     metadata_path: Path,
     captions: dict[str, CaptionValue],
@@ -441,10 +586,10 @@ def _load_hub_state(
     token: Optional[str],
 ) -> Optional[OptimizationState]:
     _, _, hf_hub_download, _, _ = _require_hub()
-    if not api.file_exists(
+    if not _hub_file_exists(
+        api,
         repo_id,
         state_repo_path,
-        repo_type="dataset",
         revision=revision,
         token=token,
     ):
@@ -459,6 +604,29 @@ def _load_hub_state(
     return _load_local_state(Path(state_path))
 
 
+def _hub_file_exists(
+    api: Any,
+    repo_id: str,
+    path: str,
+    *,
+    revision: str,
+    token: Optional[str],
+) -> bool:
+    try:
+        return api.file_exists(
+            repo_id,
+            path,
+            repo_type="dataset",
+            revision=revision,
+            token=token,
+        )
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) == 404:
+            return False
+        raise
+
+
 def _validate_resume_state(
     state: OptimizationState,
     expected: OptimizationState,
@@ -471,6 +639,7 @@ def _validate_resume_state(
         "max_shard_size_bytes",
         "payload_extensions",
         "total_samples",
+        "input_layout",
     )
     changed = [
         field
@@ -484,7 +653,9 @@ def _validate_resume_state(
         )
     if state.status not in {"running", "complete"}:
         raise ValueError(f"invalid optimization state status: {state.status!r}")
-    if not 0 <= state.next_sample_index <= state.total_samples:
+    if state.next_sample_index < 0 or (
+        state.input_layout == "loose" and state.next_sample_index > state.total_samples
+    ):
         raise ValueError("optimization state sample position is out of range")
     if state.next_shard_index < 0 or state.bytes_sharded < 0:
         raise ValueError("optimization state contains negative counters")
@@ -492,6 +663,8 @@ def _validate_resume_state(
         raise ValueError(
             "optimization state caption counters do not match its position"
         )
+    if state.next_source_archive_index < 0 or state.next_source_member_offset < 0:
+        raise ValueError("optimization state source position is out of range")
 
 
 def optimize_dataset(
@@ -510,7 +683,7 @@ def optimize_dataset(
     max_shards: Optional[int] = None,
     private: Optional[bool] = None,
 ) -> dict[str, Any]:
-    """Convert loose payload/sidecar pairs into rolling, resumable webshart shards.
+    """Convert loose files or legacy tar archives into resumable webshart shards.
 
     When ``push_to_hub`` is set, each completed tar/index pair and the resume
     state are committed atomically to that dataset repository. Without a local
@@ -535,7 +708,7 @@ def optimize_dataset(
         files = _list_local_files(source_path, source_subfolder)
         source_identity = {"kind": "local", "subfolder": source_subfolder}
     else:
-        files = _list_hub_files(
+        files, source_sha = _list_hub_files(
             source_repo,
             source_subfolder,
             source_revision,
@@ -545,20 +718,19 @@ def optimize_dataset(
             "kind": "hub",
             "repo_id": source_repo,
             "revision": source_revision,
+            "snapshot_sha": source_sha,
             "subfolder": source_subfolder,
         }
 
     samples = _build_samples(files, extensions)
-    if not samples:
-        tar_count = sum(
-            PurePosixPath(file.path).suffix.lower() == ".tar" for file in files
-        )
-        if tar_count:
-            raise ValueError(
-                "source already contains tar shards; use optimize-captions instead"
-            )
+    source_archives = sorted(
+        (file for file in files if PurePosixPath(file.path).suffix.lower() == ".tar"),
+        key=lambda file: file.path,
+    )
+    input_layout = "loose" if samples else "legacy_tar" if source_archives else None
+    if input_layout is None:
         raise ValueError(
-            "no loose payload files matched the configured extensions: "
+            "no loose payload files or legacy tar archives matched: "
             + ", ".join(extensions)
         )
 
@@ -566,11 +738,16 @@ def optimize_dataset(
         schema_version=STATE_SCHEMA_VERSION,
         status="running",
         source=source_identity,
-        manifest_sha256=_manifest_sha256(samples),
+        manifest_sha256=(
+            _manifest_sha256(samples)
+            if input_layout == "loose"
+            else _file_manifest_sha256(source_archives)
+        ),
         output_prefix=output_prefix,
         max_shard_size_bytes=max_shard_size_bytes,
         payload_extensions=list(extensions),
-        total_samples=len(samples),
+        total_samples=len(samples) if input_layout == "loose" else 0,
+        input_layout=input_layout,
     )
 
     destination_path = (
@@ -602,17 +779,17 @@ def optimize_dataset(
             token,
         )
         if state is None and (
-            api.file_exists(
+            _hub_file_exists(
+                api,
                 push_to_hub,
                 _repo_path(output_prefix, "shard-00000.tar"),
-                repo_type="dataset",
                 revision=target_revision,
                 token=token,
             )
-            or api.file_exists(
+            or _hub_file_exists(
+                api,
                 push_to_hub,
                 _repo_path(output_prefix, "shard-00000.json"),
-                repo_type="dataset",
                 revision=target_revision,
                 token=token,
             )
@@ -650,14 +827,19 @@ def optimize_dataset(
         staging = Path(temporary)
         extractor = MetadataExtractor(hf_token=token)
         progress = tqdm(
-            total=len(samples),
+            total=len(samples) if input_layout == "loose" else None,
             initial=state.next_sample_index,
             unit="sample",
             desc="Optimizing dataset",
         )
 
         try:
-            while state.next_sample_index < len(samples):
+            conversion_complete = (
+                state.next_sample_index >= len(samples)
+                if input_layout == "loose"
+                else state.next_source_archive_index >= len(source_archives)
+            )
+            while not conversion_complete:
                 if max_shards is not None and shards_created >= max_shards:
                     break
 
@@ -671,53 +853,67 @@ def optimize_dataset(
                 shard_samples = 0
                 start_index = state.next_sample_index
 
-                with tarfile.open(
-                    tar_path, mode="w", format=tarfile.PAX_FORMAT
-                ) as archive:
-                    while state.next_sample_index < len(samples):
-                        sample = samples[state.next_sample_index]
-                        payload_size = _source_file_size(
-                            sample.payload,
-                            source_repo=source_repo,
-                            source_subfolder=source_subfolder,
-                            source_revision=source_revision,
-                            token=token,
-                        )
-                        member_size = _tar_member_size(payload_size)
-                        if (
-                            shard_samples
-                            and shard_size + member_size > max_shard_size_bytes
-                        ):
-                            break
+                if input_layout == "legacy_tar":
+                    shard_samples, captions = _write_legacy_tar_shard(
+                        tar_path,
+                        source_archives,
+                        state,
+                        payload_extensions=extensions,
+                        max_shard_size_bytes=max_shard_size_bytes,
+                        source_repo=source_repo,
+                        source_subfolder=source_subfolder,
+                        source_revision=source_revision,
+                        token=token,
+                        progress=progress,
+                    )
+                else:
+                    with tarfile.open(
+                        tar_path, mode="w", format=tarfile.PAX_FORMAT
+                    ) as archive:
+                        while state.next_sample_index < len(samples):
+                            sample = samples[state.next_sample_index]
+                            payload_size = _source_file_size(
+                                sample.payload,
+                                source_repo=source_repo,
+                                source_subfolder=source_subfolder,
+                                source_revision=source_revision,
+                                token=token,
+                            )
+                            member_size = _tar_member_size(payload_size)
+                            if (
+                                shard_samples
+                                and shard_size + member_size > max_shard_size_bytes
+                            ):
+                                break
 
-                        caption, sidecar_json = _metadata_from_sidecar(
-                            sample.sidecar,
-                            source_repo=source_repo,
-                            source_subfolder=source_subfolder,
-                            source_revision=source_revision,
-                            token=token,
-                        )
-                        _add_to_tar(
-                            archive,
-                            sample,
-                            payload_size,
-                            source_repo=source_repo,
-                            source_subfolder=source_subfolder,
-                            source_revision=source_revision,
-                            token=token,
-                        )
-                        if caption is not None:
-                            captions[sample.path] = caption
-                            state.captioned_samples += 1
-                        else:
-                            state.uncaptioned_samples += 1
-                        if sidecar_json is not None:
-                            json_metadata[sample.path] = sidecar_json
-                        state.next_sample_index += 1
-                        state.bytes_sharded += payload_size
-                        shard_samples += 1
-                        shard_size += member_size
-                        progress.update(1)
+                            caption, sidecar_json = _metadata_from_sidecar(
+                                sample.sidecar,
+                                source_repo=source_repo,
+                                source_subfolder=source_subfolder,
+                                source_revision=source_revision,
+                                token=token,
+                            )
+                            _add_to_tar(
+                                archive,
+                                sample,
+                                payload_size,
+                                source_repo=source_repo,
+                                source_subfolder=source_subfolder,
+                                source_revision=source_revision,
+                                token=token,
+                            )
+                            if caption is not None:
+                                captions[sample.path] = caption
+                                state.captioned_samples += 1
+                            else:
+                                state.uncaptioned_samples += 1
+                            if sidecar_json is not None:
+                                json_metadata[sample.path] = sidecar_json
+                            state.next_sample_index += 1
+                            state.bytes_sharded += payload_size
+                            shard_samples += 1
+                            shard_size += member_size
+                            progress.update(1)
 
                 if shard_samples == 0:
                     raise RuntimeError(
@@ -732,9 +928,12 @@ def optimize_dataset(
                 )
                 _apply_sidecar_metadata(metadata_path, captions, json_metadata)
                 state.next_shard_index += 1
-                state.status = (
-                    "complete" if state.next_sample_index == len(samples) else "running"
+                conversion_complete = (
+                    state.next_sample_index >= len(samples)
+                    if input_layout == "loose"
+                    else state.next_source_archive_index >= len(source_archives)
                 )
+                state.status = "complete" if conversion_complete else "running"
                 _write_state(state_path, state)
 
                 tar_repo_path = _repo_path(output_prefix, tar_path.name)

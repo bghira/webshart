@@ -520,7 +520,7 @@ def optimize_captions(args):
 
 
 def run_optimize_dataset(args):
-    """Run rolling loose-file conversion from the CLI."""
+    """Run rolling dataset conversion from the CLI."""
     extensions = (
         tuple(part.strip() for part in args.payload_extensions.split(","))
         if args.payload_extensions
@@ -541,8 +541,9 @@ def run_optimize_dataset(args):
         max_shards=args.max_shards,
         private=True if args.private else None,
     )
+    total_samples = result["total_samples"] or "?"
     print(
-        f"Optimized {result['next_sample_index']}/{result['total_samples']} samples "
+        f"Optimized {result['next_sample_index']}/{total_samples} samples "
         f"into {result['next_shard_index']} shards "
         f"(created {result['shards_created']} this run; status={result['status']})"
     )
@@ -770,7 +771,10 @@ def main():
 
     dataset_parser = subparsers.add_parser(
         "optimize-dataset",
-        help="Stream loose payload/sidecar pairs into resumable webshart shards",
+        help=(
+            "Repackage loose pairs or legacy tar datasets into resumable "
+            "webshart shards"
+        ),
     )
     dataset_parser.add_argument("--source", required=True)
     dataset_parser.add_argument(

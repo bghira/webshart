@@ -269,8 +269,9 @@ webshart optimize-captions \
 ```
 
 `optimize-captions` expects existing `.tar` shards and webshart indexes. To
-convert a repository of loose media plus `.txt`/`.json` sidecars, use the
-rolling `optimize-dataset` command instead:
+fully repackage a repository of loose media plus `.txt`/`.json` sidecars, or a
+legacy SimpleTuner layout containing unindexed `.tar` archives whose member
+filenames are captions, use the rolling `optimize-dataset` command instead:
 
 ```bash
 webshart optimize-dataset \
@@ -282,14 +283,19 @@ webshart optimize-dataset \
 
 The target is always a Hugging Face **dataset** repository. It may be the same
 repository as the source because generated files live under `--output-prefix`.
-The converter streams one payload at a time and retains only the current shard
-locally when `--destination` is omitted.
+The input layout is detected automatically. Loose sidecars are coalesced into
+metadata. Legacy tar members are repacked into bounded shards and their
+filename stems become captions, matching SimpleTuner's filename strategy
+(underscores become spaces). Remote legacy inputs use aligned HTTP ranges from
+the saved member offset and retain only the current output shard locally.
 
 After each shard is indexed, its sidecar captions are embedded in the JSON
 index and the tar, index, and `.webshart-optimize-state.json` are uploaded in a
 single commit. The state records relative positions and conversion settings,
-never local absolute paths. Rerunning the same command resumes after the last
-committed shard. Use `--max-shards N` to bound each worker invocation.
+never local absolute paths. For legacy tars this includes the source archive
+index and tar-block member offset, so a rerun resumes within an archive after
+the last committed output shard. Use `--max-shards N` to bound each worker
+invocation.
 
 For a local-only conversion, replace `--push-to-hub` with a local destination:
 
