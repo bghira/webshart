@@ -268,6 +268,49 @@ webshart optimize-captions \
   --push-to-hub organization/dataset-metadata
 ```
 
+`optimize-captions` expects existing `.tar` shards and webshart indexes. To
+fully repackage a repository of loose media plus `.txt`/`.json` sidecars, or a
+legacy SimpleTuner layout containing unindexed `.tar` archives whose member
+filenames are captions, use the rolling `optimize-dataset` command instead:
+
+```bash
+webshart optimize-dataset \
+  --source stablellama/Qwen-Image-2512_samples \
+  --push-to-hub stablellama/Qwen-Image-2512_samples \
+  --output-prefix webshart \
+  --max-shard-size-gb 1
+```
+
+The target is always a Hugging Face **dataset** repository. It may be the same
+repository as the source because generated files live under `--output-prefix`.
+The input layout is detected automatically. Loose sidecars are coalesced into
+metadata. Legacy tar members are repacked into bounded shards and their
+filename stems become captions, matching SimpleTuner's filename strategy
+(underscores become spaces). Remote legacy inputs use aligned HTTP ranges from
+the saved member offset and retain only the current output shard locally.
+
+After each shard is indexed, its sidecar captions are embedded in the JSON
+index and the tar, index, and `.webshart-optimize-state.json` are uploaded in a
+single commit. The state records relative positions and conversion settings,
+never local absolute paths. For legacy tars this includes the source archive
+index and tar-block member offset, so a rerun resumes within an archive after
+the last committed output shard. Use `--max-shards N` to bound each worker
+invocation.
+
+For a local-only conversion, replace `--push-to-hub` with a local destination:
+
+```bash
+webshart optimize-dataset \
+  --source /datasets/loose-pairs \
+  --destination /datasets/indexed \
+  --max-shards 10
+```
+
+Plain-text sidecars are omitted from the tar after their captions are embedded.
+JSON sidecars are likewise coalesced: recognized caption fields become the
+canonical `captions` value and the complete object is retained as
+`json_metadata` in the index.
+
 Hub reads accept `hf_token=` and also honor `HF_TOKEN`. This includes gated
 datasets and separately hosted metadata. Local discovery recursively pairs tar
 and JSON indexes, preserving their relative subdirectories.

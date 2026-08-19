@@ -24,6 +24,8 @@ fn is_image_file(path: &str) -> bool {
         || path_lower.ends_with(".bmp")
         || path_lower.ends_with(".gif")
         || path_lower.ends_with(".ico")
+        || path_lower.ends_with(".jxl")
+        || path_lower.ends_with(".avif")
 }
 
 fn is_json_file(path: &str) -> bool {
@@ -1152,5 +1154,16 @@ impl PyMetadataExtractor {
                 shard_range,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_image_file;
+
+    #[test]
+    fn recognizes_modern_image_extensions_for_geometry() {
+        assert!(is_image_file("sample.jxl"));
+        assert!(is_image_file("sample.AVIF"));
     }
 }
