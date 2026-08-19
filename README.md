@@ -268,6 +268,43 @@ webshart optimize-captions \
   --push-to-hub organization/dataset-metadata
 ```
 
+`optimize-captions` expects existing `.tar` shards and webshart indexes. To
+convert a repository of loose media plus `.txt`/`.json` sidecars, use the
+rolling `optimize-dataset` command instead:
+
+```bash
+webshart optimize-dataset \
+  --source stablellama/Qwen-Image-2512_samples \
+  --push-to-hub stablellama/Qwen-Image-2512_samples \
+  --output-prefix webshart \
+  --max-shard-size-gb 1
+```
+
+The target is always a Hugging Face **dataset** repository. It may be the same
+repository as the source because generated files live under `--output-prefix`.
+The converter streams one payload at a time and retains only the current shard
+locally when `--destination` is omitted.
+
+After each shard is indexed, its sidecar captions are embedded in the JSON
+index and the tar, index, and `.webshart-optimize-state.json` are uploaded in a
+single commit. The state records relative positions and conversion settings,
+never local absolute paths. Rerunning the same command resumes after the last
+committed shard. Use `--max-shards N` to bound each worker invocation.
+
+For a local-only conversion, replace `--push-to-hub` with a local destination:
+
+```bash
+webshart optimize-dataset \
+  --source /datasets/loose-pairs \
+  --destination /datasets/indexed \
+  --max-shards 10
+```
+
+Plain-text sidecars are omitted from the tar after their captions are embedded.
+JSON sidecars are likewise coalesced: recognized caption fields become the
+canonical `captions` value and the complete object is retained as
+`json_metadata` in the index.
+
 Hub reads accept `hf_token=` and also honor `HF_TOKEN`. This includes gated
 datasets and separately hosted metadata. Local discovery recursively pairs tar
 and JSON indexes, preserving their relative subdirectories.

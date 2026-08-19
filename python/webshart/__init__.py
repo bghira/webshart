@@ -31,6 +31,7 @@ from webshart._webshart import (
     TarDataLoader,
     BucketDataLoader,
 )
+from .optimize import DEFAULT_PAYLOAD_EXTENSIONS, optimize_dataset
 
 __all__ = [
     "__version__",
@@ -55,6 +56,7 @@ __all__ = [
     "apply_captions_to_metadata",
     "write_captions_to_metadata",
     "upload_caption_metadata",
+    "optimize_dataset",
 ]
 
 
@@ -517,6 +519,35 @@ def optimize_captions(args):
         print(f"Uploaded caption metadata: {commit}")
 
 
+def run_optimize_dataset(args):
+    """Run rolling loose-file conversion from the CLI."""
+    extensions = (
+        tuple(part.strip() for part in args.payload_extensions.split(","))
+        if args.payload_extensions
+        else DEFAULT_PAYLOAD_EXTENSIONS
+    )
+    result = optimize_dataset(
+        args.source,
+        destination=args.destination,
+        push_to_hub=args.push_to_hub,
+        source_subfolder=args.source_subfolder,
+        output_prefix=args.output_prefix,
+        source_revision=args.source_revision,
+        target_revision=args.target_revision,
+        hf_token=args.hf_token,
+        max_shard_size_bytes=int(args.max_shard_size_gb * 1024**3),
+        payload_extensions=extensions,
+        include_image_geometry=not args.no_image_geometry,
+        max_shards=args.max_shards,
+        private=True if args.private else None,
+    )
+    print(
+        f"Optimized {result['next_sample_index']}/{result['total_samples']} samples "
+        f"into {result['next_shard_index']} shards "
+        f"(created {result['shards_created']} this run; status={result['status']})"
+    )
+
+
 def discover_datasets_batch(
     sources: List[str],
     hf_token: Optional[str] = None,
@@ -737,6 +768,55 @@ def main():
     optimize_parser.add_argument("--path-in-repo", default="")
     optimize_parser.add_argument("--revision", default="main")
 
+    dataset_parser = subparsers.add_parser(
+        "optimize-dataset",
+        help="Stream loose payload/sidecar pairs into resumable webshart shards",
+    )
+    dataset_parser.add_argument("--source", required=True)
+    dataset_parser.add_argument(
+        "--destination",
+        help="Optional local output directory; omit for rolling Hub-only conversion",
+    )
+    dataset_parser.add_argument(
+        "--push-to-hub",
+        metavar="REPO_ID",
+        help="Target Hugging Face dataset repo (may be the source repo)",
+    )
+    dataset_parser.add_argument("--source-subfolder", "--subfolder", default="")
+    dataset_parser.add_argument(
+        "--output-prefix",
+        default="webshart",
+        help="Target subfolder for shards, indexes, and resume state",
+    )
+    dataset_parser.add_argument("--source-revision", default="main")
+    dataset_parser.add_argument("--target-revision", default="main")
+    dataset_parser.add_argument("--hf-token")
+    dataset_parser.add_argument(
+        "--max-shard-size-gb",
+        type=float,
+        default=1.0,
+        help="Approximate maximum tar shard size (default: 1 GiB)",
+    )
+    dataset_parser.add_argument(
+        "--payload-extensions",
+        help="Comma-separated payload extensions; defaults to common media types",
+    )
+    dataset_parser.add_argument(
+        "--no-image-geometry",
+        action="store_true",
+        help="Skip image width, height, and aspect extraction",
+    )
+    dataset_parser.add_argument(
+        "--max-shards",
+        type=int,
+        help="Stop after this many new shards; rerun to resume",
+    )
+    dataset_parser.add_argument(
+        "--private",
+        action="store_true",
+        help="Create a private target repo when it does not already exist",
+    )
+
     args = parser.parse_args()
 
     if args.command == "extract-metadata":
@@ -746,6 +826,12 @@ def main():
             optimize_captions(args)
         except Exception as exc:
             print(f"✗ Error optimizing captions: {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "optimize-dataset":
+        try:
+            run_optimize_dataset(args)
+        except Exception as exc:
+            print(f"✗ Error optimizing dataset: {exc}", file=sys.stderr)
             sys.exit(1)
     else:
         parser.print_help()
