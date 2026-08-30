@@ -549,3 +549,81 @@ def test_sample_aspect_buckets_skip_paired_json_sidecars():
         assert all("sample_idx" not in entry for entry in file_bucket_entries)
         assert [entry["filename"] for entry in sample_bucket_entries] == ["sample.webp"]
         assert sample_bucket_entries[0]["sample_idx"] == 0
+
+
+def test_filtered_sample_listing_and_buckets_use_filename_patterns():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        metadata = {
+            "filesize": 4096,
+            "files": {
+                "keep/sample.webp": {
+                    "offset": 0,
+                    "length": 256,
+                    "width": 512,
+                    "height": 512,
+                    "aspect": 1.0,
+                },
+                "drop/sample.webp": {
+                    "offset": 1024,
+                    "length": 256,
+                    "width": 512,
+                    "height": 512,
+                    "aspect": 1.0,
+                },
+                "keep/blocked.webp": {
+                    "offset": 2048,
+                    "length": 256,
+                    "width": 512,
+                    "height": 512,
+                    "aspect": 1.0,
+                },
+                "keep/exact-match.webp": {
+                    "offset": 3072,
+                    "length": 256,
+                    "width": 512,
+                    "height": 512,
+                    "aspect": 1.0,
+                },
+            },
+        }
+        (Path(tmpdir) / "data-0000.json").write_text(json.dumps(metadata), encoding="utf-8")
+        (Path(tmpdir) / "data-0000.tar").touch()
+
+        dataset = webshart.discover_dataset(tmpdir)
+        loader = webshart.TarDataLoader(dataset, load_file_data=False)
+
+        samples = loader.list_samples_in_shard_filtered(
+            0,
+            path_include=["keep/"],
+            path_exclude=["blocked", "exact-match"],
+        )
+        buckets = loader.list_shard_sample_aspect_buckets_filtered(
+            [0],
+            path_include=["keep/"],
+            path_exclude=["blocked", "exact-match"],
+        )
+
+        bucket_entries = list(buckets[0]["buckets"].values())[0]
+        assert [entry["filename"] for entry in samples] == ["keep/sample.webp"]
+        assert [entry["filename"] for entry in bucket_entries] == ["keep/sample.webp"]
+
+        auto_samples = loader.list_samples_in_shard_filtered(
+            0,
+            path_include=["*/sample.webp"],
+            path_filter_mode="auto",
+        )
+        assert [entry["filename"] for entry in auto_samples] == ["drop/sample.webp", "keep/sample.webp"]
+
+        regex_samples = loader.list_samples_in_shard_filtered(
+            0,
+            path_include=["re:keep/exact-[a-z]+\\.webp"],
+            path_filter_mode="auto",
+        )
+        assert [entry["filename"] for entry in regex_samples] == ["keep/exact-match.webp"]
+
+        exact_samples = loader.list_samples_in_shard_filtered(
+            0,
+            path_include=["exact-match.webp"],
+            path_filter_mode="exact",
+        )
+        assert [entry["filename"] for entry in exact_samples] == ["keep/exact-match.webp"]
