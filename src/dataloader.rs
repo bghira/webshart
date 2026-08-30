@@ -5,6 +5,7 @@ use crate::FileInfo;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use rand::{rng, seq::SliceRandom};
+use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -13,6 +14,114 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 
 type IndexedFileEntry = (usize, String, FileInfo);
+
+pub(crate) enum PathMatcher {
+    Contains(String),
+    Exact(String),
+    Glob(String),
+    Regex(Regex),
+}
+
+impl PathMatcher {
+    fn new(pattern: String, mode: &str) -> Result<Self> {
+        match mode {
+            "contains" => Ok(Self::Contains(pattern)),
+            "exact" => Ok(Self::Exact(pattern)),
+            "glob" => Ok(Self::Glob(pattern)),
+            "regex" => {
+                Ok(Self::Regex(Regex::new(&pattern).map_err(|err| {
+                    WebshartError::InvalidShardFormat(err.to_string())
+                })?))
+            }
+            "auto" => {
+                if let Some(regex_pattern) = pattern.strip_prefix("re:") {
+                    Ok(Self::Regex(Regex::new(regex_pattern).map_err(|err| {
+                        WebshartError::InvalidShardFormat(err.to_string())
+                    })?))
+                } else if pattern.contains('*') || pattern.contains('?') {
+                    Ok(Self::Glob(pattern))
+                } else {
+                    Ok(Self::Contains(pattern))
+                }
+            }
+            _ => Err(WebshartError::InvalidShardFormat(
+                "path_filter_mode must be 'auto', 'contains', 'glob', 'regex', or 'exact'"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn is_match(&self, value: &str) -> bool {
+        match self {
+            Self::Contains(pattern) => value.contains(pattern),
+            Self::Exact(pattern) => value == pattern,
+            Self::Glob(pattern) => glob_match(pattern, value),
+            Self::Regex(pattern) => pattern.is_match(value),
+        }
+    }
+}
+
+fn build_path_matchers(patterns: Option<Vec<String>>, mode: &str) -> Result<Vec<PathMatcher>> {
+    patterns
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pattern| !pattern.is_empty())
+        .map(|pattern| PathMatcher::new(pattern, mode))
+        .collect()
+}
+
+fn filename_matches_path_filter(
+    filename: &str,
+    include: &[PathMatcher],
+    exclude: &[PathMatcher],
+) -> bool {
+    let basename = Path::new(filename)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(filename);
+    let matches_any =
+        |matcher: &PathMatcher| matcher.is_match(filename) || matcher.is_match(basename);
+
+    if !include.is_empty() && !include.iter().any(matches_any) {
+        return false;
+    }
+    if exclude.iter().any(matches_any) {
+        return false;
+    }
+    true
+}
+
+fn glob_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_idx, mut value_idx) = (0usize, 0usize);
+    let mut star_idx: Option<usize> = None;
+    let mut star_value_idx = 0usize;
+
+    while value_idx < value.len() {
+        if pattern_idx < pattern.len()
+            && (pattern[pattern_idx] == b'?' || pattern[pattern_idx] == value[value_idx])
+        {
+            pattern_idx += 1;
+            value_idx += 1;
+        } else if pattern_idx < pattern.len() && pattern[pattern_idx] == b'*' {
+            star_idx = Some(pattern_idx);
+            star_value_idx = value_idx;
+            pattern_idx += 1;
+        } else if let Some(star) = star_idx {
+            pattern_idx = star + 1;
+            star_value_idx += 1;
+            value_idx = star_value_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_idx < pattern.len() && pattern[pattern_idx] == b'*' {
+        pattern_idx += 1;
+    }
+    pattern_idx == pattern.len()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RemoteByteRange {
@@ -944,6 +1053,45 @@ impl PyTarDataLoader {
         Ok(list.into_any().unbind())
     }
 
+    #[pyo3(signature = (shard_idx, path_include=None, path_exclude=None, path_filter_mode="auto"))]
+    fn list_samples_in_shard_filtered(
+        &self,
+        shard_idx: usize,
+        py: Python,
+        path_include: Option<Vec<String>>,
+        path_exclude: Option<Vec<String>>,
+        path_filter_mode: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let include = build_path_matchers(path_include, path_filter_mode)?;
+        let exclude = build_path_matchers(path_exclude, path_filter_mode)?;
+        let mut dataset = self.dataset.lock().unwrap();
+        ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+
+        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
+        })?;
+
+        let list = PyList::empty(py);
+        if let Some(metadata) = &shard.metadata {
+            for (sample_idx, (filename, _file_info)) in metadata
+                .sample_range(0, metadata.num_samples())
+                .into_iter()
+                .enumerate()
+                .filter(|(_, (filename, file_info))| {
+                    file_info.length <= self.config.max_file_size
+                        && filename_matches_path_filter(filename, &include, &exclude)
+                })
+            {
+                let sample = PyDict::new(py);
+                sample.set_item("sample_idx", sample_idx)?;
+                sample.set_item("filename", filename)?;
+                list.append(sample)?;
+            }
+        }
+
+        Ok(list.into_any().unbind())
+    }
+
     /// Load a logical sample, or return None when it exceeds max_file_size.
     fn load_sample(&self, shard_idx: usize, sample_idx: usize) -> PyResult<Option<PyTarFileEntry>> {
         let mut dataset = self.dataset.lock().unwrap();
@@ -1275,6 +1423,39 @@ impl PyTarDataLoader {
             target_pixel_area,
             Some(target_resolution_multiple),
             round_to,
+            None,
+        )?;
+
+        let py_results: Vec<Py<PyAny>> = results
+            .into_iter()
+            .map(|bucket| self.aspect_buckets_to_py_dict(py, bucket))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        Ok(py_results)
+    }
+
+    #[pyo3(signature = (shard_indices, key="aspect", target_pixel_area=None, target_resolution_multiple=64, round_to=Some(2), path_include=None, path_exclude=None, path_filter_mode="auto"))]
+    pub fn list_shard_sample_aspect_buckets_filtered(
+        &self,
+        py: Python,
+        shard_indices: Vec<usize>,
+        key: &str,
+        target_pixel_area: Option<u32>,
+        target_resolution_multiple: u32,
+        round_to: Option<usize>,
+        path_include: Option<Vec<String>>,
+        path_exclude: Option<Vec<String>>,
+        path_filter_mode: &str,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let include = build_path_matchers(path_include, path_filter_mode)?;
+        let exclude = build_path_matchers(path_exclude, path_filter_mode)?;
+        let results = self.get_sample_aspect_buckets_for_shards(
+            shard_indices,
+            key,
+            target_pixel_area,
+            Some(target_resolution_multiple),
+            round_to,
+            Some((&include, &exclude)),
         )?;
 
         let py_results: Vec<Py<PyAny>> = results
@@ -1495,6 +1676,7 @@ impl PyTarDataLoader {
         target_pixel_area: Option<u32>,
         target_resolution_multiple: Option<u32>,
         round_to: Option<usize>,
+        path_filter: Option<(&[PathMatcher], &[PathMatcher])>,
     ) -> PyResult<AspectBuckets> {
         let key_type = BucketKeyType::parse(key)?;
         let mut dataset = self.dataset.lock().unwrap();
@@ -1520,6 +1702,11 @@ impl PyTarDataLoader {
         {
             if file_info.length > self.config.max_file_size {
                 continue;
+            }
+            if let Some((include, exclude)) = path_filter {
+                if !filename_matches_path_filter(&filename, include, exclude) {
+                    continue;
+                }
             }
             if let (Some(width), Some(height)) = (file_info.width, file_info.height) {
                 let target_resolution_multiple = target_resolution_multiple.unwrap_or(64);
@@ -1747,6 +1934,7 @@ impl PyTarDataLoader {
         target_pixel_area: Option<u32>,
         target_resolution_multiple: Option<u32>,
         round_to: Option<usize>,
+        path_filter: Option<(&[PathMatcher], &[PathMatcher])>,
     ) -> PyResult<Vec<AspectBuckets>> {
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| {
@@ -1761,6 +1949,7 @@ impl PyTarDataLoader {
                             target_pixel_area,
                             target_resolution_multiple,
                             round_to,
+                            path_filter,
                         ) {
                             Ok(buckets) => results.push(buckets),
                             Err(e) => return Err(e),
@@ -1781,6 +1970,7 @@ impl PyTarDataLoader {
                         target_pixel_area,
                         target_resolution_multiple,
                         round_to,
+                        path_filter,
                     ) {
                         Ok(buckets) => results.push(buckets),
                         Err(e) => return Err(e),
