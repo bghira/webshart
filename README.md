@@ -238,6 +238,43 @@ webshart.write_captions_to_metadata(
 
 The writer updates existing webshart metadata JSON in place, removes old singular `caption` keys from updated samples, and leaves paired `.json` sidecar entries untouched.
 
+### Renaming metadata fields
+
+Permanently rename a field across a dataset's JSON indexes:
+
+```python
+dataset = webshart.discover_dataset("/path/to/dataset")
+updated = dataset.field_rename("captions", "v1_captions")
+
+loader = webshart.TarDataLoader(dataset)
+entry = loader.load_sample(0, 0)
+print(entry.metadata["v1_captions"])
+```
+
+`field_rename(old_name, new_name, *, overwrite=False, destination=None)` returns
+the number of file entries renamed. It moves top-level keys within each index's
+`files` entries, preserving values, custom fields, and dict/list index layouts.
+It processes one shard's metadata at a time without reading or rewriting tar
+payloads. Nested `json_metadata` and sidecar contents are left intact.
+
+Missing fields are skipped; renaming a field to itself returns zero. Existing
+destination fields raise `ValueError` unless `overwrite=True`. Structural index
+fields such as offsets, lengths, and paths cannot be renamed. All indexes are
+validated before replacements begin, and each file replacement is atomic;
+an I/O failure during replacement can still leave earlier shards updated.
+
+Local indexes are rewritten in place and their loaded/disk metadata caches are
+invalidated. Recreate existing loaders after renaming. Custom names are available
+through `entry.metadata` and `loader.get_metadata()`; `entry.captions` continues
+to represent the canonical caption field and may still read unchanged sidecars.
+
+For remote indexes, pass `destination="./renamed-metadata"` to write a local
+export, then upload those JSON files separately. This also works for local
+datasets when an export is preferred. The dataset uses the exported indexes
+afterward, and tar files stay at their original locations.
+
+### Coalescing caption metadata
+
 To avoid repeated `.txt` range reads, fold all sidecar captions into standard
 webshart metadata files. If metadata caching is enabled, omitting the destination
 persists the enriched indexes in webshart's cache:
