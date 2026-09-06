@@ -160,7 +160,23 @@ impl MetadataResolver {
         Ok(metadata)
     }
 
+    pub(crate) async fn load_metadata_value(&self, path: &str) -> Result<serde_json::Value> {
+        let content = if path.starts_with("http") {
+            self.load_remote_content(path).await?
+        } else {
+            fs::read_to_string(path)?
+        };
+        Ok(serde_json::from_str(&content)?)
+    }
+
     async fn load_remote_metadata(&self, url: &str) -> Result<ShardMetadata> {
+        let response_text = self.load_remote_content(url).await?;
+        serde_json::from_str::<ShardMetadata>(&response_text).map_err(|e| {
+            WebshartError::MetadataNotFound(format!("Invalid JSON in metadata file: {}", e))
+        })
+    }
+
+    async fn load_remote_content(&self, url: &str) -> Result<String> {
         let mut request = self.client.get(url);
 
         if let Some(token) = &self.hf_token {
@@ -177,10 +193,7 @@ impl MetadataResolver {
             )));
         }
 
-        let response_text = response.text().await?;
-        serde_json::from_str::<ShardMetadata>(&response_text).map_err(|e| {
-            WebshartError::MetadataNotFound(format!("Invalid JSON in metadata file: {}", e))
-        })
+        Ok(response.text().await?)
     }
 
     async fn check_remote_metadata(&self, url: &str) -> bool {

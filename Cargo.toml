@@ -1,6 +1,6 @@
 [package]
 name = "webshart"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 authors = ["bghira <bghira@users.github.com>"]
 license = "MIT"
@@ -28,9 +28,9 @@ imagesize = "0.15.0"
 pythonize = "0.29.0"
 rand = "0.10.2"
 fs2 = "0.4.3"
+tempfile = "3.27.0"
 
 [dev-dependencies]
-tempfile = "3.27.0"
 mockito = "1.7.2"
 
 [profile.release]

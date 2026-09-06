@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,117 @@ pub struct DiscoveredDataset {
 }
 
 impl DiscoveredDataset {
+    fn field_rename(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        overwrite: bool,
+        destination: Option<PathBuf>,
+    ) -> PyResult<usize> {
+        crate::field_rename::validate_field_names(old_name, new_name)?;
+        if old_name == new_name {
+            return Ok(0);
+        }
+        if destination.is_none()
+            && self
+                .shards
+                .iter()
+                .any(|shard| shard.json_path.starts_with("http"))
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Remote metadata cannot be rewritten in place; provide a local destination directory and upload the rewritten indexes separately",
+            ));
+        }
+        let destination = destination
+            .map(|path| std::path::absolute(path))
+            .transpose()?;
+        let resolver = MetadataResolver::new(
+            self.metadata_source.clone(),
+            self.discovery_token.clone(),
+            self.runtime.clone(),
+        );
+        let mut staged = Vec::new();
+        let mut updated = 0;
+        for (shard_index, shard) in self.shards.iter().enumerate() {
+            let output_path = if let Some(destination) = &destination {
+                if Path::new(&shard.name)
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Unsafe shard name for metadata export: {}",
+                        shard.name
+                    )));
+                }
+                destination.join(format!("{}.json", shard.name))
+            } else {
+                fs::canonicalize(&shard.json_path)?
+            };
+            let mut metadata = self
+                .runtime
+                .block_on(resolver.load_metadata_value(&shard.json_path))?;
+            let count = crate::field_rename::rename_fields(
+                &mut metadata,
+                old_name,
+                new_name,
+                overwrite,
+                &shard.name,
+            )?;
+            if count == 0 && destination.is_none() {
+                continue;
+            }
+            let parent = output_path.parent().ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "Metadata path must have a parent directory",
+                )
+            })?;
+            fs::create_dir_all(parent)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            if output_path.exists() {
+                temporary
+                    .as_file()
+                    .set_permissions(fs::metadata(&output_path)?.permissions())?;
+            }
+            {
+                let mut writer = BufWriter::new(temporary.as_file_mut());
+                serde_json::to_writer(&mut writer, &metadata).map_err(WebshartError::from)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+            }
+            serde_json::from_value::<crate::metadata::ShardMetadataFormat>(metadata)
+                .map_err(WebshartError::from)?;
+            temporary.as_file().sync_all()?;
+            staged.push((shard_index, temporary.into_temp_path(), output_path));
+            updated += count;
+        }
+        for (shard_index, temporary, output_path) in staged {
+            if destination.is_none() {
+                if let Some(cache_path) =
+                    self.get_cached_metadata_path(&self.shards[shard_index].name)
+                {
+                    if cache_path != output_path {
+                        match fs::remove_file(cache_path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+            }
+            temporary
+                .persist(&output_path)
+                .map_err(|error| error.error)?;
+            let shard = &mut self.shards[shard_index];
+            shard.metadata = None;
+            shard.json_path = output_path.to_string_lossy().into_owned();
+        }
+        if let Some(destination) = destination {
+            self.metadata_source = Some(destination.to_string_lossy().into_owned());
+            self.cache_dir = None;
+        }
+        Ok(updated)
+    }
+
     /// Get total number of shards
     pub fn num_shards(&self) -> usize {
         self.shards.len()
@@ -1317,6 +1429,30 @@ pub struct PyDiscoveredDataset {
 
 #[pymethods]
 impl PyDiscoveredDataset {
+    /// Permanently rename a top-level field in every file entry in the shard indexes.
+    ///
+    /// Missing fields are skipped. Existing destinations raise ValueError unless
+    /// overwrite=True. Validation finishes before any index is replaced; each
+    /// replacement is atomic. Returns the number of entries renamed.
+    ///
+    /// Local indexes are updated in place. For remote indexes, destination must
+    /// be a local export directory; upload those files separately. The dataset
+    /// then uses the exported indexes. Recreate existing loaders after a rename.
+    #[pyo3(signature = (old_name, new_name, *, overwrite=false, destination=None))]
+    fn field_rename(
+        &mut self,
+        py: Python<'_>,
+        old_name: String,
+        new_name: String,
+        overwrite: bool,
+        destination: Option<PathBuf>,
+    ) -> PyResult<usize> {
+        py.detach(|| {
+            self.inner
+                .field_rename(&old_name, &new_name, overwrite, destination)
+        })
+    }
+
     #[getter]
     fn name(&self) -> &str {
         &self.inner.name

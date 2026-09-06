@@ -811,6 +811,7 @@ impl MetadataExtractor {
                                 json_length: None,
                                 captions: None,
                                 json_metadata: None,
+                                extra: Default::default(),
                             });
                             file_count += 1;
                             process_pb.inc(1);
@@ -974,6 +975,7 @@ impl MetadataExtractor {
                                 json_length: None,
                                 captions: None,
                                 json_metadata: None,
+                                extra: Default::default(),
                             },
                         );
 

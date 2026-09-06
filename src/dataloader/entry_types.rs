@@ -16,6 +16,7 @@ pub struct PyTarFileEntry {
     pub json_data: Option<Vec<u8>>,
     pub captions: Option<CaptionValue>,
     pub json_metadata: Option<serde_json::Value>,
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
     pub shard_idx: Option<usize>,
     pub file_idx: Option<usize>,
 }
@@ -118,6 +119,9 @@ impl PyTarFileEntry {
         if let Some(value) = &self.json_metadata {
             dict.set_item("json_metadata", pythonize::pythonize(py, value)?)?;
         }
+        for (key, value) in &self.extra {
+            dict.set_item(key, pythonize::pythonize(py, value)?)?;
+        }
 
         Ok(dict.into_any().unbind())
     }
@@ -191,6 +195,7 @@ pub fn create_tar_entry(
         json_data: None,
         captions: file_info.captions.clone(),
         json_metadata: file_info.json_metadata.clone(),
+        extra: file_info.extra.clone(),
         shard_idx,
         file_idx,
     }

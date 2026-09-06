@@ -187,6 +187,7 @@ mod remote_range_tests {
                 json_length: None,
                 captions: None,
                 json_metadata: None,
+                extra: Default::default(),
             },
         )
     }
@@ -2088,6 +2089,7 @@ impl PyTarDataLoader {
                 json_length: None,
                 captions: None,
                 json_metadata: None,
+                extra: Default::default(),
             };
 
             let data = self.load_single_file_data(tar_path, &json_info, is_remote, token)?;
@@ -2152,6 +2154,7 @@ impl PyTarDataLoader {
             json_data: entry.json_data.clone(),
             captions: entry.captions.clone(),
             json_metadata: entry.json_metadata.clone(),
+            extra: entry.extra.clone(),
             shard_idx: entry.shard_idx,
             file_idx: entry.file_idx,
         };

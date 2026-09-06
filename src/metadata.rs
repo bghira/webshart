@@ -75,6 +75,9 @@ pub struct FileInfo {
     /// Parsed paired JSON metadata when it is stored directly in the index.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub json_metadata: Option<Value>,
+
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 /// Metadata for a single shard - supports both HashMap and Vec formats
@@ -167,6 +170,7 @@ struct FileInfoInternal {
     pub json_length: Option<u64>,
     pub captions: Option<CaptionValue>,
     pub json_metadata: Option<Value>,
+    pub extra: HashMap<String, Value>,
 }
 
 impl From<FileInfo> for FileInfoInternal {
@@ -184,6 +188,7 @@ impl From<FileInfo> for FileInfoInternal {
             json_length: info.json_length,
             captions: info.captions,
             json_metadata: info.json_metadata,
+            extra: info.extra,
         }
     }
 }
@@ -203,6 +208,7 @@ impl From<&FileInfoInternal> for FileInfo {
             json_length: info.json_length,
             captions: info.captions.clone(),
             json_metadata: info.json_metadata.clone(),
+            extra: info.extra.clone(),
         }
     }
 }
@@ -596,6 +602,7 @@ impl Serialize for ShardMetadata {
                     json_length: file.json_length,
                     captions: file.captions.clone(),
                     json_metadata: file.json_metadata.clone(),
+                    extra: file.extra.clone(),
                 },
             );
         }
