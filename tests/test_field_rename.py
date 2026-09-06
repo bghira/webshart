@@ -3,8 +3,9 @@ import io
 import json
 import tarfile
 from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler
 from multiprocessing import get_context
+from socketserver import TCPServer
 
 import pytest
 
@@ -20,11 +21,11 @@ def serve_metadata(source, connection):
         def log_message(self, *_args):
             pass
 
-    server = ThreadingHTTPServer(
+    with TCPServer(
         ("127.0.0.1", 0), partial(MetadataHandler, directory=str(source))
-    )
-    connection.send(server.server_port)
-    server.serve_forever()
+    ) as server:
+        connection.send(server.server_address[1])
+        server.serve_forever()
 
 
 def write_shard(root, name, fields, *, list_format=False):
@@ -247,8 +248,11 @@ def test_field_rename_remote_metadata_requires_export_and_preserves_custom_keys(
         target=serve_metadata, args=(source, connection), daemon=True
     )
     server.start()
+    connection.close()
     try:
-        assert requests.poll(10)
+        assert requests.poll(
+            10
+        ), f"Metadata server did not start: pid={server.pid}, exitcode={server.exitcode}"
         port = requests.recv()
         dataset = webshart.discover_dataset(
             str(source),
