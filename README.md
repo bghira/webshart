@@ -22,7 +22,7 @@ Webshart is a fast reader for webdataset tar files with separate JSON index file
 - **Cloud-optimized**: Works efficiently with HTTP range requests
 - **Aspect bucketing**: Optionally include image geometry hints `width`, `height` and `aspect` for the ability to bucket images by shape
 - **Logical sample APIs**: Treat `image.ext` + `image.json` pairs as one sample while still allowing raw file access
-- **Caption metadata**: Store captions in shard metadata under the plural `captions` key as either a string or a list of strings
+- **Caption metadata**: Store captions under `captions` as strings, native JSON objects, or mixed lists of both
 - **Custom DataLoader**: Includes state dict methods on the DataLoader so that you can resume training deterministically
 - **Rate-limit friendly**: Local caching allows high-frequency random seeking without encountering storage provider rate limits
 - **Instant start-up** with pre-sorted aspect buckets
@@ -87,6 +87,51 @@ and aspect buckets instead of being returned with empty data. Direct
 `list_samples_in_shard()` returns dictionaries containing `sample_idx` and
 `filename`, so filtered listings retain the stable index required by
 `load_sample()`.
+
+## Native Hugging Face Xet Downloads
+
+Hugging Face files stored in Xet are read directly by webshart's Rust transport.
+Neither `hf_xet` nor `huggingface_hub` is needed for dataset reads. Non-Xet files
+and other HTTP servers continue to use ordinary HTTP downloads and byte ranges.
+
+The transport supports full-shard caching, individual sample/sidecar reads, and
+batched range reads. It reconstructs files using concurrent 16 MiB windows,
+decodes uncompressed, LZ4, and byte-grouped LZ4 chunks, and handles CAS v2
+multi-range responses and the documented v1 compatibility path. Buffers and
+request concurrency are bounded rather than proportional to the entire shard.
+Full-shard downloads validate the size and Hub-provided SHA-256 before entering
+the cache; partial reads validate ranges, chunk sizes, and reconstruction lengths.
+Transient requests are retried, expired credentials/transfer URLs are refreshed,
+and native Xet errors are reported rather than silently bypassing verification.
+
+```python
+dataset = webshart.discover_dataset("webshart/pseudo-camera-10k-structured", subfolder="data")
+dataset.enable_shard_cache("cache/shards", cache_limit_gb=25, parallel_downloads=4)
+loader = webshart.TarDataLoader(dataset)
+loader.prepare_shards_ahead(4)
+sample = loader.load_sample(0, 0)
+```
+
+`parallel_downloads` limits concurrent whole shards in each cache; prefetch must
+be scheduled explicitly. Xet independently permits up to eight simultaneous
+chunk transfers per process, including multiple transfers within one shard.
+Set `WEBSHART_XET_CONCURRENCY=1..64` before the first read to change that limit.
+`load_sample()` releases the Python GIL during I/O. Without a shard cache, only
+the requested sample ranges are reconstructed, not the entire archive.
+
+Set `WEBSHART_DISABLE_XET=1` to explicitly use the ordinary HTTP path instead.
+`HF_ENDPOINT` selects the Hub origin recognized by the Xet transport for custom
+resolve URLs; it does not change repository discovery's Hub endpoint.
+
+Implemented from the public [download protocol](https://huggingface.co/docs/xet/download-protocol),
+[authentication specification](https://huggingface.co/docs/xet/auth), and
+[xorb format](https://huggingface.co/docs/xet/xorb). Run the opt-in live test with
+`cargo test --lib xet::tests::live_public_hub_shard -- --ignored --nocapture`;
+it downloads a 287 MiB public shard, verifies its SHA-256, and compares partial
+reads with independent HTTP ranges.
+`WEBSHART_TEST_LIVE_XET=1 .venv/bin/python -m pytest -q tests/test_xet_live.py`
+also exercises the Python SDK, cache, batched reads, and ordinary HTTP opt-out
+with both Hugging Face Python libraries blocked from import.
 
 ## Common Patterns
 
@@ -224,7 +269,22 @@ print(entry.json_data)
 caption = loader.load_caption(0, 0)
 ```
 
-Captions are canonicalized to the plural `captions` metadata key. The value may be a single string, a list of strings, or absent.
+Captions are canonicalized to the plural `captions` metadata key. The value may be
+a string, a native JSON object, a list containing either, or absent. Nested
+objects, arrays, numbers, and booleans inside caption objects retain their JSON
+types. `entry.captions` returns the complete value; `entry.caption` and
+`loader.load_caption()` return the first string or object.
+
+The optimizer and caption coalescer recognize JSON objects and mixed caption
+lists in `.txt` sidecars. Plain text remains a string. JSON sidecars support
+native values under their caption fields and standalone caption objects.
+
+```python
+webshart.write_captions_to_metadata(
+    "shard_0000.json",
+    {"sample_0001.webp": {"description": "a café", "elements": [{"bbox": [1, 2, 30, 40]}]}},
+)
+```
 
 ```python
 webshart.write_captions_to_metadata(

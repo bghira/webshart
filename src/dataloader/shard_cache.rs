@@ -214,6 +214,13 @@ impl ShardCache {
     ) -> Result<u64> {
         use futures::StreamExt;
 
+        if let Some(file) = crate::xet::resolve(url, token.as_deref()).await? {
+            println!("[webshart] Downloading {shard_name} with native Xet");
+            let size = crate::xet::client()?.download(&file, temp_path).await?;
+            self.commit_download(temp_path, shard_name, size).await?;
+            return Ok(size);
+        }
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()

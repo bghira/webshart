@@ -13,6 +13,12 @@ pub enum WebshartError {
     #[error("HTTP request error: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("Xet download error: {0}")]
+    Xet(String),
+
+    #[error("Xet HTTP request failed (status {0})")]
+    XetHttp(u16),
+
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 

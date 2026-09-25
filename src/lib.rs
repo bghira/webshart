@@ -7,6 +7,7 @@ mod extract;
 mod field_rename;
 mod metadata;
 mod metadata_resolver;
+mod xet;
 // Re-export main types
 use dataloader::{scale_dimensions, PyBucketDataLoader, PyTarDataLoader, PyTarFileEntry};
 pub use dataloader::{AspectBucketIterator, BatchOperations, BatchResult, FileReadRequest};

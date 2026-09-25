@@ -70,40 +70,44 @@ impl RemoteFileLoader {
 
 impl FileLoader for RemoteFileLoader {
     fn load_file(&self, file_info: &FileInfo) -> Result<Vec<u8>> {
-        self.runtime.block_on(async {
-            let client = file_http_client()?;
-
-            let mut request = client
-                .get(&self.url)
-                .header(
-                    "Range",
-                    format!(
-                        "bytes={}-{}",
-                        file_info.offset,
-                        file_info.offset + file_info.length - 1
-                    ),
-                )
-                .timeout(Duration::from_secs(60));
-
-            if let Some(token) = &self.token {
-                request = request.bearer_auth(token);
-            }
-
-            let response = request.send().await?;
-
-            if response.status().is_success()
-                || response.status() == reqwest::StatusCode::PARTIAL_CONTENT
-            {
-                Ok(response.bytes().await?.to_vec())
-            } else if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                Err(WebshartError::RateLimited)
-            } else {
-                Err(WebshartError::Http(reqwest::Error::from(
-                    response.error_for_status().unwrap_err(),
-                )))
-            }
-        })
+        self.runtime.block_on(read_remote_range(
+            &self.url,
+            self.token.as_deref(),
+            file_info.offset,
+            file_info.length,
+        ))
     }
+}
+
+pub(crate) async fn read_remote_range(
+    url: &str,
+    token: Option<&str>,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if let Some(file) = crate::xet::resolve(url, token).await? {
+        return crate::xet::client()?
+            .read_range(&file, offset, length)
+            .await;
+    }
+    let end = offset
+        .checked_add(length - 1)
+        .ok_or_else(|| WebshartError::InvalidShardFormat("Byte range overflow".into()))?;
+    let mut request = file_http_client()?
+        .get(url)
+        .header("Range", format!("bytes={offset}-{end}"))
+        .timeout(Duration::from_secs(60));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(WebshartError::RateLimited);
+    }
+    Ok(response.error_for_status()?.bytes().await?.to_vec())
 }
 
 pub fn create_file_loader(

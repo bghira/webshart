@@ -73,8 +73,13 @@ impl PyTarFileEntry {
     }
 
     #[getter]
-    fn caption(&self) -> Option<&str> {
-        self.captions.as_ref().and_then(CaptionValue::first)
+    fn caption(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        self.captions
+            .as_ref()
+            .and_then(CaptionValue::first)
+            .map(|caption| pythonize::pythonize(py, caption).map(Bound::unbind))
+            .transpose()
+            .map_err(Into::into)
     }
 
     #[getter]

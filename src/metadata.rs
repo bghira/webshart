@@ -7,21 +7,40 @@ use std::time::Duration;
 
 /// Caption metadata extracted from paired JSON sidecars.
 ///
-/// This serializes as either a single string or a list of strings so Python
-/// callers see `captions: str | list[str] | None`.
+/// Python callers receive strings, JSON objects, or lists containing either.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Caption {
+    Text(String),
+    Object(serde_json::Map<String, Value>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CaptionValue {
-    Single(String),
-    Multiple(Vec<String>),
+    Single(Caption),
+    Multiple(Vec<Caption>),
 }
 
 impl CaptionValue {
-    pub fn first(&self) -> Option<&str> {
+    pub fn first(&self) -> Option<&Caption> {
         match self {
-            Self::Single(text) => Some(text.as_str()),
-            Self::Multiple(captions) => captions.first().map(String::as_str),
+            Self::Single(caption) => Some(caption),
+            Self::Multiple(captions) => captions.first(),
         }
+    }
+
+    pub fn from_text(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        if text.starts_with('{') || text.starts_with('[') {
+            if let Ok(caption) = serde_json::from_str(text) {
+                return Some(caption);
+            }
+        }
+        Some(Self::Single(Caption::Text(text.to_owned())))
     }
 }
 
@@ -352,29 +371,30 @@ impl ShardMetadata {
         ];
 
         let mut captions = Vec::new();
-        let mut seen = HashSet::new();
         if let Some(obj) = value.as_object() {
             for key in keys {
                 if let Some(field) = obj.get(key) {
-                    match field {
-                        Value::String(text) if !text.is_empty() => {
-                            if seen.insert(text.clone()) {
-                                captions.push(text.clone());
+                    let items = field
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or(std::slice::from_ref(field));
+                    for item in items {
+                        if item.as_str().is_some_and(str::is_empty) {
+                            continue;
+                        }
+                        if let Ok(caption) = serde_json::from_value::<Caption>(item.clone()) {
+                            if !captions.contains(&caption) {
+                                captions.push(caption);
                             }
                         }
-                        Value::Array(items) => {
-                            for item in items {
-                                if let Some(text) = item.as_str() {
-                                    if !text.is_empty() && seen.insert(text.to_string()) {
-                                        captions.push(text.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
+            if !keys.iter().any(|key| obj.contains_key(*key)) {
+                return Some(CaptionValue::Single(Caption::Object(obj.clone())));
+            }
+        } else {
+            return serde_json::from_value(value.clone()).ok();
         }
 
         match captions.len() {

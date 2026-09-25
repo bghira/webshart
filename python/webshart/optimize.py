@@ -18,7 +18,8 @@ from tqdm import tqdm
 from webshart._webshart import MetadataExtractor
 
 
-CaptionValue = Union[str, list[str]]
+Caption = Union[str, dict[str, Any]]
+CaptionValue = Union[Caption, list[Caption]]
 
 DEFAULT_PAYLOAD_EXTENSIONS = (
     ".avif",
@@ -335,6 +336,8 @@ def _read_small_file(
 
 
 def _normalize_caption(value: Any) -> Optional[CaptionValue]:
+    if isinstance(value, dict):
+        return value
     if isinstance(value, str):
         value = value.strip()
         return value or None
@@ -342,12 +345,14 @@ def _normalize_caption(value: Any) -> Optional[CaptionValue]:
         captions = []
         seen = set()
         for item in value:
+            if isinstance(item, dict):
+                captions.append(item)
             if isinstance(item, str):
                 item = item.strip()
                 if item and item not in seen:
                     seen.add(item)
                     captions.append(item)
-        if len(captions) == 1:
+        if len(captions) == 1 and not isinstance(captions[0], dict):
             return captions[0]
         return captions or None
     return None
@@ -371,15 +376,31 @@ def _metadata_from_sidecar(
         token=token,
     )
     if PurePosixPath(sidecar.path).suffix.lower() == ".txt":
-        return _normalize_caption(data.decode("utf-8")), None
+        text = data.decode("utf-8").strip()
+        if text.startswith(("{", "[")):
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(value, dict) or (
+                    isinstance(value, list)
+                    and all(isinstance(item, (str, dict)) for item in value)
+                ):
+                    return value, None
+        return _normalize_caption(text), None
 
     value = json.loads(data)
+    if isinstance(value, list) and all(isinstance(item, (str, dict)) for item in value):
+        return value, None
     if not isinstance(value, dict):
-        return None, None
+        return _normalize_caption(value), None
+    if not any(key in value for key in CAPTION_KEYS):
+        return value, value
     captions = []
     for key in CAPTION_KEYS:
         caption = _normalize_caption(value.get(key))
-        if isinstance(caption, str):
+        if isinstance(caption, (str, dict)):
             captions.append(caption)
         elif isinstance(caption, list):
             captions.extend(caption)
