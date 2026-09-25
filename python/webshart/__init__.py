@@ -60,7 +60,8 @@ __all__ = [
 ]
 
 
-CaptionValue = Union[str, List[str]]
+Caption = Union[str, Dict[str, Any]]
+CaptionValue = Union[Caption, List[Caption]]
 OptionalCaptionValue = Optional[CaptionValue]
 
 
@@ -235,10 +236,14 @@ def _sample_lookup_keys(path: str) -> List[str]:
 def _normalize_captions(value: Any) -> OptionalCaptionValue:
     if value is None:
         return None
-    if isinstance(value, str):
+    if isinstance(value, (str, dict)):
         return value
     if isinstance(value, (list, tuple)):
-        captions = [str(item) for item in value if item is not None and str(item)]
+        captions = [
+            item if isinstance(item, dict) else str(item)
+            for item in value
+            if item is not None and (isinstance(item, dict) or str(item))
+        ]
         return captions or None
     return str(value)
 
@@ -250,7 +255,7 @@ def apply_captions_to_metadata(
     """Attach captions to a webshart metadata mapping in-place.
 
     Captions are stored under the canonical plural ``captions`` key and may be a
-    single string or a list of strings. Existing singular ``caption`` keys are
+    string, JSON object, or a list containing either. Existing singular ``caption`` keys are
     removed from updated sample entries.
     """
     files = metadata.get("files")
@@ -307,7 +312,8 @@ def write_captions_to_metadata(
 
     Args:
         metadata_path: Existing webshart metadata JSON file to read.
-        captions_by_sample: Mapping from sample path/stem to caption string or list.
+        captions_by_sample: Mapping from sample path/stem to a string, JSON object,
+            or list of strings and objects.
         output_path: Optional destination JSON file. Defaults to updating
             ``metadata_path`` in place.
 

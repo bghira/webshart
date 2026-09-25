@@ -647,27 +647,13 @@ impl ShardReader {
 
     /// Read a file from remote tar archive using HTTP range requests
     async fn read_file_remote(&self, _filename: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
-        let client = reqwest::Client::new();
-
-        // For this dataset, offsets point directly to file content
-        // Just read the bytes from offset to offset+length
-        let mut request = client
-            .get(&self.tar_location)
-            .header("Range", format!("bytes={}-{}", offset, offset + length - 1));
-
-        if let Some(token) = &self.hf_token {
-            request = request.bearer_auth(token);
-        }
-
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(WebshartError::InvalidShardFormat(format!(
-                "Failed to read file content: {}",
-                response.status()
-            )));
-        }
-
-        Ok(response.bytes().await?.to_vec())
+        crate::dataloader::file_loading::read_remote_range(
+            &self.tar_location,
+            self.hf_token.as_deref(),
+            offset,
+            length,
+        )
+        .await
     }
 
     /// Read a file from local tar archive

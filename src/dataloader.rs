@@ -166,9 +166,39 @@ fn plan_remote_byte_ranges(
     ranges
 }
 
+fn handle_file_read_error(filename: &str, error: WebshartError) -> Result<Vec<u8>> {
+    match error {
+        WebshartError::Xet(_) | WebshartError::XetHttp(_) => Err(error),
+        error => {
+            eprintln!("Failed to load {filename}: {error}");
+            Ok(Vec::new())
+        }
+    }
+}
+
 #[cfg(test)]
 mod remote_range_tests {
-    use super::{plan_remote_byte_ranges, FileInfo, IndexedFileEntry, RemoteByteRange};
+    use super::{
+        handle_file_read_error, plan_remote_byte_ranges, FileInfo, IndexedFileEntry,
+        RemoteByteRange, WebshartError,
+    };
+
+    #[test]
+    fn file_read_errors_preserve_native_failures_and_legacy_fallback() {
+        assert!(matches!(
+            handle_file_read_error("sample.jpg", WebshartError::Xet("invalid chunk".into())),
+            Err(WebshartError::Xet(_))
+        ));
+        assert!(matches!(
+            handle_file_read_error("sample.jpg", WebshartError::XetHttp(403)),
+            Err(WebshartError::XetHttp(403))
+        ));
+        assert!(
+            handle_file_read_error("sample.jpg", WebshartError::RateLimited)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn entry(file_idx: usize, offset: u64, length: u64) -> IndexedFileEntry {
         (
@@ -230,7 +260,7 @@ mod aspect_buckets;
 mod batch;
 mod config;
 mod entry_types;
-mod file_loading;
+pub(crate) mod file_loading;
 pub mod shard_cache;
 use crate::impl_batch_iterator;
 use crate::metadata::ensure_shard_metadata_with_retry;
@@ -1094,70 +1124,82 @@ impl PyTarDataLoader {
     }
 
     /// Load a logical sample, or return None when it exceeds max_file_size.
-    fn load_sample(&self, shard_idx: usize, sample_idx: usize) -> PyResult<Option<PyTarFileEntry>> {
-        let mut dataset = self.dataset.lock().unwrap();
-        ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+    fn load_sample(
+        &self,
+        py: Python,
+        shard_idx: usize,
+        sample_idx: usize,
+    ) -> PyResult<Option<PyTarFileEntry>> {
+        py.detach(|| {
+            let mut dataset = self.dataset.lock().unwrap();
+            ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
 
-        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
-            WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
-        })?;
+            let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
+                WebshartError::InvalidShardFormat(format!("Shard index {} out of range", shard_idx))
+            })?;
 
-        let metadata = shard
-            .metadata
-            .as_ref()
-            .ok_or_else(|| WebshartError::MetadataNotFound("Metadata not loaded".to_string()))?;
+            let metadata = shard.metadata.as_ref().ok_or_else(|| {
+                WebshartError::MetadataNotFound("Metadata not loaded".to_string())
+            })?;
 
-        let (filename, file_info) = metadata.get_sample_by_index(sample_idx).ok_or_else(|| {
-            WebshartError::InvalidShardFormat(format!(
-                "Sample index {} out of range for shard {}",
-                sample_idx, shard_idx
-            ))
-        })?;
-        let txt_sidecar = metadata
-            .get_txt_sidecar_by_sample_index(sample_idx)
-            .map(|(_, file_info)| file_info);
+            let (filename, file_info) =
+                metadata.get_sample_by_index(sample_idx).ok_or_else(|| {
+                    WebshartError::InvalidShardFormat(format!(
+                        "Sample index {} out of range for shard {}",
+                        sample_idx, shard_idx
+                    ))
+                })?;
+            let txt_sidecar = metadata
+                .get_txt_sidecar_by_sample_index(sample_idx)
+                .map(|(_, file_info)| file_info);
 
-        let tar_path = shard.tar_path.clone();
-        let is_remote = dataset.is_remote;
-        let token = if is_remote {
-            dataset.get_hf_token()
-        } else {
-            None
-        };
-        drop(dataset);
+            let tar_path = shard.tar_path.clone();
+            let is_remote = dataset.is_remote;
+            let token = if is_remote {
+                dataset.get_hf_token()
+            } else {
+                None
+            };
+            drop(dataset);
 
-        if file_info.length > self.config.max_file_size {
-            return Ok(None);
-        }
+            if file_info.length > self.config.max_file_size {
+                return Ok(None);
+            }
 
-        let data = if self.config.load_file_data {
-            self.load_single_file_data(&tar_path, &file_info, is_remote, token.clone())?
-        } else {
-            Vec::new()
-        };
+            let data = if self.config.load_file_data {
+                self.load_single_file_data(&tar_path, &file_info, is_remote, token.clone())?
+            } else {
+                Vec::new()
+            };
 
-        let mut entry = create_tar_entry(
-            filename,
-            &file_info,
-            data,
-            Some(shard_idx),
-            Some(sample_idx),
-        );
-        entry.json_data =
-            self.load_json_sidecar_bytes(&tar_path, &file_info, is_remote, token.clone())?;
-        entry.captions = self.load_caption_value(
-            &tar_path,
-            &file_info,
-            txt_sidecar.as_ref(),
-            entry.json_data.as_deref(),
-            is_remote,
-            token,
-        )?;
-        Ok(Some(entry))
+            let mut entry = create_tar_entry(
+                filename,
+                &file_info,
+                data,
+                Some(shard_idx),
+                Some(sample_idx),
+            );
+            entry.json_data =
+                self.load_json_sidecar_bytes(&tar_path, &file_info, is_remote, token.clone())?;
+            entry.captions = self.load_caption_value(
+                &tar_path,
+                &file_info,
+                txt_sidecar.as_ref(),
+                entry.json_data.as_deref(),
+                is_remote,
+                token,
+            )?;
+            Ok(Some(entry))
+        })
     }
 
     /// Load the first caption for a logical sample from metadata or a paired sidecar.
-    fn load_caption(&self, shard_idx: usize, sample_idx: usize) -> PyResult<Option<String>> {
+    fn load_caption(
+        &self,
+        py: Python,
+        shard_idx: usize,
+        sample_idx: usize,
+    ) -> PyResult<Option<Py<PyAny>>> {
         let mut dataset = self.dataset.lock().unwrap();
         ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
 
@@ -1198,7 +1240,12 @@ impl PyTarDataLoader {
             is_remote,
             token,
         )?;
-        Ok(captions.and_then(|value| value.first().map(str::to_owned)))
+        captions
+            .as_ref()
+            .and_then(CaptionValue::first)
+            .map(|caption| pythonize::pythonize(py, caption).map(Bound::unbind))
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Fold sidecar captions into normal webshart metadata JSON files.
@@ -1301,7 +1348,7 @@ impl PyTarDataLoader {
         shard_idx: usize,
         sample_idx: usize,
     ) -> PyResult<Option<Py<PyBytes>>> {
-        let Some(entry) = self.load_sample(shard_idx, sample_idx)? else {
+        let Some(entry) = self.load_sample(py, shard_idx, sample_idx)? else {
             return Ok(None);
         };
         Ok(entry
@@ -1525,12 +1572,7 @@ impl PyTarDataLoader {
                 "Caption sidecar is not valid UTF-8: {error}"
             ))
         })?;
-        let caption = caption.trim();
-        if caption.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(CaptionValue::Single(caption.to_string())))
-        }
+        Ok(CaptionValue::from_text(&caption))
     }
 
     fn load_caption_value(
@@ -2042,11 +2084,15 @@ impl PyTarDataLoader {
 
             // Cache and acquire the read lock without an eviction race between
             // those operations.
-            if let Ok((cached_path, _lock)) = self.runtime.block_on(cache.cache_shard_for_reading(
+            let cached = self.runtime.block_on(cache.cache_shard_for_reading(
                 shard_name,
                 tar_path,
                 token.clone(),
-            )) {
+            ));
+            if let Err(WebshartError::Xet(_) | WebshartError::XetHttp(_)) = &cached {
+                return Err(cached.err().unwrap());
+            }
+            if let Ok((cached_path, _lock)) = cached {
                 let loader = create_file_loader(
                     &cached_path.to_string_lossy(),
                     false,
@@ -2263,10 +2309,7 @@ impl PyTarDataLoader {
             for (file_idx, filename, file_info) in file_entries {
                 let data = self
                     .load_single_file_data(&tar_path, &file_info, is_remote, token.clone())
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to load {}: {}", filename, e);
-                        Vec::new()
-                    });
+                    .or_else(|error| handle_file_read_error(&filename, error))?;
 
                 self.entry_buffer.push(create_tar_entry(
                     filename,
@@ -2307,10 +2350,15 @@ impl PyTarDataLoader {
 
             // Cache and acquire the read lock without an eviction race between
             // those operations.
-            if let Ok((cached_path, _lock)) = self
-                .runtime
-                .block_on(cache_clone.cache_shard_for_reading(shard_name, tar_path, token.clone()))
-            {
+            let cached = self.runtime.block_on(cache_clone.cache_shard_for_reading(
+                shard_name,
+                tar_path,
+                token.clone(),
+            ));
+            if let Err(WebshartError::Xet(_) | WebshartError::XetHttp(_)) = &cached {
+                return Err(cached.err().unwrap().into());
+            }
+            if let Ok((cached_path, _lock)) = cached {
                 use std::io::{Read, Seek, SeekFrom};
 
                 let mut file = std::fs::File::open(&cached_path).map_err(WebshartError::Io)?;
@@ -2364,6 +2412,23 @@ impl PyTarDataLoader {
         let ranges =
             plan_remote_byte_ranges(&file_entries, self.config.max_file_size, chunk_size_bytes);
         let fetch_result: Result<Vec<(RemoteByteRange, Vec<u8>)>> = self.runtime.block_on(async {
+            if let Some(file) = crate::xet::resolve(&url, token.as_deref()).await? {
+                use futures::{stream, StreamExt, TryStreamExt};
+                let client = crate::xet::client()?;
+                return stream::iter(ranges)
+                    .map(|range| {
+                        let file = file.clone();
+                        async move {
+                            let data = client
+                                .read_range(&file, range.start, range.end - range.start)
+                                .await?;
+                            Ok((range, data))
+                        }
+                    })
+                    .buffered(8)
+                    .try_collect()
+                    .await;
+            }
             let client = file_http_client()?;
             let mut fetched = Vec::with_capacity(ranges.len());
 
@@ -2425,14 +2490,12 @@ impl PyTarDataLoader {
                 }
                 Ok(())
             }
+            Err(error @ (WebshartError::Xet(_) | WebshartError::XetHttp(_))) => Err(error.into()),
             Err(_) => {
                 for (file_idx, filename, file_info) in file_entries {
                     let data = self
                         .load_single_file_data(&url, &file_info, true, token.clone())
-                        .unwrap_or_else(|error| {
-                            eprintln!("Failed to load {}: {}", filename, error);
-                            Vec::new()
-                        });
+                        .or_else(|error| handle_file_read_error(&filename, error))?;
                     self.entry_buffer.push(create_tar_entry(
                         filename,
                         &file_info,
