@@ -28,7 +28,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install maturin[patchelf] pytest tqdm
+        pip install maturin[patchelf] pytest tqdm pyarrow
     
     - name: Build and install package
       run: |

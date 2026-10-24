@@ -434,7 +434,109 @@ for bucket_key, entries in buckets.items():
 
 This uses logical samples from `metadata.sample_range()` / `get_sample_by_index()` and excludes paired JSON sidecars before bucketing. Each bucket entry includes `sample_idx`, so callers can build stable IDs and load images directly with `loader.load_sample(shard_idx, sample_idx)`.
 
-## Why is it fast?
+## Parquet Payloads With Custom Metadata
+
+The Parquet API is available in this source checkout (not in the published 0.6.0
+wheel). Existing tar APIs keep their behavior. Use `ParquetDataLoader`, not
+`TarDataLoader` or `BucketDataLoader`, for Parquet sources:
+
+```python
+dataset = webshart.discover_dataset(
+    "InternVL-U/ScaleEdit-12M",
+    format="parquet",
+    metadata="webshart/ScaleEdit-12M-metadata",
+)
+loader = webshart.ParquetDataLoader(
+    dataset, image_columns=["source_image", "edited_image"]
+)
+metadata = loader.get_metadata(0, 0)
+sample = loader.load_sample(0, 0)
+edited_bytes = sample.data
+source_bytes = sample.payloads["source_image"]
+instruction = sample.captions
+```
+
+Local directories work too. Without separate metadata, specify the source column
+names with `image_column`, `caption_column`, `width_column`, and `height_column`.
+`discover_parquet_dataset(...)` is equivalent to discovery with `format="parquet"`.
+Hub discovery requires `webshart[hub]`; payload decoding is native Rust and does
+not require PyArrow, `datasets`, or `hf_xet`. Hub payload ranges reuse webshart's
+native Xet transport, with HTTP Range for non-Xet files.
+
+### Metadata manifest
+
+Pass a local metadata directory or Hub dataset repository containing
+`webshart-parquet.json`. The source files stay unchanged. For example:
+
+```json
+{
+  "format": "webshart-parquet",
+  "version": 1,
+  "source": {"repo_id": "owner/source", "revision": "<40-character commit SHA>"},
+  "columns": {"image": "image", "captions": "instruction", "width": "width", "height": "height"},
+  "metadata_mode": "overlay",
+  "shards": [{
+    "path": "data/part-000.parquet",
+    "num_rows": 2,
+    "metadata_path": "custom/part-000.json"
+  }]
+}
+```
+
+The JSON metadata file is a list of row objects:
+
+```json
+[
+  {"source_row": 1, "captions": [{"scene": "sunset"}, "warm lighting"], "rating": 5},
+  {"source_row": 0, "captions": {"scene": "forest", "lighting": "soft"}}
+]
+```
+
+Alternatively, `metadata_path` can name a Parquet file with a `source_row`
+integer column and arbitrary custom columns. Row order and source IDs do not
+matter: the join uses the **source shard path plus zero-based physical row**.
+Optional `source_path` values must match the manifest. Duplicates, invalid row
+positions, unsafe paths, mismatched file sizes/row counts, and incorrect optional
+`metadata_sha256` checksums fail explicitly. `size`, when present, is the source
+Parquet file size in bytes. Remote manifests must pin their source commit;
+`metadata_revision` can additionally pin the metadata repository commit.
+
+`overlay` merges custom values over source non-binary columns and permits sparse
+overrides. Custom `captions`, `width`, and `height` override configured aliases.
+`replace` reads metadata only from the companion file and requires every row to
+be present. It avoids reading upstream metadata columns. Payload columns cannot
+be overridden. Metadata is cached per shard with a bounded LRU (default: one
+shard; adjust `metadata_cache_size`). Recreate the dataset after changing files.
+Companion files up to 64 MiB are buffered while decoding so many small Parquet
+pages do not cause repeated network round trips; image payload files are not.
+
+Parquet structs, lists, and maps retain their native Python representations.
+For mixed strings/objects that Parquet cannot represent in one homogeneous
+column, store JSON text and declare `"json_columns": ["captions"]` in the
+manifest (or discovery options). Only explicitly declared columns are parsed;
+ordinary caption strings are not guessed or stringified. Decimal values remain
+`decimal.Decimal`; date/time values use their Parquet integer units.
+
+### Streaming and access costs
+
+`loader.iter_shard(shard_index, start=0, stop=None)` streams selected image
+columns page by page, reusing dictionaries. `load_sample(shard_index, row_index)`
+skips preceding row groups but scans earlier rows within the selected group.
+Unlike indexed tar, compressed Parquet does **not** provide constant-cost
+per-image byte offsets. Prefer sequential iteration for large row groups.
+Memory scales with selected columns' decoded pages/dictionaries, not an entire
+shard; oversized dictionaries can still require hundreds of MiB. The
+`max_page_bytes` discovery option limits individual compressed page/footer reads
+(default 512 MiB), not total or decompressed memory.
+
+Binary image columns and Hugging Face `{bytes, path}` image structs are supported.
+Missing bytes produce `sample.data is None`; original structs remain in
+`sample.payloads`. External URLs/path-only images are **never fetched
+automatically**. Keep URL/hash metadata and apply your own retrieval policy.
+The loader does not rewrite or download whole source shards, and does not expose
+tar-only byte-offset, bucket, shard-cache, or field-rewrite APIs.
+
+## Why is indexed tar fast?
 
 **Problem**: Standard tar files require sequential reading. To get file #10,000, you must read through files #1-9,999 first.
 
