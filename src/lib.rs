@@ -7,6 +7,7 @@ mod extract;
 mod field_rename;
 mod metadata;
 mod metadata_resolver;
+mod parquet;
 mod xet;
 // Re-export main types
 use dataloader::{scale_dimensions, PyBucketDataLoader, PyTarDataLoader, PyTarFileEntry};
@@ -38,6 +39,8 @@ fn _webshart(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTarDataLoader>()?;
     m.add_class::<PyTarFileEntry>()?;
     m.add_class::<PyBucketDataLoader>()?;
+    m.add_class::<parquet::PyParquetFile>()?;
+    m.add_class::<parquet::PyParquetRows>()?;
     m.add_function(wrap_pyfunction!(scale_dimensions, m)?)?;
 
     Ok(())
