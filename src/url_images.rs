@@ -67,6 +67,14 @@ struct Probe {
     url_http_status: Option<u16>,
     download_bytes: Option<usize>,
     download_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_format: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recompression_status: Option<&'static str>,
     #[serde(skip)]
     image_data: Option<Vec<u8>>,
 }
@@ -165,6 +173,10 @@ impl PyURLImageClient {
             download_bytes: None,
             download_sha256: None,
             image_data: None,
+            stored_format: None,
+            stored_bytes: None,
+            stored_sha256: None,
+            recompression_status: None,
         };
         match self.download(url).await {
             Ok(data) => {
@@ -222,7 +234,7 @@ impl PyURLImageClient {
         })
     }
 
-    #[pyo3(signature = (urls, workers=32, max_pixels=64000000, capture_directory=None))]
+    #[pyo3(signature = (urls, workers=32, max_pixels=64000000, capture_directory=None, recompress_images=false, recompress_workers=2))]
     fn scan(
         &self,
         py: Python<'_>,
@@ -230,12 +242,26 @@ impl PyURLImageClient {
         workers: usize,
         max_pixels: usize,
         capture_directory: Option<String>,
+        recompress_images: bool,
+        recompress_workers: usize,
     ) -> PyResult<Py<PyAny>> {
         if workers == 0 || max_pixels == 0 {
             return Err(PyValueError::new_err(
                 "workers and max_pixels must be positive",
             ));
         }
+        if recompress_images && (capture_directory.is_none() || recompress_workers == 0) {
+            return Err(PyValueError::new_err(
+                "Recompression requires capture_directory and positive recompress_workers",
+            ));
+        }
+        if recompress_images && !py.detach(crate::recompress::available) {
+            return Err(PyValueError::new_err(
+                "JPEG XL recompression requires cjxl and djxl on PATH",
+            ));
+        }
+        let encoding_slots = tokio::sync::Semaphore::new(recompress_workers.max(1));
+        let slots = &encoding_slots;
         let result = py.detach(|| {
             runtime()?.block_on(async {
                 let capture_root = capture_directory.as_deref();
@@ -247,10 +273,34 @@ impl PyURLImageClient {
                         if let Some(data) = probe.image_data.take() {
                             let path = std::path::Path::new(capture_root.unwrap())
                                 .join(format!("{index}.bin"));
-                            tokio::task::spawn_blocking(move || std::fs::write(path, data))
-                                .await
-                                .map_err(|_| PyOSError::new_err("Image staging task failed"))?
-                                .map_err(|_| PyOSError::new_err("Cannot stage captured image"))?;
+                            let _permit = if recompress_images {
+                                Some(slots.acquire().await.map_err(|_| {
+                                    PyOSError::new_err("Recompression queue closed")
+                                })?)
+                            } else {
+                                None
+                            };
+                            let (size, digest, status) = tokio::task::spawn_blocking(move || {
+                                let (data, status) = if recompress_images {
+                                    crate::recompress::recompress(data, path.parent().unwrap())
+                                } else {
+                                    (data, "disabled")
+                                };
+                                let size = data.len();
+                                let digest = crate::digest_to_hex(Sha256::digest(&data));
+                                std::fs::write(path, data).map(|_| (size, digest, status))
+                            })
+                            .await
+                            .map_err(|_| PyOSError::new_err("Image staging task failed"))?
+                            .map_err(|_| PyOSError::new_err("Cannot stage captured image"))?;
+                            probe.stored_format = Some(if status == "recompressed" {
+                                "jxl"
+                            } else {
+                                "original"
+                            });
+                            probe.stored_bytes = Some(size);
+                            probe.stored_sha256 = Some(digest);
+                            probe.recompression_status = Some(status);
                         }
                         Ok::<_, PyErr>((index, probe))
                     }))

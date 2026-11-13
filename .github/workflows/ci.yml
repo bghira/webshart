@@ -24,6 +24,10 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
     
+    - name: Install optional JPEG XL tools
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y libjxl-tools
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip

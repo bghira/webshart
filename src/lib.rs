@@ -10,6 +10,7 @@ mod metadata_resolver;
 mod parquet;
 mod xet;
 mod url_images;
+mod recompress;
 // Re-export main types
 use dataloader::{scale_dimensions, PyBucketDataLoader, PyTarDataLoader, PyTarFileEntry};
 pub use dataloader::{AspectBucketIterator, BatchOperations, BatchResult, FileReadRequest};
