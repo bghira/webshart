@@ -595,6 +595,40 @@ scan: discarded image bytes must be downloaded again. Use separate upload
 repositories for different sources or revisions, and disjoint shard ranges
 for concurrent writers to one repository.
 
+For a separate uploader, give each producer a distinct child scan directory and
+matching staging directory, then add `--defer-uploads --no-local-images` with
+`--upload-repo`. For example, metadata in `./scans/000000` can stage bytes in
+`./buffer/000000` using `--staging-directory`. Downloads, native recompression,
+and image Parquet writing continue without waiting for Hub uploads.
+`--min-staging-free-bytes` pauses producers when the staging filesystem is low
+on free space. Keep staging directories exclusive to their corresponding scans.
+
+A separate process can periodically run:
+
+```bash
+webshart upload-capture-queue \
+  --destination ./scans --staging-directory ./buffer \
+  --upload-repo owner/dataset --min-bytes 1099511627776
+```
+
+The uploader consumes **completed child scans** once at least 1 TiB is pending.
+It retains individual Parquet files and uploads groups of at most 64 files per
+commit, with four transfer threads by default. Only one uploader may operate on
+a queue. The SDK equivalent is `upload_capture_queue`; its byte threshold,
+commit size, and transfer concurrency are configurable. Run with `--flush` after
+all producers finish to upload the final remainder. If resuming an interrupted
+batch, repeat until the returned `pending_bytes` is zero. Capture completion alone
+is not proof of upload completion.
+
+Active batch state and commit receipts remain with the scan metadata. A small
+receipt marker is committed alongside each remote file group, allowing retries
+to recognize a successful commit even if its acknowledgment was lost. Staged
+files are removed after the receipt and checkpoints are saved. Preserve both
+metadata and staging across restarts; missing pending image files cause an error
+rather than silently skipping rows. Deferred mode is part of scan identity;
+existing immediate-upload scans require an explicit checkpoint migration or a
+fresh destination before changing modes.
+
 The resulting `webshart-parquet.json` and `metadata/` files can be used locally
 or hosted together in a metadata-only Hub repository. Keep `scan-state.json`,
 `checkpoints/`, and `parts/` locally for resuming. Each completed invocation
