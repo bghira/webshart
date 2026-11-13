@@ -177,6 +177,12 @@ impl BatchOperations {
     }
 }
 
+impl Default for BatchOperations {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Helper functions for file reading
 async fn read_file_remote(
     tar_url: &str,

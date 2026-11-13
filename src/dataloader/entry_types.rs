@@ -178,7 +178,6 @@ pub struct BucketEntry {
     pub shard_idx: usize,
     pub filename: String,
     pub file_info: crate::metadata::FileInfo,
-    pub original_size: Option<(u32, u32)>,
 }
 
 pub fn create_tar_entry(

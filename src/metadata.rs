@@ -664,7 +664,7 @@ pub fn ensure_shard_metadata_with_retry(
             Ok(_) => return Ok(()),
             Err(e) => {
                 if attempts >= MAX_ATTEMPTS {
-                    return Err(e.into());
+                    return Err(e);
                 }
 
                 if matches!(e, WebshartError::RateLimited) || e.to_string().contains("429") {
@@ -676,7 +676,7 @@ pub fn ensure_shard_metadata_with_retry(
                     );
                     std::thread::sleep(wait_time);
                 } else {
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }

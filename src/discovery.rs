@@ -69,9 +69,7 @@ impl DiscoveredDataset {
                 "Remote metadata cannot be rewritten in place; provide a local destination directory and upload the rewritten indexes separately",
             ));
         }
-        let destination = destination
-            .map(|path| std::path::absolute(path))
-            .transpose()?;
+        let destination = destination.map(std::path::absolute).transpose()?;
         let resolver = MetadataResolver::new(
             self.metadata_source.clone(),
             self.discovery_token.clone(),
@@ -709,6 +707,12 @@ pub struct DatasetDiscovery {
     client: reqwest::Client,
     runtime: Arc<Runtime>,
     metadata_resolver: MetadataResolver,
+}
+
+impl Default for DatasetDiscovery {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DatasetDiscovery {

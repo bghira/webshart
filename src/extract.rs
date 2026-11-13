@@ -609,10 +609,7 @@ impl MetadataExtractor {
         }
 
         let response = request.send().await.map_err(|e| {
-            WebshartError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to connect: {}", e),
-            ))
+            WebshartError::Io(std::io::Error::other(format!("Failed to connect: {}", e)))
         })?;
 
         if !response.status().is_success() {
@@ -659,8 +656,7 @@ impl MetadataExtractor {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(std::result::Result::Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        let _ = tx.send(std::result::Result::Err(std::io::Error::other(
                             e.to_string(),
                         )));
                         break;
@@ -779,11 +775,7 @@ impl MetadataExtractor {
                             let file_hash = if compute_sha256 {
                                 if size == 0 {
                                     Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
-                                } else if let Some(h) = hasher {
-                                    Some(digest_to_hex(h.finalize()))
-                                } else {
-                                    None
-                                }
+                                } else { hasher.map(|h| digest_to_hex(h.finalize())) }
                             } else {
                                 None
                             };
@@ -828,8 +820,7 @@ impl MetadataExtractor {
                 files,
                 json_by_path,
             ))
-        }).await.map_err(|e| WebshartError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        }).await.map_err(|e| WebshartError::Io(std::io::Error::other(
             format!("Task join error: {}", e)
         )))??;
 
@@ -937,10 +928,8 @@ impl MetadataExtractor {
                         let file_hash = if self.compute_sha256 {
                             if size == 0 {
                                 Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
-                            } else if let Some(h) = hasher {
-                                Some(digest_to_hex(h.finalize()))
                             } else {
-                                None
+                                hasher.map(|h| digest_to_hex(h.finalize()))
                             }
                         } else {
                             None
@@ -1044,16 +1033,12 @@ impl MetadataExtractor {
     fn load_checkpoints(&self, dir: &str) -> Result<HashMap<String, ShardCheckpoint>> {
         let mut checkpoints = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Ok(checkpoint) =
-                                serde_json::from_str::<ShardCheckpoint>(&content)
-                            {
-                                checkpoints.insert(checkpoint.shard_name.clone(), checkpoint);
-                            }
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(checkpoint) = serde_json::from_str::<ShardCheckpoint>(&content) {
+                            checkpoints.insert(checkpoint.shard_name.clone(), checkpoint);
                         }
                     }
                 }

@@ -273,9 +273,6 @@ use config::DataLoaderConfig;
 pub use entry_types::{create_tar_entry, BucketEntry, PyTarFileEntry};
 use file_loading::{create_file_loader, file_http_client};
 
-// Re-export the entry type as it's part of the public API
-pub use entry_types::PyTarFileEntry as TarFileEntry;
-
 // Generate batch iterators using the macro
 impl_batch_iterator!(
     PyBatchIterator,
@@ -295,7 +292,6 @@ impl_batch_iterator!(
 #[pyclass]
 pub struct PyRangeIterator {
     loader: Py<PyTarDataLoader>,
-    start: usize,
     end: usize,
     current: usize,
 }
@@ -359,9 +355,7 @@ impl PyTarDataLoader {
         batch_size: Option<usize>,
     ) -> PyResult<Self> {
         let runtime =
-            Arc::new(Runtime::new().map_err(|e| {
-                WebshartError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-            })?);
+            Arc::new(Runtime::new().map_err(|e| WebshartError::Io(std::io::Error::other(e)))?);
 
         let (dataset, source) =
             if let Ok(py_dataset) = dataset_or_path.extract::<PyRef<PyDiscoveredDataset>>() {
@@ -579,7 +573,6 @@ impl PyTarDataLoader {
 
         Ok(PyRangeIterator {
             loader: slf.into(),
-            start,
             end,
             current: start,
         })
@@ -785,14 +778,14 @@ impl PyTarDataLoader {
         dict.set_item("name", &shard.name)?;
         dict.set_item("tar_path", &shard.tar_path)?;
 
-        if dataset.is_remote && dataset.shard_cache.is_some() {
+        if let Some(cache) = dataset.shard_cache.as_ref().filter(|_| dataset.is_remote) {
             let shard_name = shard
                 .tar_path
                 .rsplit('/')
                 .next()
                 .unwrap_or(&shard.tar_path)
                 .to_string();
-            let cache = dataset.shard_cache.as_ref().unwrap().clone();
+            let cache = cache.clone();
             drop(dataset);
 
             let is_cached = self.runtime.block_on(cache.is_cached(&shard_name));
@@ -816,14 +809,14 @@ impl PyTarDataLoader {
         dict.set_item("name", &shard.name)?;
         dict.set_item("tar_path", &shard.tar_path)?;
 
-        if dataset.is_remote && dataset.shard_cache.is_some() {
+        if let Some(cache) = dataset.shard_cache.as_ref().filter(|_| dataset.is_remote) {
             let shard_filename = shard
                 .tar_path
                 .rsplit('/')
                 .next()
                 .unwrap_or(&shard.tar_path)
                 .to_string();
-            let cache = dataset.shard_cache.as_ref().unwrap().clone();
+            let cache = cache.clone();
             drop(dataset);
 
             let (is_cached, size) = self.runtime.block_on(async {
@@ -859,9 +852,9 @@ impl PyTarDataLoader {
             dict.set_item("index", shard_idx)?;
             dict.set_item("name", &shard.name)?;
 
-            if dataset.is_remote && dataset.shard_cache.is_some() {
+            if let Some(cache) = dataset.shard_cache.as_ref().filter(|_| dataset.is_remote) {
                 let shard_name = shard.tar_path.rsplit('/').next().unwrap_or(&shard.tar_path);
-                let cache = dataset.shard_cache.as_ref().unwrap().clone();
+                let cache = cache.clone();
                 let is_cached = self.runtime.block_on(cache.is_cached(shard_name));
                 dict.set_item("is_cached", is_cached)?;
             } else {
@@ -1483,6 +1476,7 @@ impl PyTarDataLoader {
     }
 
     #[pyo3(signature = (shard_indices, key="aspect", target_pixel_area=None, target_resolution_multiple=64, round_to=Some(2), path_include=None, path_exclude=None, path_filter_mode="auto"))]
+    #[allow(clippy::too_many_arguments)] // Preserve the Python keyword argument interface.
     pub fn list_shard_sample_aspect_buckets_filtered(
         &self,
         py: Python,
@@ -1695,7 +1689,7 @@ impl PyTarDataLoader {
 
                 buckets
                     .entry(bucket_key)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(AspectBucketEntry {
                         filename: filename.to_string(),
                         file_info,
@@ -1766,7 +1760,7 @@ impl PyTarDataLoader {
 
                 buckets
                     .entry(bucket_key)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(AspectBucketEntry {
                         filename,
                         file_info,
@@ -1822,7 +1816,7 @@ impl PyTarDataLoader {
 
         for shard_idx in 0..num_shards {
             if dataset.shards[shard_idx].metadata.is_none() {
-                ensure_shard_metadata_with_retry(&mut *dataset, shard_idx)?;
+                ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
             }
 
             if let Some(metadata) = &dataset.shards[shard_idx].metadata {
@@ -2077,9 +2071,9 @@ impl PyTarDataLoader {
         let dataset = self.dataset.lock().unwrap();
 
         // If we have a shard cache and this is remote, try to get cached version
-        if is_remote && dataset.shard_cache.is_some() {
+        if let Some(cache) = dataset.shard_cache.as_ref().filter(|_| is_remote) {
             let shard_name = tar_path.rsplit('/').next().unwrap_or(tar_path);
-            let cache = dataset.shard_cache.as_ref().unwrap().clone();
+            let cache = cache.clone();
             drop(dataset); // Release lock before async operation
 
             // Cache and acquire the read lock without an eviction race between
@@ -2508,17 +2502,6 @@ impl PyTarDataLoader {
             }
         }
     }
-
-    fn load_single_file_data_no_lock(
-        &self,
-        tar_path: &str,
-        file_info: &FileInfo,
-        is_remote: bool,
-        token: Option<String>,
-    ) -> Result<Vec<u8>> {
-        let loader = create_file_loader(tar_path, is_remote, token, self.runtime.clone());
-        loader.load_file(file_info)
-    }
 }
 
 #[pyclass(name = "BucketDataLoader")]
@@ -2554,6 +2537,7 @@ impl BatchIterable<PyTarFileEntry> for PyBucketDataLoader {
 
 #[pymethods]
 impl PyBucketDataLoader {
+    #[allow(clippy::too_many_arguments)] // Preserve the Python constructor signature.
     #[new]
     #[pyo3(signature = (
         dataset_or_path,
@@ -2852,12 +2836,11 @@ impl PyBucketDataLoader {
                     shard_idx,
                     filename: bucket_entry.filename,
                     file_info: bucket_entry.file_info,
-                    original_size: bucket_entry.original_size,
                 };
 
                 self.buckets
                     .entry(bucket_key.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(entry);
             }
         }
