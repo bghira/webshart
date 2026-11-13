@@ -62,3 +62,21 @@ def test_staged_changes_are_checked(tmp_path, monkeypatch, capsys):
     subprocess.run(["git", "add", "."], check=True, capture_output=True)
     assert guard.main(["--staged"]) == 1
     assert capsys.readouterr().err.strip() == guard.BLOCKED
+
+
+def test_invalid_arguments_do_not_echo_input(capsys):
+    import pytest
+
+    with pytest.raises(SystemExit) as failure:
+        guard.main(["--private-value"])
+    assert failure.value.code == 2
+    assert capsys.readouterr().err.strip() == "Blocked: public text could not be checked."
+
+
+def test_empty_invocation_fails_closed(capsys):
+    import pytest
+
+    with pytest.raises(SystemExit) as failure:
+        guard.main([])
+    assert failure.value.code == 2
+    assert capsys.readouterr().err.strip() == "Blocked: public text could not be checked."

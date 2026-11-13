@@ -28,8 +28,13 @@ def git(*args):
     return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL).decode("utf-8", errors="replace")
 
 
+class PayloadParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, "Blocked: public text could not be checked.\n")
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = PayloadParser(description=__doc__)
     parser.add_argument("--text-file", action="append", default=[])
     parser.add_argument("--staged", action="store_true")
     parser.add_argument("--git-range")
