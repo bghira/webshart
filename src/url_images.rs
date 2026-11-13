@@ -67,6 +67,8 @@ struct Probe {
     url_http_status: Option<u16>,
     download_bytes: Option<usize>,
     download_sha256: Option<String>,
+    #[serde(skip)]
+    image_data: Option<Vec<u8>>,
 }
 
 #[pyclass(name = "_URLImageClient")]
@@ -154,7 +156,7 @@ impl PyURLImageClient {
         unreachable!()
     }
 
-    async fn probe(&self, url: Option<&str>, max_pixels: usize) -> Probe {
+    async fn probe(&self, url: Option<&str>, max_pixels: usize, capture: bool) -> Probe {
         let mut result = Probe {
             width: None,
             height: None,
@@ -162,6 +164,7 @@ impl PyURLImageClient {
             url_http_status: None,
             download_bytes: None,
             download_sha256: None,
+            image_data: None,
         };
         match self.download(url).await {
             Ok(data) => {
@@ -184,6 +187,9 @@ impl PyURLImageClient {
                         result.height = Some(size.height);
                     }
                     Err(_) => result.url_status = "invalid_image",
+                }
+                if capture && result.url_status == "ok" {
+                    result.image_data = Some(data);
                 }
             }
             Err(error) => {
@@ -216,13 +222,14 @@ impl PyURLImageClient {
         })
     }
 
-    #[pyo3(signature = (urls, workers=32, max_pixels=64000000))]
+    #[pyo3(signature = (urls, workers=32, max_pixels=64000000, capture_directory=None))]
     fn scan(
         &self,
         py: Python<'_>,
         urls: Vec<Option<String>>,
         workers: usize,
         max_pixels: usize,
+        capture_directory: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         if workers == 0 || max_pixels == 0 {
             return Err(PyValueError::new_err(
@@ -230,21 +237,34 @@ impl PyURLImageClient {
             ));
         }
         let result = py.detach(|| {
-            runtime().map(|rt| {
-                rt.block_on(async {
-                    let mut results: Vec<_> =
-                        stream::iter(urls.iter().enumerate().map(|(index, url)| async move {
-                            (index, self.probe(url.as_deref(), max_pixels).await)
-                        }))
-                        .buffer_unordered(workers)
-                        .collect()
-                        .await;
-                    results.sort_unstable_by_key(|(index, _)| *index);
-                    results
+            runtime()?.block_on(async {
+                let capture_root = capture_directory.as_deref();
+                let mut results: Vec<_> =
+                    stream::iter(urls.iter().enumerate().map(|(index, url)| async move {
+                        let mut probe = self
+                            .probe(url.as_deref(), max_pixels, capture_root.is_some())
+                            .await;
+                        if let Some(data) = probe.image_data.take() {
+                            let path = std::path::Path::new(capture_root.unwrap())
+                                .join(format!("{index}.bin"));
+                            tokio::task::spawn_blocking(move || std::fs::write(path, data))
+                                .await
+                                .map_err(|_| PyOSError::new_err("Image staging task failed"))?
+                                .map_err(|_| PyOSError::new_err("Cannot stage captured image"))?;
+                        }
+                        Ok::<_, PyErr>((index, probe))
+                    }))
+                    .buffer_unordered(workers)
+                    .collect()
+                    .await;
+                let mut ordered = results.drain(..).collect::<PyResult<Vec<_>>>()?;
+                ordered.sort_unstable_by_key(|(index, _)| *index);
+                Ok::<_, PyErr>(
+                    ordered
                         .into_iter()
                         .map(|(_, probe)| probe)
-                        .collect::<Vec<_>>()
-                })
+                        .collect::<Vec<_>>(),
+                )
             })
         })?;
         Ok(pythonize::pythonize(py, &result)?.unbind())
@@ -273,7 +293,7 @@ mod tests {
             .await;
         let client = PyURLImageClient::create(1.0, 2, 1024).unwrap();
         let probe = client
-            .probe(Some(&format!("{}/image", server.url())), 1000)
+            .probe(Some(&format!("{}/image", server.url())), 1000, false)
             .await;
         assert_eq!((probe.width, probe.height), (Some(17), Some(9)));
         assert_eq!(probe.url_status, "ok");

@@ -7,6 +7,10 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
+import tempfile
+import random
+import time
 
 from .parquet import MANIFEST, ParquetDataset, _integer
 from .url_images import URLImageClient, URLImageOptions
@@ -21,6 +25,18 @@ def _atomic_json(path, value):
     temporary.replace(path)
 
 
+def _upload_capture(api, **kwargs):
+    # Retry commit contention and transient service failures without refetching.
+    for attempt in range(8):
+        try:
+            return api.upload_file(**kwargs)
+        except Exception as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            if attempt == 7 or status is None or not (status in (408, 409, 429) or 500 <= status < 600):
+                raise
+            time.sleep(min(30, 2 ** attempt) + random.random())
+
+
 def scan_url_metadata(
     dataset: ParquetDataset,
     destination: str,
@@ -32,8 +48,14 @@ def scan_url_metadata(
     stop_shard: int | None = None,
     url_options: URLImageOptions | None = None,
     max_pixels: int = 64_000_000,
+    capture_images: bool = False,
+    upload_repo: str | None = None,
+    upload_repo_type: str = "dataset",
+    upload_endpoint: str | None = None,
+    upload_token: str | None = None,
+    keep_local_images: bool = True,
 ) -> dict:
-    """Fetch and discard images, checkpointing geometry and availability per batch.
+    """Checkpoint geometry and availability, optionally capturing image Parquet shards.
 
     ``max_samples`` limits new attempts in this invocation. Resume with the same
     source revision, shard range and fetch options. Worker count and invocation
@@ -61,6 +83,17 @@ def scan_url_metadata(
     )
     if not 0 <= start_shard < stop_shard <= dataset.num_shards:
         raise ValueError("Invalid shard range")
+    if upload_repo and not capture_images:
+        raise ValueError("upload_repo requires capture_images")
+    if not keep_local_images and not upload_repo:
+        raise ValueError("Discarding local images requires upload_repo")
+    if upload_repo_type not in {"dataset", "model"}:
+        raise ValueError("upload_repo_type must be dataset or model")
+    api = None
+    if upload_repo:
+        from huggingface_hub import HfApi
+        api = HfApi(endpoint=upload_endpoint, token=upload_token)
+        api.repo_info(upload_repo, repo_type=upload_repo_type)
     options = url_options or URLImageOptions()
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
@@ -78,6 +111,10 @@ def scan_url_metadata(
             "repo_id": dataset._source_repo.source,
             "revision": dataset.source_revision,
         }
+        if dataset._source_repo.endpoint:
+            source["endpoint"] = dataset._source_repo.endpoint
+        if dataset._source_repo.repo_type != "dataset":
+            source["repo_type"] = dataset._source_repo.repo_type
         shards = []
         for index in range(start_shard, stop_shard):
             record = dataset._shard(index)
@@ -99,6 +136,14 @@ def scan_url_metadata(
             "options": asdict(options),
             "max_pixels": max_pixels,
         }
+        if capture_images:
+            identity["capture"] = {
+                "format": "parquet-image-bytes-v1",
+                "upload_repo": upload_repo,
+                "upload_repo_type": upload_repo_type,
+                "upload_endpoint": api.endpoint if api else None,
+                "keep_local_images": keep_local_images,
+            }
         if state_path.exists():
             state = json.loads(state_path.read_text())
             if state["identity"] != identity:
@@ -108,6 +153,10 @@ def scan_url_metadata(
         else:
             state = {"identity": identity}
             _atomic_json(state_path, state)
+        # A previous process may have exited while native writers were staging bytes.
+        for stale in root.glob(".images-*"):
+            if stale.is_dir():
+                shutil.rmtree(stale)
         schema = pa.schema(
             [
                 ("source_row", pa.int64()),
@@ -119,6 +168,12 @@ def scan_url_metadata(
                 ("download_sha256", pa.string()),
             ]
         )
+
+        image_schema = pa.schema(list(schema) + [
+            ("source_shard", pa.int64()), ("url", pa.string()),
+            ("captions", pa.string()),
+            ("image", pa.struct([("bytes", pa.binary()), ("path", pa.string())])),
+        ])
 
         def checkpoint(index):
             return root / "checkpoints" / f"{index:06d}.json"
@@ -147,6 +202,18 @@ def scan_url_metadata(
                         != part["sha256"]
                     ):
                         raise ValueError("Changed scan checkpoint part")
+            if capture_images and keep_local_images:
+                for part in progress["parts"]:
+                    image_path = root / part["image_path"]
+                    if not image_path.is_file() or image_path.stat().st_size != part["image_size"]:
+                        raise ValueError("Missing or changed captured image part")
+                    with image_path.open("rb") as stream:
+                        if hashlib.file_digest(stream, "sha256").hexdigest() != part["image_sha256"]:
+                            raise ValueError("Changed captured image part")
+            if not keep_local_images:
+                for part in progress["parts"]:
+                    if part.get("image_path"):
+                        (root / part["image_path"]).unlink(missing_ok=True)
             reader = dataset._file(index)
             count = reader.info()["num_rows"]
             progress["num_rows"] = count
@@ -156,33 +223,84 @@ def scan_url_metadata(
                 else min(count, progress["next_row"] + max_samples - attempted)
             )
             rows = reader.rows(
-                columns=[dataset.image_url_column],
+                columns=list(dict.fromkeys([dataset.image_url_column] +
+                    ([dataset.caption_column] if capture_images and dataset.caption_column else []))),
                 start=progress["next_row"],
                 stop=stop,
             )
             while progress["next_row"] < stop:
                 start = progress["next_row"]
                 size = min(batch_size, stop - start)
-                batch = [
-                    (start + offset, next(rows)[dataset.image_url_column])
-                    for offset in range(size)
-                ]
-                results = client.scan(
-                    [url for _, url in batch], workers=workers, max_pixels=max_pixels
-                )
-                for (row, _), result in zip(batch, results, strict=True):
-                    result["source_row"] = row
                 relative = f"parts/{index:06d}/{start:012d}.parquet"
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = path.with_suffix(".tmp")
-                pq.write_table(pa.Table.from_pylist(results, schema=schema), temporary)
-                temporary.replace(path)
+                image_relative = f"data/{index:06d}/{start:012d}.parquet"
+                image_path = root / image_relative
+                # A pending upload keeps its original batch boundaries on resume.
+                pending = None
+                if capture_images and image_path.is_file() and path.is_file():
+                    pending = pq.read_table(path).to_pylist()
+                    if not pending or len(pending) > stop - start:
+                        pending = None
+                    elif [row["source_row"] for row in pending] != list(range(start, start + len(pending))):
+                        raise ValueError("Invalid staged capture row identities")
+                if pending is not None:
+                    size = len(pending)
+                batch = [next(rows) for _ in range(size)]
+                if pending is not None:
+                    results = pending
+                else:
+                    with tempfile.TemporaryDirectory(prefix=".images-", dir=root) as staging:
+                        scan_kwargs = {"workers": workers, "max_pixels": max_pixels}
+                        if capture_images:
+                            scan_kwargs["capture_directory"] = staging
+                        results = client.scan(
+                            [row[dataset.image_url_column] for row in batch], **scan_kwargs
+                        )
+                        for offset, result in enumerate(results):
+                            result["source_row"] = start + offset
+                        if capture_images:
+                            image_path.parent.mkdir(parents=True, exist_ok=True)
+                            temporary = image_path.with_suffix(".tmp")
+                            captured_schema = image_schema.with_metadata({
+                                "webshart.source": json.dumps(source),
+                                "webshart.source_path": dataset._shard(index)["path"],
+                            })
+                            with pq.ParquetWriter(temporary, captured_schema) as writer:
+                                captured_rows, captured_bytes = [], 0
+                                for offset, (row, result) in enumerate(zip(batch, results, strict=True)):
+                                    blob = Path(staging) / f"{offset}.bin"
+                                    captured = dict(result, source_shard=index,
+                                        url=row[dataset.image_url_column],
+                                        captions=row.get(dataset.caption_column),
+                                        image={"bytes": blob.read_bytes(), "path": None} if blob.exists() else None)
+                                    captured_rows.append(captured)
+                                    captured_bytes += blob.stat().st_size if blob.exists() else 0
+                                    if captured_bytes >= 16 * 1024 * 1024 or len(captured_rows) >= 32:
+                                        writer.write_table(pa.Table.from_pylist(captured_rows, schema=image_schema))
+                                        captured_rows, captured_bytes = [], 0
+                                if captured_rows:
+                                    writer.write_table(pa.Table.from_pylist(captured_rows, schema=image_schema))
+                            temporary.replace(image_path)
+                        temporary = path.with_suffix(".tmp")
+                        pq.write_table(pa.Table.from_pylist(results, schema=schema), temporary)
+                        temporary.replace(path)
                 with path.open("rb") as stream:
                     digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                progress["parts"].append(
-                    {"path": relative, "size": path.stat().st_size, "sha256": digest}
-                )
+                part = {"path": relative, "size": path.stat().st_size, "sha256": digest}
+                if capture_images:
+                    with image_path.open("rb") as stream:
+                        image_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                    part.update(image_path=image_relative, image_sha256=image_digest,
+                                image_size=image_path.stat().st_size)
+                    if api:
+                        commit = _upload_capture(api,
+                            repo_id=upload_repo, repo_type=upload_repo_type,
+                            path_in_repo=image_relative, path_or_fileobj=str(image_path),
+                            commit_message=f"Capture shard {index} rows {start}-{start + size}",
+                        )
+                        part["upload_commit"] = commit.oid
+                progress["parts"].append(part)
                 progress["next_row"] += size
                 attempted += size
                 counts = Counter(progress["counts"])
@@ -195,6 +313,8 @@ def scan_url_metadata(
                 progress["counts"] = dict(counts)
                 checkpoint(index).parent.mkdir(exist_ok=True)
                 _atomic_json(checkpoint(index), progress)
+                if capture_images and not keep_local_images:
+                    image_path.unlink(missing_ok=True)
             if count == 0:
                 checkpoint(index).parent.mkdir(exist_ok=True)
                 _atomic_json(checkpoint(index), progress)
