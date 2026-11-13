@@ -25,14 +25,24 @@ static DOWNLOAD_ID: AtomicU64 = AtomicU64::new(0);
 /// The lock is released when this struct is dropped.
 #[derive(Debug)]
 pub struct ShardLockGuard {
-    #[allow(dead_code)]
     file: std::fs::File,
 }
 
 #[derive(Debug)]
 struct ExclusiveLockGuard {
-    #[allow(dead_code)]
     file: std::fs::File,
+}
+
+impl Drop for ShardLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+impl Drop for ExclusiveLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 #[derive(Debug)]
@@ -584,6 +594,30 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn guards_release_locks_with_duplicate_handles() {
+        for shared in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("guard.lock");
+            let file = ShardCache::open_lock_file(&path).unwrap();
+            if shared {
+                FileExt::lock_shared(&file).unwrap();
+            } else {
+                file.lock_exclusive().unwrap();
+            }
+            let duplicate = file.try_clone().unwrap();
+            let competitor = ShardCache::open_lock_file(&path).unwrap();
+            assert!(competitor.try_lock_exclusive().is_err());
+            if shared {
+                drop(ShardLockGuard { file });
+            } else {
+                drop(ExclusiveLockGuard { file });
+            }
+            competitor.try_lock_exclusive().unwrap();
+            drop(duplicate);
+        }
+    }
 
     const CHILD_CACHE_DIR: &str = "WEBSHART_TEST_CHILD_CACHE_DIR";
     const CHILD_READY_PATH: &str = "WEBSHART_TEST_CHILD_READY_PATH";
