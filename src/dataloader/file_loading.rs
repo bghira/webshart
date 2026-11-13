@@ -107,7 +107,34 @@ pub(crate) async fn read_remote_range(
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(WebshartError::RateLimited);
     }
-    Ok(response.error_for_status()?.bytes().await?.to_vec())
+    let mut response = response.error_for_status()?;
+    let expected_range = format!("bytes {offset}-{end}/");
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        || !response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(&expected_range))
+    {
+        return Err(WebshartError::InvalidShardFormat(
+            "Remote server did not honor the requested byte range".into(),
+        ));
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if data.len() as u64 + chunk.len() as u64 > length {
+            return Err(WebshartError::InvalidShardFormat(
+                "Remote byte range exceeds requested length".into(),
+            ));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.len() as u64 != length {
+        return Err(WebshartError::InvalidShardFormat(
+            "Remote byte range was truncated".into(),
+        ));
+    }
+    Ok(data)
 }
 
 pub fn create_file_loader(

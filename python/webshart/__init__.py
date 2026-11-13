@@ -32,6 +32,12 @@ from webshart._webshart import (
     BucketDataLoader,
 )
 from .optimize import DEFAULT_PAYLOAD_EXTENSIONS, optimize_dataset
+from .parquet import (
+    ParquetDataset,
+    ParquetDataLoader,
+    ParquetSample,
+    discover_parquet_dataset,
+)
 
 __all__ = [
     "__version__",
@@ -57,6 +63,10 @@ __all__ = [
     "write_captions_to_metadata",
     "upload_caption_metadata",
     "optimize_dataset",
+    "ParquetDataset",
+    "ParquetDataLoader",
+    "ParquetSample",
+    "discover_parquet_dataset",
 ]
 
 
@@ -372,7 +382,10 @@ def discover_dataset(
     hf_token: Optional[str] = None,
     subfolder: Optional[str] = None,
     metadata: Optional[str] = None,
-) -> DiscoveredDataset:
+    *,
+    format: str = "tar",
+    **parquet_options: Any,
+) -> Union[DiscoveredDataset, ParquetDataset]:
     """
     Discover dataset shards from various sources (synchronous).
 
@@ -388,8 +401,19 @@ def discover_dataset(
             - Full URL prefix
 
     Returns:
-        DiscoveredDataset object with all shards discovered
+        DiscoveredDataset, or ParquetDataset when format="parquet". Parquet
+        options include revision, image_column, caption_column and json_columns.
     """
+    if format == "parquet":
+        return discover_parquet_dataset(
+            source,
+            hf_token=hf_token,
+            subfolder=subfolder,
+            metadata=metadata,
+            **parquet_options,
+        )
+    if format != "tar" or parquet_options:
+        raise ValueError("Use format='parquet' for Parquet-specific discovery options")
     hf_token = hf_token or os.environ.get("HF_TOKEN")
     discovery = DatasetDiscovery(hf_token=hf_token, metadata_source=metadata)
 

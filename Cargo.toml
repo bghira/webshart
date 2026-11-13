@@ -31,6 +31,8 @@ fs2 = "0.4.3"
 tempfile = "3.27.0"
 lz4_flex = "0.13.1"
 url = { version = "2.5", features = ["serde"] }
+bytes = "1"
+parquet = { version = "60", default-features = false, features = ["snap", "zstd", "flate2-zlib-rs", "lz4", "brotli"] }
 
 [dev-dependencies]
 mockito = "1.7.2"
