@@ -39,10 +39,12 @@ from .parquet import (
     discover_parquet_dataset,
 )
 from .url_images import URLImageError, URLImageOptions
+from .url_scan import scan_url_metadata
 
 __all__ = [
     "URLImageError",
     "URLImageOptions",
+    "scan_url_metadata",
     "__version__",
     "DatasetDiscovery",
     "DiscoveredDataset",
@@ -741,6 +743,26 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    scan_parser = subparsers.add_parser(
+        "scan-url-metadata",
+        help="Build resumable geometry and availability metadata for URL images",
+    )
+    scan_parser.add_argument("--source", required=True)
+    scan_parser.add_argument("--destination", required=True)
+    scan_parser.add_argument("--revision")
+    scan_parser.add_argument("--subfolder")
+    scan_parser.add_argument("--url-column", default="url")
+    scan_parser.add_argument("--caption-column", default="captions")
+    scan_parser.add_argument("--workers", type=int, default=32)
+    scan_parser.add_argument("--batch-size", type=int, default=1000)
+    scan_parser.add_argument("--max-samples", type=int)
+    scan_parser.add_argument("--start-shard", type=int, default=0)
+    scan_parser.add_argument("--stop-shard", type=int)
+    scan_parser.add_argument("--timeout", type=float, default=15)
+    scan_parser.add_argument("--retries", type=int, default=1)
+    scan_parser.add_argument("--max-bytes", type=int, default=32 * 1024 * 1024)
+    scan_parser.add_argument("--max-pixels", type=int, default=64_000_000)
+
     # extract-metadata subcommand
     extract_parser = subparsers.add_parser(
         "extract-metadata", help="Extract metadata from unindexed webdataset shards"
@@ -856,7 +878,31 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "extract-metadata":
+    if args.command == "scan-url-metadata":
+        try:
+            dataset = discover_parquet_dataset(
+                args.source,
+                revision=args.revision,
+                subfolder=args.subfolder,
+                image_url_column=args.url_column,
+                caption_column=args.caption_column,
+            )
+            summary = scan_url_metadata(
+                dataset,
+                args.destination,
+                workers=args.workers,
+                batch_size=args.batch_size,
+                max_samples=args.max_samples,
+                start_shard=args.start_shard,
+                stop_shard=args.stop_shard,
+                max_pixels=args.max_pixels,
+                url_options=URLImageOptions(args.timeout, args.retries, args.max_bytes),
+            )
+            print(json.dumps(summary, indent=2))
+        except Exception as exc:
+            print(f"Error scanning URL metadata: {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "extract-metadata":
         extract_metadata(args)
     elif args.command == "optimize-captions":
         try:
