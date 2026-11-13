@@ -154,15 +154,16 @@ def test_invalid_options(kwargs):
         webshart.URLImageOptions(**kwargs)
 
 
-
-
-
-
 def test_overlay_cannot_replace_url(tmp_path, server):
     dataset = source(tmp_path / "source", server[0])
     output = tmp_path / "metadata"
-    webshart.scan_url_metadata(dataset, str(output), max_samples=1)
-    path = output / "metadata" / "000000.parquet"
+    output.mkdir()
+    path = output / "overlay.parquet"
+    (output / "webshart-parquet.json").write_text(json.dumps({
+        "format": "webshart-parquet", "version": 1,
+        "columns": {"image_url": "url"},
+        "shards": [{**dataset.get_shard_info(0), "metadata_path": path.name}],
+    }))
     pq.write_table(
         pa.Table.from_pylist([{"source_row": 0, "url": server[0] + "/missing"}]), path
     )
@@ -171,12 +172,6 @@ def test_overlay_cannot_replace_url(tmp_path, server):
     )
     with pytest.raises(ValueError, match="payload"):
         loaded.get_metadata(0, 0)
-
-
-
-
-
-
 
 
 def test_native_metadata_cache_respects_limit_and_avoids_rereads(tmp_path, server):
