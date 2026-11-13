@@ -44,6 +44,8 @@ def server():
                 time.sleep(0.15)
                 hits["inflight"] -= 1
             data = b"<html>not an image</html>" if self.path == "/html" else content
+            if self.path == "/jpeg":
+                data = (Path(__file__).parent / "fixtures" / "recompression.jpg").read_bytes()
             self.send_response(200)
             if self.path != "/no-length":
                 self.send_header("Content-Length", str(len(data)))
@@ -395,3 +397,53 @@ def test_capture_upload_retries_transient_commit_errors(monkeypatch):
     assert scan_module._upload_capture(Hub(), path_in_repo="data/part.parquet") == "committed"
     assert len(sleeps) == 2 and len(attempts) == 3
     assert 1 <= sleeps[0] < 2 and 2 <= sleeps[1] < 3
+
+
+def test_jxl_capture_exact_reconstruction(tmp_path, server):
+    import hashlib
+    import shutil
+    import subprocess
+
+    if not all(shutil.which(tool) for tool in ("cjxl", "djxl")):
+        pytest.skip("optional JPEG XL tools are not installed")
+    base, _, _, _ = server
+    root = tmp_path / "source"
+    root.mkdir()
+    pq.write_table(pa.Table.from_pylist([
+        {"url": base + "/jpeg", "captions": "jpeg"},
+        {"url": base + "/image", "captions": "png"},
+        {"url": base + "/missing", "captions": "missing"},
+    ]), root / "part.parquet")
+    dataset = webshart.discover_parquet_dataset(str(root), image_url_column="url")
+    out = tmp_path / "out"
+    summary = webshart.scan_url_metadata(dataset, str(out), capture_images=True,
+                                        recompress_images=True, recompress_workers=1)
+    assert summary["complete"]
+    rows = pq.read_table(next(out.glob("data/*/*.parquet"))).to_pylist()
+    original = (Path(__file__).parent / "fixtures" / "recompression.jpg").read_bytes()
+    jpeg = rows[0]
+    assert jpeg["stored_format"] == "jxl" and jpeg["recompression_status"] == "recompressed"
+    assert jpeg["stored_bytes"] < jpeg["download_bytes"] == len(original)
+    assert jpeg["stored_sha256"] == hashlib.sha256(jpeg["image"]["bytes"]).hexdigest()
+    assert jpeg["download_sha256"] == hashlib.sha256(original).hexdigest()
+    compressed = tmp_path / "image.jxl"
+    restored = tmp_path / "restored.jpg"
+    compressed.write_bytes(jpeg["image"]["bytes"])
+    subprocess.run(["djxl", str(compressed), str(restored), "--quiet"], check=True)
+    assert restored.read_bytes() == original
+    assert rows[1]["stored_format"] == "original"
+    assert rows[1]["recompression_status"] == "unsupported_format"
+    assert rows[1]["stored_sha256"] == rows[1]["download_sha256"]
+    assert rows[2]["image"] is None
+    with pytest.raises(ValueError, match="options changed"):
+        webshart.scan_url_metadata(dataset, str(out), capture_images=True)
+
+
+def test_jxl_capture_requires_tools_and_capture(tmp_path, server, monkeypatch):
+    base, _, _, _ = server
+    dataset = source(tmp_path / "source", base)
+    with pytest.raises(ValueError, match="requires capture_images"):
+        webshart.scan_url_metadata(dataset, str(tmp_path / "out"), recompress_images=True)
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(ValueError, match="requires cjxl and djxl"):
+        webshart.scan_url_metadata(dataset, str(tmp_path / "out"), capture_images=True, recompress_images=True)

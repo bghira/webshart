@@ -49,6 +49,8 @@ def scan_url_metadata(
     url_options: URLImageOptions | None = None,
     max_pixels: int = 64_000_000,
     capture_images: bool = False,
+    recompress_images: bool = False,
+    recompress_workers: int = 2,
     upload_repo: str | None = None,
     upload_repo_type: str = "dataset",
     upload_endpoint: str | None = None,
@@ -83,6 +85,9 @@ def scan_url_metadata(
     )
     if not 0 <= start_shard < stop_shard <= dataset.num_shards:
         raise ValueError("Invalid shard range")
+    recompress_workers = _integer(recompress_workers, "recompress_workers", 1)
+    if recompress_images and not capture_images:
+        raise ValueError("recompress_images requires capture_images")
     if upload_repo and not capture_images:
         raise ValueError("upload_repo requires capture_images")
     if not keep_local_images and not upload_repo:
@@ -144,6 +149,8 @@ def scan_url_metadata(
                 "upload_endpoint": api.endpoint if api else None,
                 "keep_local_images": keep_local_images,
             }
+        if recompress_images:
+            identity["recompression"] = "jxl-jpeg-lossless-effort3-verified-v1"
         if state_path.exists():
             state = json.loads(state_path.read_text())
             if state["identity"] != identity:
@@ -169,7 +176,13 @@ def scan_url_metadata(
             ]
         )
 
-        image_schema = pa.schema(list(schema) + [
+        storage_fields = [
+            ("stored_format", pa.string()), ("stored_bytes", pa.int64()),
+            ("stored_sha256", pa.string()), ("recompression_status", pa.string()),
+        ]
+        if recompress_images:
+            schema = pa.schema(list(schema) + storage_fields)
+        image_schema = pa.schema(list(schema) + ([] if recompress_images else storage_fields) + [
             ("source_shard", pa.int64()), ("url", pa.string()),
             ("captions", pa.string()),
             ("image", pa.struct([("bytes", pa.binary()), ("path", pa.string())])),
@@ -254,6 +267,8 @@ def scan_url_metadata(
                         scan_kwargs = {"workers": workers, "max_pixels": max_pixels}
                         if capture_images:
                             scan_kwargs["capture_directory"] = staging
+                        if recompress_images:
+                            scan_kwargs.update(recompress_images=True, recompress_workers=recompress_workers)
                         results = client.scan(
                             [row[dataset.image_url_column] for row in batch], **scan_kwargs
                         )

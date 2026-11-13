@@ -545,6 +545,26 @@ null images and their failure status. Filter `url_status == "ok"` for training.
 Rust stages successful downloads while Python writes bounded Arrow row groups;
 images are fetched only once per successful batch.
 
+Optional `--recompress-images` (SDK: `recompress_images=True`) losslessly
+recompresses captured JPEGs to JPEG XL. Install the reference `cjxl` and `djxl`
+tools on `PATH`; missing tools fail the scan before downloading a batch. Rust
+invokes the codecs without a shell, limits each codec to one thread, reconstructs
+the JPEG, and compares the reconstructed file byte for byte with the download.
+Only smaller, verified results replace originals. Other formats, codec failures,
+and conversions that do not save space retain the original bytes. This is JPEG
+bitstream recompression, not lossy pixel re-encoding.
+
+`--recompress-workers` (SDK: `recompress_workers`, default 2) separately bounds
+encoding concurrency per scan invocation. Codec calls have a 60-second timeout
+each. Rust performs staging, hashing, verification, and cleanup with the Python
+GIL released. The codec implementation is supplied by the external libjxl tools.
+Captured rows include `stored_format` (`jxl` or `original`), `stored_bytes`,
+`stored_sha256`, and `recompression_status`; the existing `download_*` fields
+always describe the original response. Failed downloads have null storage fields.
+JXL bytes require a compatible training decoder or JPEG reconstruction with
+`djxl`; webshart returns the stored bytes unchanged. Enabling recompression
+requires a fresh scan destination so a resume cannot silently mix policies.
+
 To upload each completed shard and discard its local image copy, add:
 
 ```bash
