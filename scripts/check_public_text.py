@@ -40,7 +40,7 @@ def main(argv=None):
             payloads.append(git("diff", "--cached", "--binary", "--no-ext-diff"))
         if args.git_range:
             payloads.extend([git("diff", "--binary", "--no-ext-diff", args.git_range),
-                             git("log", "--format=%B", args.git_range)])
+                             git("log", "--format=%B", "--patch", "--binary", "--no-ext-diff", args.git_range)])
         if not payloads:
             parser.error("Provide an exact text file, staged diff, or commit range")
         if any(contains_private_text(value) for value in payloads):
