@@ -162,10 +162,10 @@ impl ShardCache {
         // The semaphore limits this process. The file lock prevents a second
         // process using the same cache directory from downloading the same shard.
         let _permit = self.download_semaphore.acquire().await.map_err(|e| {
-            WebshartError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to acquire download permit: {}", e),
-            ))
+            WebshartError::Io(std::io::Error::other(format!(
+                "Failed to acquire download permit: {}",
+                e
+            )))
         })?;
         let _download_lock = self
             .lock_exclusive(self.download_lock_path(shard_name))
@@ -257,7 +257,7 @@ impl ShardCache {
             bytes_written += chunk.len() as u64;
             file.write_all(&chunk).await.map_err(WebshartError::Io)?;
 
-            if bytes_written % (1024 * 1024) == 0 {
+            if bytes_written.is_multiple_of(1024 * 1024) {
                 file.sync_data().await.map_err(WebshartError::Io)?;
             }
         }
@@ -532,10 +532,10 @@ impl ShardCache {
     }
 
     fn join_error(error: tokio::task::JoinError) -> WebshartError {
-        WebshartError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Cache lock task failed: {}", error),
-        ))
+        WebshartError::Io(std::io::Error::other(format!(
+            "Cache lock task failed: {}",
+            error
+        )))
     }
 
     fn shard_key(shard_name: &str) -> String {
