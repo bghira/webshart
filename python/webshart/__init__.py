@@ -38,8 +38,11 @@ from .parquet import (
     ParquetSample,
     discover_parquet_dataset,
 )
+from .url_images import URLImageError, URLImageOptions
 
 __all__ = [
+    "URLImageError",
+    "URLImageOptions",
     "__version__",
     "DatasetDiscovery",
     "DiscoveredDataset",

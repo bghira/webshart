@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ._webshart import _ParquetFile
+from .url_images import URLImageError, URLImageOptions, URLImageClient
 
 
 MANIFEST = "webshart-parquet.json"
@@ -140,11 +141,13 @@ class ParquetDataset:
         metadata_revision: str | None = None,
         subfolder: str | None = None,
         image_column: str | None = None,
+        image_url_column: str | None = None,
         caption_column: str | None = None,
         width_column: str | None = None,
         height_column: str | None = None,
         json_columns: list[str] | None = None,
         metadata_cache_size: int = 1,
+        url_metadata_cache_bytes: int = 128 * 1024 * 1024,
         max_page_bytes: int = 512 * 1024 * 1024,
     ):
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
@@ -160,6 +163,9 @@ class ParquetDataset:
             metadata_cache_size, "metadata_cache_size", 1
         )
         self.max_page_bytes = _integer(max_page_bytes, "max_page_bytes", 1)
+        self.url_metadata_cache_bytes = _integer(
+            url_metadata_cache_bytes, "url_metadata_cache_bytes"
+        )
         self._metadata_cache: OrderedDict[int, dict[int, dict]] = OrderedDict()
         self._files: OrderedDict[int, _ParquetFile] = OrderedDict()
         self._metadata_repo = None
@@ -198,6 +204,11 @@ class ParquetDataset:
         )
         columns = manifest.get("columns", {})
         self.image_column = image_column or columns.get("image", "image")
+        self.image_url_column = image_url_column or columns.get("image_url")
+        if self.image_url_column is not None and (
+            not isinstance(self.image_url_column, str) or not self.image_url_column
+        ):
+            raise ValueError("image_url_column must be a nonempty column name")
         self.caption_column = caption_column or columns.get("captions", "captions")
         self.width_column = width_column or columns.get("width", "width")
         self.height_column = height_column or columns.get("height", "height")
@@ -324,6 +335,8 @@ class ParquetDataset:
             self._metadata_cache.move_to_end(index)
             return self._metadata_cache[index]
         reader = self._file(index)
+        if self.image_url_column and self.metadata_mode == "overlay":
+            reader.cache_source(self.url_metadata_cache_bytes)
         shard = self._shard(index)
         info = reader.info()
         binary_columns = set(info["binary_columns"])
@@ -371,7 +384,11 @@ class ParquetDataset:
                     raise ValueError("Duplicate or out-of-bounds metadata source_row")
                 if "source_path" in row and row["source_path"] != shard["path"]:
                     raise ValueError("Metadata source_path does not match its shard")
-                if binary_columns.intersection(row) or self.image_column in row:
+                if (
+                    binary_columns.intersection(row)
+                    or self.image_column in row
+                    or self.image_url_column in row
+                ):
                     raise ValueError("Custom metadata cannot override payload columns")
                 seen.add(row_index)
                 records.setdefault(row_index, {}).update(self._decode(row))
@@ -411,14 +428,15 @@ class ParquetDataset:
 class ParquetSample:
     """Decoded bytes and native metadata for a physical Parquet row.
 
-    ``data`` is None for missing/external images. ``payloads`` retains every
-    requested binary or Hugging Face image-struct value; URLs are never fetched.
+    ``data`` is None for missing images or disabled/failed URL reads. ``payloads`` retains every
+    requested source value. URL fetching requires explicit loader opt-in.
     """
 
     path: str
     data: bytes | None
     metadata: dict[str, Any]
     payloads: dict[str, Any]
+    error: str | None = None
 
     @property
     def size(self) -> int:
@@ -454,13 +472,34 @@ class ParquetDataLoader:
     """
 
     def __init__(
-        self, dataset: ParquetDataset, *, image_columns: list[str] | None = None
+        self,
+        dataset: ParquetDataset,
+        *,
+        image_columns: list[str] | None = None,
+        fetch_external_urls: bool = False,
+        url_options: URLImageOptions | None = None,
+        on_url_error: str = "raise",
     ):
         if not isinstance(dataset, ParquetDataset):
             raise TypeError("ParquetDataLoader requires a ParquetDataset")
         self.dataset = dataset
+        if on_url_error not in {"raise", "return"}:
+            raise ValueError("on_url_error must be 'raise' or 'return'")
+        if fetch_external_urls and not dataset.image_url_column:
+            raise ValueError("URL fetching requires image_url_column")
+        self.fetch_external_urls = fetch_external_urls
+        self.url_options = url_options or URLImageOptions()
+        self.on_url_error = on_url_error
+        self._url_client = (
+            URLImageClient(self.url_options) if fetch_external_urls else None
+        )
         self.image_columns = list(
-            dict.fromkeys([dataset.image_column, *(image_columns or [])])
+            dict.fromkeys(
+                [
+                    dataset.image_url_column or dataset.image_column,
+                    *(image_columns or []),
+                ]
+            )
         )
 
     def __len__(self) -> int:
@@ -472,8 +511,21 @@ class ParquetDataLoader:
     def _sample(
         self, shard_index: int, sample_index: int, payloads: dict
     ) -> ParquetSample:
-        value = payloads[self.dataset.image_column]
-        data = value.get("bytes") if isinstance(value, dict) else value
+        error = None
+        if self.dataset.image_url_column:
+            data = None
+            if self.fetch_external_urls:
+                try:
+                    data = self._url_client.fetch(
+                        payloads[self.dataset.image_url_column]
+                    )
+                except URLImageError as failure:
+                    if self.on_url_error == "raise":
+                        raise
+                    error = str(failure)
+        else:
+            value = payloads[self.dataset.image_column]
+            data = value.get("bytes") if isinstance(value, dict) else value
         if data is not None and not isinstance(data, bytes):
             raise TypeError(
                 "Image column must contain binary bytes or an image struct with bytes/path"
@@ -484,6 +536,7 @@ class ParquetDataLoader:
             data=data,
             metadata=metadata,
             payloads=payloads,
+            error=error,
         )
 
     def load_sample(self, shard_index: int, sample_index: int) -> ParquetSample:
