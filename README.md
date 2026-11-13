@@ -505,6 +505,64 @@ URL-source metadata reads use a bounded native Parquet cache to avoid repeated
 small network reads. `url_metadata_cache_bytes` defaults to 128 MiB per cached
 source shard; larger files use the existing page reader. Set it to zero to
 disable this cache. This caches source Parquet bytes, never fetched image bytes.
+The geometry scanner projects only the URL column and does not fill this cache.
+
+### Scanning image dimensions and availability
+
+Install `webshart[scan]` to build metadata overlays. The Rust scanner fetches
+images concurrently, reads dimensions from their headers, computes downloaded
+byte hashes, and discards image bytes. Python writes checkpointed Parquet
+metadata. Header inspection is not a full pixel decode or image-quality check.
+
+Start with a bounded pilot and pin the source revision for repeatable resumes:
+
+```bash
+webshart scan-url-metadata \
+  --source UCSC-VLAA/Recap-DataComp-1B \
+  --revision 457c44d98651bcfdfb3cc8695f5e60a0d2705e78 \
+  --subfolder data/train_data \
+  --url-column url --caption-column re_caption \
+  --destination ./recap-metadata \
+  --workers 128 --batch-size 1000 \
+  --timeout 10 --retries 1 --max-bytes 16777216 \
+  --max-samples 1000
+```
+
+`--workers` bounds simultaneous native requests, not Python threads. Peak image
+buffer memory scales with concurrency times `--max-bytes`; metadata batches are
+bounded by `--batch-size`. Checkpoints are separate per source shard. Re-running
+with the same source and fetch options resumes after committed batches;
+`--max-samples` limits **new** attempts in each invocation. Worker count and batch
+size may change. An interrupted batch is retried. Previously recorded failures
+are retained; use a fresh destination to reassess them. Do not run two writers
+against the same destination. For distributed scans, use disjoint
+`--start-shard`/`--stop-shard` ranges and separate output directories.
+
+The resulting `webshart-parquet.json` and `metadata/` files can be used locally
+or hosted together in a metadata-only Hub repository. Keep `scan-state.json`,
+`checkpoints/`, and `parts/` locally for resuming. Each completed invocation
+publishes an overlay covering the rows attempted so far, including partial
+shards; unscanned rows retain their original metadata.
+
+```python
+dataset = webshart.discover_parquet_dataset(
+    "UCSC-VLAA/Recap-DataComp-1B",
+    metadata="./recap-metadata",
+)
+loader = webshart.ParquetDataLoader(dataset, fetch_external_urls=True)
+metadata = loader.get_metadata(0, 0)
+if metadata.get("url_status") == "ok":
+    image = loader.load_sample(0, 0)
+```
+
+Overlay rows include `width`, `height`, `url_status`, `url_http_status`,
+`download_bytes`, and `download_sha256`. `scan-summary.json` separates successful
+geometry reads, HTTP status codes, timeouts, network errors, size limits and
+invalid images. These are observations from one scan: access denial, temporary
+failures, and unsupported formats are not proof of permanent link rot. A prefix
+pilot is not a representative estimate of availability across the whole dataset.
+Image URLs can change even when the Parquet source revision is pinned, and a
+successful scan does not guarantee a later training request will succeed.
 
 ### Metadata manifest format
 

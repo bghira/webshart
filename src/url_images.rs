@@ -1,9 +1,12 @@
 //! On-demand HTTP image payloads and concurrent geometry probes.
 
+use futures::{stream, StreamExt};
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use reqwest::{Client, Url};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -54,6 +57,16 @@ fn valid_url(url: &Url) -> bool {
         && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
+}
+
+#[derive(Serialize)]
+struct Probe {
+    width: Option<usize>,
+    height: Option<usize>,
+    url_status: &'static str,
+    url_http_status: Option<u16>,
+    download_bytes: Option<usize>,
+    download_sha256: Option<String>,
 }
 
 #[pyclass(name = "_URLImageClient")]
@@ -140,6 +153,46 @@ impl PyURLImageClient {
         }
         unreachable!()
     }
+
+    async fn probe(&self, url: Option<&str>, max_pixels: usize) -> Probe {
+        let mut result = Probe {
+            width: None,
+            height: None,
+            url_status: "ok",
+            url_http_status: None,
+            download_bytes: None,
+            download_sha256: None,
+        };
+        match self.download(url).await {
+            Ok(data) => {
+                result.download_bytes = Some(data.len());
+                result.download_sha256 = Some(crate::digest_to_hex(Sha256::digest(&data)));
+                match imagesize::blob_size(&data) {
+                    Ok(size) if size.width == 0 || size.height == 0 => {
+                        result.url_status = "invalid_image"
+                    }
+                    Ok(size)
+                        if size
+                            .width
+                            .checked_mul(size.height)
+                            .is_none_or(|n| n > max_pixels) =>
+                    {
+                        result.url_status = "too_many_pixels"
+                    }
+                    Ok(size) => {
+                        result.width = Some(size.width);
+                        result.height = Some(size.height);
+                    }
+                    Err(_) => result.url_status = "invalid_image",
+                }
+            }
+            Err(error) => {
+                result.url_status = error.code;
+                result.url_http_status = error.status;
+            }
+        }
+        result
+    }
 }
 
 #[pymethods]
@@ -162,6 +215,40 @@ impl PyURLImageClient {
             Err(error) => (None, Some(error.code.to_string()), error.status),
         })
     }
+
+    #[pyo3(signature = (urls, workers=32, max_pixels=64000000))]
+    fn scan(
+        &self,
+        py: Python<'_>,
+        urls: Vec<Option<String>>,
+        workers: usize,
+        max_pixels: usize,
+    ) -> PyResult<Py<PyAny>> {
+        if workers == 0 || max_pixels == 0 {
+            return Err(PyValueError::new_err(
+                "workers and max_pixels must be positive",
+            ));
+        }
+        let result = py.detach(|| {
+            runtime().map(|rt| {
+                rt.block_on(async {
+                    let mut results: Vec<_> =
+                        stream::iter(urls.iter().enumerate().map(|(index, url)| async move {
+                            (index, self.probe(url.as_deref(), max_pixels).await)
+                        }))
+                        .buffer_unordered(workers)
+                        .collect()
+                        .await;
+                    results.sort_unstable_by_key(|(index, _)| *index);
+                    results
+                        .into_iter()
+                        .map(|(_, probe)| probe)
+                        .collect::<Vec<_>>()
+                })
+            })
+        })?;
+        Ok(pythonize::pythonize(py, &result)?.unbind())
+    }
 }
 
 #[cfg(test)]
@@ -169,7 +256,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn bounds_errors_and_payload() {
+    async fn bounds_errors_and_geometry() {
         let mut server = mockito::Server::new_async().await;
         let ok = server
             .mock("GET", "/image")
@@ -185,11 +272,11 @@ mod tests {
             .create_async()
             .await;
         let client = PyURLImageClient::create(1.0, 2, 1024).unwrap();
-        let data = client
-            .download(Some(&format!("{}/image", server.url())))
-            .await
-            .unwrap();
-        assert_eq!(data, include_bytes!("../tests/fixtures/url-image.png"));
+        let probe = client
+            .probe(Some(&format!("{}/image", server.url())), 1000)
+            .await;
+        assert_eq!((probe.width, probe.height), (Some(17), Some(9)));
+        assert_eq!(probe.url_status, "ok");
         let error = client
             .download(Some(&format!("{}/missing", server.url())))
             .await
