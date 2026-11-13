@@ -463,7 +463,50 @@ Hub discovery requires `webshart[hub]`; payload decoding is native Rust and does
 not require PyArrow, `datasets`, or `hf_xet`. Hub payload ranges reuse webshart's
 native Xet transport, with HTTP Range for non-Xet files.
 
-### Metadata manifest
+### Online images from URL columns
+
+URL-only Parquet datasets such as
+[Recap-DataComp-1B](https://huggingface.co/datasets/UCSC-VLAA/Recap-DataComp-1B)
+can use the same metadata overlays without storing a second copy of the images:
+
+```python
+dataset = webshart.discover_parquet_dataset(
+    "UCSC-VLAA/Recap-DataComp-1B",
+    subfolder="data/train_data",
+    image_url_column="url",
+    caption_column="re_caption",
+)
+loader = webshart.ParquetDataLoader(
+    dataset,
+    fetch_external_urls=True,
+    url_options=webshart.URLImageOptions(timeout=10, retries=1, max_bytes=16 * 1024**2),
+    on_url_error="return",
+)
+sample = loader.load_sample(0, 0)
+if sample.error is None and sample.data is not None:
+    image_bytes, caption = sample.data, sample.captions
+```
+
+Discovery and `get_metadata()` never fetch external images. Without
+`fetch_external_urls=True`, URL samples have `data=None`. With it enabled,
+Rust fetches HTTP(S) bytes on demand using a reusable connection pool, bounded
+response sizes, a timeout covering each request and its body, and retries for
+transient failures. Hub credentials are never passed to image hosts. Image
+bytes are neither persisted nor uploaded; repeated loads fetch the URL again.
+The loader returns raw bytes and does not decode or validate image contents.
+
+Failures raise `URLImageError` by default. `on_url_error="return"` yields
+`data=None` and an `error` string instead, preserving the physical row identity
+and iteration order. A missing URL is an `invalid_url` failure. `payloads` retains
+the original URL, and original captions and hash columns remain in metadata.
+An existing `sha256` is not assumed to hash the currently served image bytes.
+
+URL-source metadata reads use a bounded native Parquet cache to avoid repeated
+small network reads. `url_metadata_cache_bytes` defaults to 128 MiB per cached
+source shard; larger files use the existing page reader. Set it to zero to
+disable this cache. This caches source Parquet bytes, never fetched image bytes.
+
+### Metadata manifest format
 
 Pass a local metadata directory or Hub dataset repository containing
 `webshart-parquet.json`. The source files stay unchanged. For example:
@@ -482,6 +525,10 @@ Pass a local metadata directory or Hub dataset repository containing
   }]
 }
 ```
+
+For URL sources, set `"image_url": "url"` in `columns` instead of `"image"`.
+This declares the payload column but does not enable network loading; the loader
+still requires `fetch_external_urls=True`. Overlays cannot replace payload URLs.
 
 The JSON metadata file is a list of row objects:
 

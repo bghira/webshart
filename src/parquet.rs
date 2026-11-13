@@ -277,6 +277,20 @@ impl PyParquetFile {
         self.source.bytes_read.load(Ordering::Relaxed)
     }
 
+    fn cache_source(&self, py: Python<'_>, max_bytes: usize) -> PyResult<bool> {
+        py.detach(|| {
+            if self.source.size > max_bytes as u64 {
+                return Ok(false);
+            }
+            if self.source.cache.lock().map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))?.is_some() {
+                return Ok(true);
+            }
+            let data = self.source.read(0, self.source.size as usize).map_err(python_error)?;
+            *self.source.cache.lock().map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))? = Some(data.into());
+            Ok(true)
+        })
+    }
+
     fn verify_sha256(&self, py: Python<'_>, expected: String) -> PyResult<()> {
         py.detach(|| {
             let mut digest = Sha256::new();
