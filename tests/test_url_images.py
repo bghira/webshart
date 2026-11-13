@@ -303,3 +303,95 @@ def test_native_metadata_cache_respects_limit_and_avoids_rereads(tmp_path, serve
     assert list(reader.rows(columns=["url"], stop=1))[0]["url"].endswith("/image")
     assert reader.cache_source(dataset.get_shard_info(0)["size"])
     assert reader.bytes_read == cached
+
+
+def test_capture_upload_retry_and_cleanup(tmp_path, server, monkeypatch):
+    from types import SimpleNamespace
+    import huggingface_hub
+
+    base, content, hits, _ = server
+    dataset = source(tmp_path / "source", base)
+    uploaded = {}
+    calls = []
+
+    class FakeHub:
+        endpoint = "https://hub.example"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def repo_info(self, *args, **kwargs):
+            pass
+
+        def upload_file(self, **kwargs):
+            calls.append(kwargs["path_in_repo"])
+            if len(calls) == 1:
+                raise OSError("upload interrupted")
+            uploaded[kwargs["path_in_repo"]] = Path(kwargs["path_or_fileobj"]).read_bytes()
+            return SimpleNamespace(oid="commit-id")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHub)
+    destination = tmp_path / "scan"
+    options = dict(capture_images=True, upload_repo="owner/dataset", keep_local_images=False)
+    with pytest.raises(OSError, match="upload interrupted"):
+        webshart.scan_url_metadata(dataset, str(destination), **options)
+    before = hits.copy()
+    assert list(destination.glob("data/*/*.parquet"))
+    result = webshart.scan_url_metadata(dataset, str(destination), batch_size=2, **options)
+    assert result["complete"] and hits == before
+    assert not list(destination.glob("data/*/*.parquet"))
+    assert not list(destination.glob(".images-*"))
+    rows = pq.read_table(pa.BufferReader(next(iter(uploaded.values())))).to_pylist()
+    assert [r["source_row"] for r in rows] == [0, 1, 2, 3]
+    assert rows[0]["image"]["bytes"] == content
+    assert rows[0]["captions"] == "caption 0"
+    assert rows[0]["width"] == 17 and rows[0]["height"] == 9
+    assert rows[1]["image"] is None and rows[2]["image"] is None
+    assert rows[3]["image"]["bytes"] == content
+    webshart.scan_url_metadata(dataset, str(destination), **options)
+    assert len(calls) == 2 and hits == before
+    with pytest.raises(ValueError, match="options changed"):
+        webshart.scan_url_metadata(dataset, str(destination))
+
+
+def test_capture_local_and_option_validation(tmp_path, server):
+    base, content, _, _ = server
+    dataset = source(tmp_path / "source", base)
+    destination = tmp_path / "scan"
+    with pytest.raises(ValueError, match="requires capture_images"):
+        webshart.scan_url_metadata(dataset, str(destination), upload_repo="owner/dataset")
+    with pytest.raises(ValueError, match="requires upload_repo"):
+        webshart.scan_url_metadata(dataset, str(destination), keep_local_images=False)
+    result = webshart.scan_url_metadata(dataset, str(destination), capture_images=True, batch_size=2)
+    assert result["complete"]
+    parts = sorted(destination.glob("data/*/*.parquet"))
+    assert len(parts) == 2
+    assert pq.read_table(parts[0])["image"][0].as_py()["bytes"] == content
+    captured = webshart.discover_parquet_dataset(str(destination / "data"))
+    sample = webshart.ParquetDataLoader(captured).load_sample(0, 0)
+    assert sample.data == content and sample.captions == "caption 0"
+    assert sample.width == 17 and sample.height == 9
+    parts[0].unlink()
+    with pytest.raises(ValueError, match="captured image part"):
+        webshart.scan_url_metadata(dataset, str(destination), capture_images=True)
+
+
+def test_capture_upload_retries_transient_commit_errors(monkeypatch):
+    from types import SimpleNamespace
+
+    attempts, sleeps = [], []
+
+    class Conflict(Exception):
+        response = SimpleNamespace(status_code=409)
+
+    class Hub:
+        def upload_file(self, **kwargs):
+            attempts.append(kwargs)
+            if len(attempts) < 3:
+                raise Conflict()
+            return "committed"
+
+    monkeypatch.setattr(scan_module.time, "sleep", sleeps.append)
+    assert scan_module._upload_capture(Hub(), path_in_repo="data/part.parquet") == "committed"
+    assert len(sleeps) == 2 and len(attempts) == 3
+    assert 1 <= sleeps[0] < 2 and 2 <= sleeps[1] < 3

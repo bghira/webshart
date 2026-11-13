@@ -511,7 +511,7 @@ The geometry scanner projects only the URL column and does not fill this cache.
 
 Install `webshart[scan]` to build metadata overlays. The Rust scanner fetches
 images concurrently, reads dimensions from their headers, computes downloaded
-byte hashes, and discards image bytes. Python writes checkpointed Parquet
+byte hashes, and by default discards image bytes. Python writes checkpointed Parquet
 metadata. Header inspection is not a full pixel decode or image-quality check.
 
 Start with a bounded pilot and pin the source revision for repeatable resumes:
@@ -537,6 +537,43 @@ size may change. An interrupted batch is retried. Previously recorded failures
 are retained; use a fresh destination to reassess them. Do not run two writers
 against the same destination. For distributed scans, use disjoint
 `--start-shard`/`--stop-shard` ranges and separate output directories.
+
+Add `--capture-images` to also write image-bearing Parquet shards under `data/`.
+Each row contains `image: {bytes, path}`, `captions`, `url`, physical
+`source_shard` and `source_row`, and the scan metadata. Failed probes retain
+null images and their failure status. Filter `url_status == "ok"` for training.
+Rust stages successful downloads while Python writes bounded Arrow row groups;
+images are fetched only once per successful batch.
+
+To upload each completed shard and discard its local image copy, add:
+
+```bash
+--capture-images --upload-repo owner/dataset --no-local-images
+```
+
+The destination repository must already exist. Uploads use `huggingface_hub`
+authentication and endpoint configuration; `--upload-endpoint` overrides only
+the upload endpoint. `--upload-repo-type model` supports repositories exposed
+through the model API. The SDK equivalents are `capture_images=True`,
+`upload_repo="owner/dataset"`, `keep_local_images=False`, and optional
+`upload_endpoint`, `upload_token`, and `upload_repo_type` arguments to
+`scan_url_metadata`. Explicit upload credentials do not change source reads.
+
+This mode needs temporary disk space for one download batch and its Parquet
+shard per process (bounded by batch size times the maximum image size, plus
+encoding overhead). It retains local metadata and checkpoints. Images are
+removed only after a successful Hub commit and a durable local checkpoint.
+A failed upload retains the completed batch for retry without refetching.
+Resuming trusts recorded Hub commit receipts; keep the uploaded files intact.
+The destination `data/` files are self-contained image/caption Parquet shards;
+the metadata overlay still refers to the original URL source. Local captured
+shards can be loaded with `discover_parquet_dataset("./recap-metadata/data")`.
+For a remote captured repository, use `subfolder="data"` and optionally
+`endpoint` and `repo_type="model"` in `discover_parquet_dataset`.
+Use a fresh scan destination when enabling capture on an existing metadata-only
+scan: discarded image bytes must be downloaded again. Use separate upload
+repositories for different sources or revisions, and disjoint shard ranges
+for concurrent writers to one repository.
 
 The resulting `webshart-parquet.json` and `metadata/` files can be used locally
 or hosted together in a metadata-only Hub repository. Keep `scan-state.json`,

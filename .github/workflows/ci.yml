@@ -31,7 +31,7 @@ jobs:
     
     - name: Build and install package
       run: |
-        pip install -e .
+        pip install -e ".[scan]"
     
     - name: Run Rust tests
       run: cargo test --lib

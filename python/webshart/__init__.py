@@ -763,6 +763,12 @@ def main():
     scan_parser.add_argument("--max-bytes", type=int, default=32 * 1024 * 1024)
     scan_parser.add_argument("--max-pixels", type=int, default=64_000_000)
 
+    scan_parser.add_argument("--capture-images", action="store_true")
+    scan_parser.add_argument("--upload-repo")
+    scan_parser.add_argument("--upload-repo-type", choices=["dataset", "model"], default="dataset")
+    scan_parser.add_argument("--upload-endpoint")
+    scan_parser.add_argument("--no-local-images", action="store_true")
+
     # extract-metadata subcommand
     extract_parser = subparsers.add_parser(
         "extract-metadata", help="Extract metadata from unindexed webdataset shards"
@@ -897,6 +903,11 @@ def main():
                 stop_shard=args.stop_shard,
                 max_pixels=args.max_pixels,
                 url_options=URLImageOptions(args.timeout, args.retries, args.max_bytes),
+                capture_images=args.capture_images,
+                upload_repo=args.upload_repo,
+                upload_repo_type=args.upload_repo_type,
+                upload_endpoint=args.upload_endpoint,
+                keep_local_images=not args.no_local_images,
             )
             print(json.dumps(summary, indent=2))
         except Exception as exc:

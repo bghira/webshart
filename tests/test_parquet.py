@@ -499,3 +499,30 @@ def test_hub_metadata_pins_source_and_metadata_revisions(monkeypatch):
 def test_compressed_parquet_matches_arrow(tmp_path, codec):
     path = write_source(tmp_path, compression=codec)
     assert list(_ParquetFile(str(path)).rows()) == parquet.read_table(path).to_pylist()
+
+
+def test_repository_endpoint_and_model_type(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from webshart.parquet import _Repository
+
+    calls = []
+
+    class FakeApi:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def repo_info(self, source, **kwargs):
+            calls.append((source, kwargs))
+            return SimpleNamespace(sha="a" * 40, siblings=[])
+
+    def url(source, path, **kwargs):
+        calls.append(kwargs)
+        return "https://hub.example/file"
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(HfApi=FakeApi, hf_hub_url=url))
+    repo = _Repository("owner/images", "upload-token", endpoint="https://hub.example", repo_type="model")
+    assert repo.location("data/part.parquet") == "https://hub.example/file"
+    assert calls[0] == {"token": "upload-token", "endpoint": "https://hub.example"}
+    assert calls[1][1]["repo_type"] == calls[2]["repo_type"] == "model"
+    assert calls[2]["endpoint"] == "https://hub.example"

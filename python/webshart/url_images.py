@@ -52,9 +52,10 @@ class URLImageClient:
             raise URLImageError(code, status)
         return data
 
-    def scan(self, urls, *, workers=32, max_pixels=64_000_000):
+    def scan(self, urls, *, workers=32, max_pixels=64_000_000, capture_directory=None):
         return self._native.scan(
-            [url if isinstance(url, str) else None for url in urls], workers, max_pixels
+            [url if isinstance(url, str) else None for url in urls], workers, max_pixels,
+            str(capture_directory) if capture_directory is not None else None
         )
 
 

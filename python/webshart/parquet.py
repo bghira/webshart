@@ -59,11 +59,13 @@ class _SafeRedirect(HTTPRedirectHandler):
 
 
 class _Repository:
-    def __init__(self, source: str, token: str | None, revision: str | None = None):
+    def __init__(self, source: str, token: str | None, revision: str | None = None, *, endpoint: str | None = None, repo_type: str = "dataset"):
         self.source = (
             str(source).removeprefix("https://huggingface.co/datasets/").rstrip("/")
         )
         self.token = token
+        self.endpoint = endpoint
+        self.repo_type = repo_type
         self.local = Path(source).is_dir()
         self.revision = revision
         self.files: dict[str, int] = {}
@@ -76,9 +78,11 @@ class _Repository:
                 raise ImportError(
                     "Hub Parquet discovery requires webshart[hub]"
                 ) from error
-            info = HfApi(token=token).dataset_info(
-                self.source, revision=revision, files_metadata=True
-            )
+            api = HfApi(token=token, **({"endpoint": endpoint} if endpoint else {}))
+            if repo_type == "dataset":
+                info = api.dataset_info(self.source, revision=revision, files_metadata=True)
+            else:
+                info = api.repo_info(self.source, repo_type=repo_type, revision=revision, files_metadata=True)
             self.revision = info.sha
             self.files = {entry.rfilename: entry.size for entry in info.siblings}
 
@@ -95,7 +99,7 @@ class _Repository:
         from huggingface_hub import hf_hub_url
 
         return hf_hub_url(
-            self.source, path, repo_type="dataset", revision=self.revision
+            self.source, path, repo_type=self.repo_type, revision=self.revision, endpoint=self.endpoint
         )
 
     def size(self, path: str) -> int:
@@ -136,6 +140,8 @@ class ParquetDataset:
         source: str,
         *,
         metadata: str | None = None,
+        endpoint: str | None = None,
+        repo_type: str = "dataset",
         hf_token: str | None = None,
         revision: str | None = None,
         metadata_revision: str | None = None,
@@ -196,7 +202,7 @@ class ParquetDataset:
                 if revision is not None and revision != pinned["revision"]:
                     raise ValueError("Source revision conflicts with metadata manifest")
                 revision = pinned["revision"]
-        self._source_repo = _Repository(source, self.hf_token, revision)
+        self._source_repo = _Repository(source, self.hf_token, revision, endpoint=endpoint, repo_type=repo_type)
         self.name = str(source)
         self.source_revision = self._source_repo.revision
         self.metadata_revision = (
