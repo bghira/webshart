@@ -436,8 +436,8 @@ This uses logical samples from `metadata.sample_range()` / `get_sample_by_index(
 
 ## Parquet Payloads With Custom Metadata
 
-The Parquet API is available in this source checkout (not in the published 0.6.0
-wheel). Existing tar APIs keep their behavior. Use `ParquetDataLoader`, not
+The Parquet API is available starting with webshart 0.7.0. Existing tar APIs
+keep their behavior. Use `ParquetDataLoader`, not
 `TarDataLoader` or `BucketDataLoader`, for Parquet sources:
 
 ```python
