@@ -447,3 +447,99 @@ def test_jxl_capture_requires_tools_and_capture(tmp_path, server, monkeypatch):
     monkeypatch.setenv("PATH", "")
     with pytest.raises(ValueError, match="requires cjxl and djxl"):
         webshart.scan_url_metadata(dataset, str(tmp_path / "out"), capture_images=True, recompress_images=True)
+
+
+def test_deferred_queue_threshold_and_receipt_recovery(tmp_path, server, monkeypatch):
+    from types import SimpleNamespace
+    import huggingface_hub
+    import webshart.upload_queue as queue_module
+
+    base, content, hits, _ = server
+    dataset = source(tmp_path / "source", base)
+    root, staging = tmp_path / "scans", tmp_path / "staging"
+    calls = []
+
+    class Hub:
+        endpoint = "https://hub.example"
+        def __init__(self, **kwargs): pass
+        def repo_info(self, *args, **kwargs):
+            return SimpleNamespace(siblings=[])
+        def create_commit(self, **kwargs):
+            calls.append(kwargs)
+            assert len(kwargs["operations"]) == 3
+            return SimpleNamespace(oid="commit-id")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    def missing_receipt(*args, **kwargs):
+        from huggingface_hub.errors import EntryNotFoundError
+        raise EntryNotFoundError("missing")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", missing_receipt)
+    kwargs = dict(capture_images=True, upload_repo="owner/dataset", keep_local_images=False,
+                  defer_uploads=True, staging_directory=str(staging / "scan"), batch_size=2)
+    webshart.scan_url_metadata(dataset, str(root / "scan"), **kwargs)
+    assert not list((root / "scan").glob("data/*/*.parquet"))
+    assert len(list(staging.glob("scan/data/*/*.parquet"))) == 2
+    before = hits.copy()
+    options = dict(upload_repo="owner/dataset", min_bytes=1024 ** 4)
+    result = webshart.upload_capture_queue(str(root), str(staging), **options)
+    assert result["uploaded_files"] == 0 and result["pending_bytes"] > 0
+    assert calls == []
+    atomic = queue_module._atomic_json
+    failed = False
+    def interrupt(path, value):
+        nonlocal failed
+        if path.parent.name == "checkpoints" and not failed:
+            failed = True
+            raise OSError("checkpoint interrupted")
+        return atomic(path, value)
+    monkeypatch.setattr(queue_module, "_atomic_json", interrupt)
+    with pytest.raises(OSError, match="checkpoint interrupted"):
+        webshart.upload_capture_queue(str(root), str(staging), flush=True, **options)
+    assert len(calls) == 1 and len(list(staging.glob("scan/data/*/*.parquet"))) == 2
+    webshart.upload_capture_queue(str(root), str(staging), **options)
+    assert len(calls) == 1 and not list(staging.glob("scan/data/*/*.parquet"))
+    webshart.scan_url_metadata(dataset, str(root / "scan"), **kwargs)
+    assert hits == before
+
+
+def test_queue_recovers_lost_remote_acknowledgment(tmp_path, server, monkeypatch):
+    from types import SimpleNamespace
+    import huggingface_hub
+    from huggingface_hub.errors import EntryNotFoundError
+
+    dataset = source(tmp_path / "source", server[0])
+    root, staging = tmp_path / "scans", tmp_path / "stage"
+    markers, commits = {}, []
+    class Hub:
+        endpoint = "https://hub.example"
+        def __init__(self, **kwargs): pass
+        def repo_info(self, *args, **kwargs):
+            return SimpleNamespace(siblings=[SimpleNamespace(rfilename=p) for p in markers])
+        def create_commit(self, **kwargs):
+            commits.append(kwargs)
+            marker = kwargs["operations"][-1]
+            markers[marker.path_in_repo] = marker.path_or_fileobj
+            if len(commits) == 1:
+                raise OSError("lost acknowledgment")
+            return SimpleNamespace(oid="commit-id")
+    def download(repo, filename, **kwargs):
+        if filename not in markers:raise EntryNotFoundError("missing")
+        path = tmp_path / "receipt.json"
+        path.write_bytes(markers[filename])
+        return str(path)
+    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    webshart.scan_url_metadata(dataset, str(root / "scan"), capture_images=True,
+        upload_repo="owner/dataset", keep_local_images=False, defer_uploads=True,
+        staging_directory=str(staging / "scan"), batch_size=2)
+    options = dict(upload_repo="owner/dataset", min_bytes=1, max_files_per_commit=1, flush=False)
+    with pytest.raises(OSError, match="lost acknowledgment"):
+        webshart.upload_capture_queue(str(root), str(staging), **options)
+    options.update(min_bytes=1024 ** 4, flush=False)
+    result = webshart.upload_capture_queue(str(root), str(staging), **options)
+    assert len(commits) == 1 and result["pending_bytes"] > 0
+    options["flush"] = True
+    result = webshart.upload_capture_queue(str(root), str(staging), **options)
+    assert result["pending_bytes"] == 0
+    assert len(commits) == 2
+    assert not list(staging.glob("scan/data/*/*.parquet"))

@@ -40,11 +40,13 @@ from .parquet import (
 )
 from .url_images import URLImageError, URLImageOptions
 from .url_scan import scan_url_metadata
+from .upload_queue import upload_capture_queue
 
 __all__ = [
     "URLImageError",
     "URLImageOptions",
     "scan_url_metadata",
+    "upload_capture_queue",
     "__version__",
     "DatasetDiscovery",
     "DiscoveredDataset",
@@ -770,6 +772,20 @@ def main():
     scan_parser.add_argument("--upload-repo-type", choices=["dataset", "model"], default="dataset")
     scan_parser.add_argument("--upload-endpoint")
     scan_parser.add_argument("--no-local-images", action="store_true")
+    scan_parser.add_argument("--defer-uploads", action="store_true")
+    scan_parser.add_argument("--staging-directory")
+    scan_parser.add_argument("--min-staging-free-bytes", type=int, default=0)
+
+    queue_parser = subparsers.add_parser("upload-capture-queue", help="Upload completed capture scans in byte-triggered batches")
+    queue_parser.add_argument("--destination", required=True)
+    queue_parser.add_argument("--staging-directory", required=True)
+    queue_parser.add_argument("--upload-repo", required=True)
+    queue_parser.add_argument("--upload-repo-type", choices=["dataset", "model"], default="dataset")
+    queue_parser.add_argument("--upload-endpoint")
+    queue_parser.add_argument("--min-bytes", type=int, default=1024 ** 4)
+    queue_parser.add_argument("--max-files-per-commit", type=int, default=64)
+    queue_parser.add_argument("--num-threads", type=int, default=4)
+    queue_parser.add_argument("--flush", action="store_true")
 
     # extract-metadata subcommand
     extract_parser = subparsers.add_parser(
@@ -912,10 +928,24 @@ def main():
                 upload_repo_type=args.upload_repo_type,
                 upload_endpoint=args.upload_endpoint,
                 keep_local_images=not args.no_local_images,
+                defer_uploads=args.defer_uploads,
+                staging_directory=args.staging_directory,
+                min_staging_free_bytes=args.min_staging_free_bytes,
             )
             print(json.dumps(summary, indent=2))
         except Exception as exc:
             print(f"Error scanning URL metadata: {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "upload-capture-queue":
+        try:
+            print(json.dumps(upload_capture_queue(
+                args.destination, args.staging_directory, upload_repo=args.upload_repo,
+                upload_repo_type=args.upload_repo_type, upload_endpoint=args.upload_endpoint,
+                min_bytes=args.min_bytes, flush=args.flush,
+                max_files_per_commit=args.max_files_per_commit, num_threads=args.num_threads,
+            ), indent=2))
+        except Exception as exc:
+            print(f"Error uploading capture queue: {exc}", file=sys.stderr)
             sys.exit(1)
     elif args.command == "extract-metadata":
         extract_metadata(args)

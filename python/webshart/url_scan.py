@@ -56,6 +56,9 @@ def scan_url_metadata(
     upload_endpoint: str | None = None,
     upload_token: str | None = None,
     keep_local_images: bool = True,
+    defer_uploads: bool = False,
+    staging_directory: str | None = None,
+    min_staging_free_bytes: int = 0,
 ) -> dict:
     """Checkpoint geometry and availability, optionally capturing image Parquet shards.
 
@@ -94,14 +97,20 @@ def scan_url_metadata(
         raise ValueError("Discarding local images requires upload_repo")
     if upload_repo_type not in {"dataset", "model"}:
         raise ValueError("upload_repo_type must be dataset or model")
+    min_staging_free_bytes = _integer(min_staging_free_bytes, "min_staging_free_bytes")
+    if defer_uploads and (not upload_repo or keep_local_images):
+        raise ValueError("Deferred uploads require upload_repo and keep_local_images=False")
     api = None
     if upload_repo:
         from huggingface_hub import HfApi
         api = HfApi(endpoint=upload_endpoint, token=upload_token)
-        api.repo_info(upload_repo, repo_type=upload_repo_type)
+        if not defer_uploads:
+            api.repo_info(upload_repo, repo_type=upload_repo_type)
     options = url_options or URLImageOptions()
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
+    image_root = Path(staging_directory) if staging_directory else root
+    image_root.mkdir(parents=True, exist_ok=True)
     state_path = root / "scan-state.json"
     # A separate SQLite transaction is a process lock released automatically on exit.
     lock = sqlite3.connect(root / ".scan-lock.sqlite", timeout=0)
@@ -151,6 +160,8 @@ def scan_url_metadata(
             }
         if recompress_images:
             identity["recompression"] = "jxl-jpeg-lossless-effort3-verified-v1"
+        if defer_uploads:
+            identity["defer_uploads"] = True
         if state_path.exists():
             state = json.loads(state_path.read_text())
             if state["identity"] != identity:
@@ -161,7 +172,7 @@ def scan_url_metadata(
             state = {"identity": identity}
             _atomic_json(state_path, state)
         # A previous process may have exited while native writers were staging bytes.
-        for stale in root.glob(".images-*"):
+        for stale in image_root.glob(".images-*"):
             if stale.is_dir():
                 shutil.rmtree(stale)
         schema = pa.schema(
@@ -215,9 +226,11 @@ def scan_url_metadata(
                         != part["sha256"]
                     ):
                         raise ValueError("Changed scan checkpoint part")
-            if capture_images and keep_local_images:
+            if capture_images and (keep_local_images or defer_uploads):
                 for part in progress["parts"]:
-                    image_path = root / part["image_path"]
+                    if defer_uploads and part.get("upload_commit"):
+                        continue
+                    image_path = image_root / part["image_path"]
                     if not image_path.is_file() or image_path.stat().st_size != part["image_size"]:
                         raise ValueError("Missing or changed captured image part")
                     with image_path.open("rb") as stream:
@@ -225,8 +238,8 @@ def scan_url_metadata(
                             raise ValueError("Changed captured image part")
             if not keep_local_images:
                 for part in progress["parts"]:
-                    if part.get("image_path"):
-                        (root / part["image_path"]).unlink(missing_ok=True)
+                    if part.get("image_path") and part.get("upload_commit"):
+                        (image_root / part["image_path"]).unlink(missing_ok=True)
             reader = dataset._file(index)
             count = reader.info()["num_rows"]
             progress["num_rows"] = count
@@ -242,13 +255,16 @@ def scan_url_metadata(
                 stop=stop,
             )
             while progress["next_row"] < stop:
+                if capture_images and min_staging_free_bytes:
+                    while shutil.disk_usage(image_root).free < min_staging_free_bytes:
+                        time.sleep(5)
                 start = progress["next_row"]
                 size = min(batch_size, stop - start)
                 relative = f"parts/{index:06d}/{start:012d}.parquet"
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 image_relative = f"data/{index:06d}/{start:012d}.parquet"
-                image_path = root / image_relative
+                image_path = image_root / image_relative
                 # A pending upload keeps its original batch boundaries on resume.
                 pending = None
                 if capture_images and image_path.is_file() and path.is_file():
@@ -263,7 +279,7 @@ def scan_url_metadata(
                 if pending is not None:
                     results = pending
                 else:
-                    with tempfile.TemporaryDirectory(prefix=".images-", dir=root) as staging:
+                    with tempfile.TemporaryDirectory(prefix=".images-", dir=image_root) as staging:
                         scan_kwargs = {"workers": workers, "max_pixels": max_pixels}
                         if capture_images:
                             scan_kwargs["capture_directory"] = staging
@@ -308,7 +324,7 @@ def scan_url_metadata(
                         image_digest = hashlib.file_digest(stream, "sha256").hexdigest()
                     part.update(image_path=image_relative, image_sha256=image_digest,
                                 image_size=image_path.stat().st_size)
-                    if api:
+                    if api and not defer_uploads:
                         commit = _upload_capture(api,
                             repo_id=upload_repo, repo_type=upload_repo_type,
                             path_in_repo=image_relative, path_or_fileobj=str(image_path),
@@ -328,7 +344,7 @@ def scan_url_metadata(
                 progress["counts"] = dict(counts)
                 checkpoint(index).parent.mkdir(exist_ok=True)
                 _atomic_json(checkpoint(index), progress)
-                if capture_images and not keep_local_images:
+                if capture_images and not keep_local_images and not defer_uploads:
                     image_path.unlink(missing_ok=True)
             if count == 0:
                 checkpoint(index).parent.mkdir(exist_ok=True)
