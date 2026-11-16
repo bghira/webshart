@@ -465,6 +465,8 @@ native Xet transport, with HTTP Range for non-Xet files.
 
 ### Captured images on S3
 
+Native S3 access and batched row-group reads require webshart 0.8.0 or later.
+
 S3-compatible Parquet sources use native Rust AWS signing, connection pooling,
 ETag-pinned range reads, and streamed shard downloads. No Python S3 transfer
 library is required. Supply an endpoint without the bucket name:
