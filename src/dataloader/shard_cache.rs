@@ -157,6 +157,23 @@ impl ShardCache {
         token: Option<String>,
         lock_for_reading: bool,
     ) -> Result<(PathBuf, Option<ShardLockGuard>)> {
+        self.ensure_cached_with(shard_name, lock_for_reading, |temp_path| async move {
+            self.download_shard_to_disk(remote_url, token, &temp_path)
+                .await
+        })
+        .await
+    }
+
+    pub(crate) async fn ensure_cached_with<F, Fut>(
+        &self,
+        shard_name: &str,
+        lock_for_reading: bool,
+        fetch: F,
+    ) -> Result<(PathBuf, Option<ShardLockGuard>)>
+    where
+        F: FnOnce(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Result<u64>>,
+    {
         let cached_path = self.get_cached_shard_path(shard_name);
 
         // The semaphore limits this process. The file lock prevents a second
@@ -190,9 +207,13 @@ impl ShardCache {
             .unwrap()
             .insert(shard_name.to_string(), temp_path.clone());
 
-        let result = self
-            .download_shard_to_disk(remote_url, token, shard_name, &temp_path)
-            .await;
+        let result = match fetch(temp_path.clone()).await {
+            Ok(size) => self
+                .commit_download(&temp_path, shard_name, size)
+                .await
+                .map(|()| size),
+            Err(error) => Err(error),
+        };
 
         self.active_downloads.lock().unwrap().remove(shard_name);
 
@@ -219,15 +240,12 @@ impl ShardCache {
         &self,
         url: &str,
         token: Option<String>,
-        shard_name: &str,
         temp_path: &Path,
     ) -> Result<u64> {
         use futures::StreamExt;
 
         if let Some(file) = crate::xet::resolve(url, token.as_deref()).await? {
-            println!("[webshart] Downloading {shard_name} with native Xet");
             let size = crate::xet::client()?.download(&file, temp_path).await?;
-            self.commit_download(temp_path, shard_name, size).await?;
             return Ok(size);
         }
 
@@ -265,9 +283,6 @@ impl ShardCache {
         file.flush().await.map_err(WebshartError::Io)?;
         file.sync_all().await.map_err(WebshartError::Io)?;
         drop(file);
-
-        self.commit_download(temp_path, shard_name, bytes_written)
-            .await?;
 
         Ok(bytes_written)
     }

@@ -463,6 +463,51 @@ Hub discovery requires `webshart[hub]`; payload decoding is native Rust and does
 not require PyArrow, `datasets`, or `hf_xet`. Hub payload ranges reuse webshart's
 native Xet transport, with HTTP Range for non-Xet files.
 
+### Captured images on S3
+
+S3-compatible Parquet sources use native Rust AWS signing, connection pooling,
+ETag-pinned range reads, and streamed shard downloads. No Python S3 transfer
+library is required. Supply an endpoint without the bucket name:
+
+```python
+dataset = webshart.discover_parquet_dataset(
+    "s3://training-images",
+    manifest="combined/dataset.json",
+    s3_options={"endpoint_url": "https://storage.example", "max_connections": 32},
+)
+dataset.enable_shard_cache("cache/parquet", cache_limit_gb=25, parallel_downloads=4)
+loader = webshart.ParquetDataLoader(dataset)
+samples = loader.load_samples([(0, 12), (0, 3), (0, 12)], parallel_reads=4)
+```
+
+Omit `manifest` to list Parquet objects below the source prefix. A capture
+descriptor has `format: "parquet-image-capture"`, `version: 1` or `2`, and a
+`files_manifest` pointing to source-relative JSONL entries containing `key`,
+`size_bytes`, and `num_rows`. An optional `manifest_sha256` verifies the JSONL
+contents. Discovery uses manifest sizes instead of sending one HEAD per part.
+Object size and row counts are checked when a part is opened.
+
+Credentials can come from AWS environment variables, web identity, or container
+and instance roles. Explicit `aws_access_key_id`, `aws_secret_access_key`,
+`aws_session_token`, and `region_name` are also accepted in `s3_options`.
+`allow_http=True` is available for local S3 test servers. Shared AWS profile files
+are not read by this transport.
+
+Without a shard cache, only selected Parquet ranges are fetched. The shard cache
+streams whole objects to disk and reuses webshart's download locks and eviction.
+Cache entries are scoped by endpoint, bucket, object key, and ETag. Metadata preparation coalesces selected column chunks into a bounded 64 MiB
+cache and leaves image columns unread. Whole-shard downloads begin on payload
+access. Network I/O and Parquet decoding release the GIL. Batch requests share each selected row
+group, use bounded native concurrency, and preserve input order and duplicates.
+
+`loader.get_metadata(shard)` returns logical sample metadata;
+`loader.list_samples_in_shard(shard)` and
+`loader.list_shard_sample_aspect_buckets([shard])` omit failed capture rows.
+Physical row indices stay unchanged. `dataset.fingerprint` identifies the source
+configuration and catalog snapshot for downstream metadata caches. Captured bytes are read directly, without
+recompression or fetching the original URL. Applications decode the returned
+bytes; JPEG XL requires a decoder such as `pillow-jxl-plugin`.
+
 ### Online images from URL columns
 
 URL-only Parquet datasets such as

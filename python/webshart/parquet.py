@@ -14,9 +14,8 @@ from typing import Any, Iterator
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from ._webshart import _ParquetFile
+from ._webshart import _ParquetFile, _ParquetCache, _S3Store, _parquet_bucket_keys
 from .url_images import URLImageError, URLImageOptions, URLImageClient
-
 
 MANIFEST = "webshart-parquet.json"
 
@@ -59,7 +58,16 @@ class _SafeRedirect(HTTPRedirectHandler):
 
 
 class _Repository:
-    def __init__(self, source: str, token: str | None, revision: str | None = None, *, endpoint: str | None = None, repo_type: str = "dataset"):
+    def __init__(
+        self,
+        source: str,
+        token: str | None,
+        revision: str | None = None,
+        *,
+        endpoint: str | None = None,
+        repo_type: str = "dataset",
+        s3_options: dict | None = None,
+    ):
         self.source = (
             str(source).removeprefix("https://huggingface.co/datasets/").rstrip("/")
         )
@@ -69,7 +77,18 @@ class _Repository:
         self.local = Path(source).is_dir()
         self.revision = revision
         self.files: dict[str, int] = {}
-        if self.local:
+        self.s3 = None
+        self.prefix = ""
+        if self.source.startswith("s3://"):
+            uri = urlparse(self.source)
+            if not uri.netloc or uri.query or uri.fragment or "@" in uri.netloc:
+                raise ValueError("S3 source must be s3://bucket or s3://bucket/prefix")
+            self.s3 = _S3Store(uri.netloc, **(s3_options or {}))
+            self.bucket = uri.netloc
+            self.prefix = (
+                _relative_path(uri.path.strip("/")) + "/" if uri.path.strip("/") else ""
+            )
+        elif self.local:
             self.root = Path(source).resolve()
         else:
             try:
@@ -80,17 +99,36 @@ class _Repository:
                 ) from error
             api = HfApi(token=token, **({"endpoint": endpoint} if endpoint else {}))
             if repo_type == "dataset":
-                info = api.dataset_info(self.source, revision=revision, files_metadata=True)
+                info = api.dataset_info(
+                    self.source, revision=revision, files_metadata=True
+                )
             else:
-                info = api.repo_info(self.source, repo_type=repo_type, revision=revision, files_metadata=True)
+                info = api.repo_info(
+                    self.source,
+                    repo_type=repo_type,
+                    revision=revision,
+                    files_metadata=True,
+                )
             self.revision = info.sha
             self.files = {entry.rfilename: entry.size for entry in info.siblings}
 
     def exists(self, path: str) -> bool:
+        if self.s3 is not None:
+            if path in self.files:
+                return True
+            try:
+                self.files[path] = self.s3.head(self.prefix + _relative_path(path))[
+                    "size"
+                ]
+                return True
+            except FileNotFoundError:
+                return False
         return Path(self.location(path)).is_file() if self.local else path in self.files
 
     def location(self, path: str) -> str:
         path = _relative_path(path)
+        if self.s3 is not None:
+            return f"s3://{self.bucket}/{self.prefix}{path}"
         if self.local:
             target = (self.root / path).resolve()
             if not target.is_relative_to(self.root):
@@ -99,10 +137,16 @@ class _Repository:
         from huggingface_hub import hf_hub_url
 
         return hf_hub_url(
-            self.source, path, repo_type=self.repo_type, revision=self.revision, endpoint=self.endpoint
+            self.source,
+            path,
+            repo_type=self.repo_type,
+            revision=self.revision,
+            endpoint=self.endpoint,
         )
 
     def size(self, path: str) -> int:
+        if self.s3 is not None and path not in self.files:
+            self.files[path] = self.s3.head(self.prefix + _relative_path(path))["size"]
         return (
             Path(self.location(path)).stat().st_size if self.local else self.files[path]
         )
@@ -112,7 +156,9 @@ class _Repository:
             raise ValueError(
                 "JSON metadata exceeds 16 MiB; use Parquet metadata instead"
             )
-        if self.local:
+        if self.s3 is not None:
+            content = self.s3.read(self.prefix + _relative_path(path))
+        elif self.local:
             content = Path(self.location(path)).read_bytes()
         else:
             headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
@@ -125,6 +171,59 @@ class _Repository:
         if expected_hash and hashlib.sha256(content).hexdigest() != expected_hash:
             raise ValueError("Metadata SHA-256 mismatch")
         return json.loads(content)
+
+    def capture_records(self, manifest: str) -> list[dict]:
+        descriptor = self.read_json(manifest)
+        if descriptor.get("format") != "parquet-image-capture" or descriptor.get(
+            "version"
+        ) not in (1, 2):
+            raise ValueError("Unsupported image capture manifest")
+        path = _relative_path(descriptor["files_manifest"])
+        expected = descriptor.get("manifest_sha256")
+        if expected is not None and not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError("Invalid manifest SHA-256")
+        if self.s3 is not None:
+            records = self.s3.read_jsonl(self.prefix + path, expected_sha256=expected)
+        elif self.local:
+            content = Path(self.location(path)).read_bytes()
+            if expected and hashlib.sha256(content).hexdigest() != expected:
+                raise ValueError("Manifest SHA-256 mismatch")
+            records = [
+                json.loads(line) for line in content.splitlines() if line.strip()
+            ]
+        else:
+            raise ValueError(
+                "Capture manifests currently require a local directory or S3 source"
+            )
+        output = []
+        for record in records:
+            key = _relative_path(record["key"])
+            size = _integer(record["size_bytes"], "size_bytes", 1)
+            if self.s3 is not None:
+                self.files[key] = size
+            output.append(
+                {
+                    "path": key,
+                    "size": size,
+                    "num_rows": _integer(record["num_rows"], "num_rows"),
+                }
+            )
+        self.capture_digest = expected
+        return output
+
+    def parquet_paths(self) -> list[str]:
+        if self.local:
+            return [
+                path.relative_to(self.root).as_posix()
+                for path in sorted(self.root.rglob("*.parquet"))
+            ]
+        if self.s3 is not None:
+            self.files = {
+                entry["key"][len(self.prefix) :]: entry["size"]
+                for entry in self.s3.list(self.prefix)
+                if entry["key"].endswith(".parquet")
+            }
+        return sorted(path for path in self.files if path.endswith(".parquet"))
 
 
 class ParquetDataset:
@@ -140,6 +239,8 @@ class ParquetDataset:
         source: str,
         *,
         metadata: str | None = None,
+        manifest: str | None = None,
+        s3_options: dict | None = None,
         endpoint: str | None = None,
         repo_type: str = "dataset",
         hf_token: str | None = None,
@@ -169,16 +270,23 @@ class ParquetDataset:
             metadata_cache_size, "metadata_cache_size", 1
         )
         self.max_page_bytes = _integer(max_page_bytes, "max_page_bytes", 1)
+        self.parallel_reads = _integer(
+            (s3_options or {}).get("max_connections", 4), "max_connections", 1
+        )
         self.url_metadata_cache_bytes = _integer(
             url_metadata_cache_bytes, "url_metadata_cache_bytes"
         )
         self._metadata_cache: OrderedDict[int, dict[int, dict]] = OrderedDict()
         self._files: OrderedDict[int, _ParquetFile] = OrderedDict()
+        self._payload_files: OrderedDict[int, _ParquetFile] = OrderedDict()
         self._metadata_repo = None
+        self._shard_cache = None
+        self._metadata_cache_dir = None
+        capture_manifest = manifest
         manifest: dict = {}
         if metadata is not None:
             self._metadata_repo = _Repository(
-                metadata, self.hf_token, metadata_revision
+                metadata, self.hf_token, metadata_revision, s3_options=s3_options
             )
             manifest = self._metadata_repo.read_json(MANIFEST)
             if (
@@ -187,7 +295,12 @@ class ParquetDataset:
             ):
                 raise ValueError("Unsupported webshart Parquet metadata manifest")
             pinned = manifest.get("source", {})
-            if not Path(source).is_dir():
+            if str(source).startswith("s3://"):
+                if pinned.get("uri") != str(source).rstrip("/"):
+                    raise ValueError(
+                        "Metadata manifest belongs to a different S3 source"
+                    )
+            elif not Path(source).is_dir():
                 normalized = (
                     str(source)
                     .removeprefix("https://huggingface.co/datasets/")
@@ -202,7 +315,14 @@ class ParquetDataset:
                 if revision is not None and revision != pinned["revision"]:
                     raise ValueError("Source revision conflicts with metadata manifest")
                 revision = pinned["revision"]
-        self._source_repo = _Repository(source, self.hf_token, revision, endpoint=endpoint, repo_type=repo_type)
+        self._source_repo = _Repository(
+            source,
+            self.hf_token,
+            revision,
+            endpoint=endpoint,
+            repo_type=repo_type,
+            s3_options=s3_options,
+        )
         self.name = str(source)
         self.source_revision = self._source_repo.revision
         self.metadata_revision = (
@@ -227,21 +347,42 @@ class ParquetDataset:
         if self.metadata_mode not in ("overlay", "replace"):
             raise ValueError("metadata_mode must be 'overlay' or 'replace'")
         prefix = _relative_path(subfolder.rstrip("/")) + "/" if subfolder else ""
-        if metadata is not None:
+        if capture_manifest is not None:
+            if metadata is not None:
+                raise ValueError("Select either a capture manifest or custom metadata")
+            records = self._source_repo.capture_records(
+                _relative_path(capture_manifest)
+            )
+        elif metadata is not None:
             records = manifest.get("shards")
             if not isinstance(records, list):
                 raise ValueError("Manifest shards must be a list")
-        elif self._source_repo.local:
-            records = [
-                {"path": path.relative_to(self._source_repo.root).as_posix()}
-                for path in sorted(self._source_repo.root.rglob("*.parquet"))
-            ]
         else:
-            records = [
-                {"path": path}
-                for path in sorted(self._source_repo.files)
-                if path.endswith(".parquet")
-            ]
+            records = [{"path": path} for path in self._source_repo.parquet_paths()]
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "source": self._source_repo.source,
+                    "revision": self.source_revision,
+                    "endpoint": (s3_options or {}).get("endpoint_url")
+                    or os.environ.get("AWS_ENDPOINT_URL_S3")
+                    or os.environ.get("AWS_ENDPOINT_URL")
+                    or os.environ.get("AWS_ENDPOINT"),
+                    "capture": getattr(self._source_repo, "capture_digest", None),
+                    "metadata": metadata,
+                    "metadata_revision": self.metadata_revision,
+                    "columns": [
+                        self.image_column,
+                        self.image_url_column,
+                        self.caption_column,
+                        self.width_column,
+                        self.height_column,
+                        self.json_columns,
+                    ],
+                },
+                sort_keys=True,
+            ).encode()
+        )
         self._shards: list[dict] = []
         paths = set()
         for record in records:
@@ -278,8 +419,18 @@ class ParquetDataset:
             ):
                 raise ValueError("Invalid metadata SHA-256")
             self._shards.append(record)
+            fingerprint.update(json.dumps(record, sort_keys=True).encode())
+        self.fingerprint = fingerprint.hexdigest()
         if not self._shards:
             raise ValueError("No Parquet shards found")
+
+    def enable_shard_cache(
+        self, location: str, cache_limit_gb: float = 25.0, parallel_downloads: int = 4
+    ):
+        self._shard_cache = _ParquetCache(
+            str(location), cache_limit_gb, parallel_downloads
+        )
+        self._payload_files.clear()
 
     @property
     def num_shards(self) -> int:
@@ -295,24 +446,38 @@ class ParquetDataset:
         return self._shards[index]
 
     @_synchronized
-    def _file(self, index: int) -> _ParquetFile:
+    def _file(self, index: int, *, payload: bool = False) -> _ParquetFile:
         shard = self._shard(index)
-        if index not in self._files:
+        files = (
+            self._payload_files
+            if payload and self._shard_cache is not None
+            else self._files
+        )
+        if index not in files:
             reader = _ParquetFile(
                 self._source_repo.location(shard["path"]),
                 size=shard["size"],
                 hf_token=self.hf_token,
                 max_page_bytes=self.max_page_bytes,
+                s3=self._source_repo.s3,
+                cache=self._shard_cache if payload else None,
             )
-            count = reader.info()["num_rows"]
+            info = reader.info()
+            if info.get("etag") is not None:
+                if "etag" in shard and shard["etag"] != info["etag"]:
+                    raise OSError(
+                        "S3 object changed since its first read; reopen the dataset"
+                    )
+                shard["etag"] = info["etag"]
+            count = info["num_rows"]
             if "num_rows" in shard and count != shard["num_rows"]:
                 raise ValueError("Source row count does not match metadata manifest")
             shard["num_rows"] = count
-            self._files[index] = reader
-            if len(self._files) > self.metadata_cache_size:
-                self._files.popitem(last=False)
-        self._files.move_to_end(index)
-        return self._files[index]
+            files[index] = reader
+            if len(files) > self.metadata_cache_size:
+                files.popitem(last=False)
+        files.move_to_end(index)
+        return files[index]
 
     def get_shard_info(self, index: int) -> dict:
         shard = self._shard(index)
@@ -353,9 +518,16 @@ class ParquetDataset:
         ]
         records = {}
         if self.metadata_mode == "overlay" and columns:
+            reader.prefetch_columns(columns, parallel_reads=self.parallel_reads)
             records = {
                 row_index: self._decode(row)
-                for row_index, row in enumerate(reader.rows(columns=columns))
+                for row_index, row in enumerate(
+                    reader.rows_at(
+                        list(range(info["num_rows"])),
+                        columns=columns,
+                        parallel_reads=self.parallel_reads,
+                    )
+                )
             }
         if "metadata_path" in shard:
             path = shard["metadata_path"]
@@ -373,6 +545,7 @@ class ParquetDataset:
                     hf_token=self.hf_token,
                     max_page_bytes=self.max_page_bytes,
                     cache_bytes=64 * 1024 * 1024,
+                    s3=repository.s3,
                 )
                 if expected_hash:
                     metadata_reader.verify_sha256(expected_hash)
@@ -511,8 +684,72 @@ class ParquetDataLoader:
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def get_metadata(self, shard_index: int, sample_index: int) -> dict:
-        return self.dataset.get_metadata(shard_index, sample_index)
+    def get_metadata(self, shard_index: int, sample_index: int | None = None) -> dict:
+        if sample_index is not None:
+            return self.dataset.get_metadata(shard_index, sample_index)
+        return {
+            entry["filename"]: entry
+            for entry in self.list_samples_in_shard(shard_index)
+        }
+
+    def list_samples_in_shard(self, shard_index: int) -> list[dict]:
+        records = self.dataset._metadata(shard_index)
+        output = []
+        for row_index in range(self.dataset.get_shard_info(shard_index)["num_rows"]):
+            row = records.get(row_index, {})
+            if row.get("url_status", "ok") != "ok" or (
+                "stored_bytes" in row and not row["stored_bytes"]
+            ):
+                continue
+            metadata = self.dataset.get_metadata(shard_index, row_index)
+            extension = "jxl" if metadata.get("stored_format") == "jxl" else "jpg"
+            output.append(
+                {
+                    **metadata,
+                    "sample_idx": row_index,
+                    "shard_idx": shard_index,
+                    "filename": f"{metadata['source_path']}/{row_index:012d}.{extension}",
+                }
+            )
+        return output
+
+    def list_shard_sample_aspect_buckets(
+        self,
+        shard_indices: list[int],
+        *,
+        key="aspect",
+        target_pixel_area=None,
+        target_resolution_multiple=64,
+        round_to=2,
+    ) -> list[dict]:
+        output = []
+        for shard in shard_indices:
+            entries = [
+                entry
+                for entry in self.list_samples_in_shard(shard)
+                if entry.get("width", 0)
+                and entry.get("height", 0)
+                and entry["width"] > 0
+                and entry["height"] > 0
+            ]
+            keys = _parquet_bucket_keys(
+                [(entry["width"], entry["height"]) for entry in entries],
+                key,
+                target_pixel_area,
+                target_resolution_multiple,
+                round_to,
+            )
+            buckets = {}
+            for bucket, entry in zip(keys, entries):
+                buckets.setdefault(bucket, []).append(entry)
+            output.append(
+                {
+                    "shard_idx": shard,
+                    "shard_name": self.dataset._shard(shard)["path"],
+                    "buckets": buckets,
+                }
+            )
+        return output
 
     def _sample(
         self, shard_index: int, sample_index: int, payloads: dict
@@ -547,16 +784,35 @@ class ParquetDataLoader:
 
     def load_sample(self, shard_index: int, sample_index: int) -> ParquetSample:
         self.get_metadata(shard_index, sample_index)
-        rows = self.dataset._file(shard_index).rows(
+        rows = self.dataset._file(shard_index, payload=True).rows(
             columns=self.image_columns, start=sample_index, stop=sample_index + 1
         )
         return self._sample(shard_index, sample_index, next(rows))
+
+    def load_samples(
+        self, requests: list[tuple[int, int]], *, parallel_reads: int = 4
+    ) -> list[ParquetSample]:
+        """Batch physical rows, sharing row-group reads and preserving duplicates/order."""
+        groups = {}
+        for position, (shard, row) in enumerate(requests):
+            self.dataset.get_metadata(shard, row)
+            groups.setdefault(shard, []).append((position, row))
+        output = [None] * len(requests)
+        for shard, selected in groups.items():
+            rows = self.dataset._file(shard, payload=True).rows_at(
+                [row for _, row in selected],
+                columns=self.image_columns,
+                parallel_reads=parallel_reads,
+            )
+            for (position, row), payloads in zip(selected, rows):
+                output[position] = self._sample(shard, row, payloads)
+        return output
 
     def iter_shard(
         self, shard_index: int, start: int = 0, stop: int | None = None
     ) -> Iterator[ParquetSample]:
         self.dataset._metadata(shard_index)
-        rows = self.dataset._file(shard_index).rows(
+        rows = self.dataset._file(shard_index, payload=True).rows(
             columns=self.image_columns, start=start, stop=stop
         )
         for sample_index, payloads in enumerate(rows, start=start):
