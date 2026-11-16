@@ -256,7 +256,7 @@ mod remote_range_tests {
 }
 
 // Import from modules
-mod aspect_buckets;
+pub(crate) mod aspect_buckets;
 mod batch;
 mod config;
 mod entry_types;

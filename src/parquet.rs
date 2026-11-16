@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use futures::{stream, StreamExt, TryStreamExt};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, FileReader, Length};
 use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
@@ -9,6 +10,7 @@ use pyo3::exceptions::{PyIndexError, PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 
 use crate::dataloader::file_loading::read_remote_range;
+use crate::dataloader::shard_cache::{ShardCache, ShardLockGuard};
+use crate::s3::{PyS3Store, Store};
 
 const RANGE_CHUNK: usize = 8 * 1024 * 1024;
 
@@ -27,7 +31,7 @@ fn python_error(error: ParquetError) -> PyErr {
     PyOSError::new_err(error.to_string())
 }
 
-fn runtime() -> ParquetResult<&'static Runtime> {
+pub(crate) fn runtime() -> ParquetResult<&'static Runtime> {
     static RUNTIME: OnceLock<std::result::Result<Runtime, String>> = OnceLock::new();
     RUNTIME
         .get_or_init(|| {
@@ -46,12 +50,29 @@ struct Source {
     size: u64,
     token: Option<String>,
     remote: bool,
+    s3: Option<(Arc<Store>, String, Option<String>)>,
+    _cache_guard: Option<ShardLockGuard>,
     bytes_read: AtomicU64,
     max_page_bytes: usize,
     cache: Mutex<Option<Bytes>>,
+    cached_ranges: Mutex<BTreeMap<u64, Bytes>>,
 }
 
 impl Source {
+    fn cached_range(&self, start: u64) -> ParquetResult<Option<Bytes>> {
+        let ranges = self
+            .cached_ranges
+            .lock()
+            .map_err(|_| parquet_error("Parquet range cache lock poisoned"))?;
+        Ok(ranges
+            .range(..=start)
+            .next_back()
+            .and_then(|(&offset, data)| {
+                let relative = (start - offset) as usize;
+                (relative < data.len()).then(|| data.slice(relative..))
+            }))
+    }
+
     fn read(&self, start: u64, length: usize) -> ParquetResult<Vec<u8>> {
         if start
             .checked_add(length as u64)
@@ -67,7 +88,25 @@ impl Source {
         {
             return Ok(data.slice(start as usize..start as usize + length).to_vec());
         }
-        let data = if self.remote {
+        if let Some(data) = self.cached_range(start)? {
+            if length <= data.len() {
+                return Ok(data.slice(..length).to_vec());
+            }
+        }
+        let data = if let Some((store, key, etag)) = &self.s3 {
+            let mut data = Vec::with_capacity(length);
+            while data.len() < length {
+                let count = RANGE_CHUNK.min(length - data.len());
+                let chunk = runtime()?
+                    .block_on(store.range(key, start + data.len() as u64, count, etag.clone()))
+                    .map_err(|_| parquet_error("S3 Parquet range request failed"))?;
+                if chunk.len() != count {
+                    return Err(parquet_error("S3 Parquet range length mismatch"));
+                }
+                data.extend_from_slice(&chunk);
+            }
+            data
+        } else if self.remote {
             let mut data = Vec::with_capacity(length);
             while data.len() < length {
                 let count = RANGE_CHUNK.min(length - data.len());
@@ -107,7 +146,14 @@ struct RangeStream {
 
 impl Read for RangeStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let length = buffer.len().min((self.source.size - self.offset) as usize);
+        let mut length = buffer.len().min((self.source.size - self.offset) as usize);
+        if let Some(cached) = self
+            .source
+            .cached_range(self.offset)
+            .map_err(std::io::Error::other)?
+        {
+            length = length.min(cached.len());
+        }
         let data = self
             .source
             .read(self.offset, length)
@@ -216,8 +262,109 @@ fn field_to_python(py: Python<'_>, field: &Field) -> PyResult<Py<PyAny>> {
     }
 }
 
+fn project_columns(schema: &Type, columns: Option<Vec<String>>) -> PyResult<Option<Type>> {
+    let Some(columns) = columns else {
+        return Ok(None);
+    };
+    if columns.is_empty() {
+        return Err(PyValueError::new_err("Select at least one Parquet column"));
+    }
+    let mut fields = Vec::new();
+    for name in columns {
+        let field = schema
+            .get_fields()
+            .iter()
+            .find(|field| field.name() == name)
+            .ok_or_else(|| PyValueError::new_err(format!("Unknown Parquet column: {name}")))?;
+        if fields.contains(field) {
+            return Err(PyValueError::new_err("Duplicate Parquet projection column"));
+        }
+        fields.push(field.clone());
+    }
+    Ok(Some(
+        Type::group_type_builder(schema.name())
+            .with_fields(fields)
+            .build()
+            .map_err(python_error)?,
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature=(dimensions, key="aspect", target_pixel_area=None, target_resolution_multiple=64, round_to=Some(2)))]
+pub fn _parquet_bucket_keys(
+    py: Python<'_>,
+    dimensions: Vec<(u32, u32)>,
+    key: &str,
+    target_pixel_area: Option<u32>,
+    target_resolution_multiple: u32,
+    round_to: Option<usize>,
+) -> PyResult<Vec<String>> {
+    use crate::dataloader::aspect_buckets::{calculate_bucket_key, BucketKeyType};
+    if target_resolution_multiple == 0 || target_pixel_area == Some(0) {
+        return Err(PyValueError::new_err(
+            "Target size and multiple must be positive",
+        ));
+    }
+    if dimensions.iter().any(|&(w, h)| w == 0 || h == 0) {
+        return Err(PyValueError::new_err("Image dimensions must be positive"));
+    }
+    let key = BucketKeyType::parse(key)?;
+    Ok(py.detach(move || {
+        dimensions
+            .into_iter()
+            .map(|(w, h)| {
+                calculate_bucket_key(
+                    &key,
+                    w,
+                    h,
+                    None,
+                    target_pixel_area,
+                    target_resolution_multiple,
+                    round_to,
+                )
+                .0
+            })
+            .collect()
+    }))
+}
+
+#[pyclass(name = "_ParquetCache")]
+pub struct PyParquetCache {
+    cache: ShardCache,
+}
+
+#[pymethods]
+impl PyParquetCache {
+    #[new]
+    #[pyo3(signature=(location, cache_limit_gb=25.0, parallel_downloads=4))]
+    fn new(
+        py: Python<'_>,
+        location: String,
+        cache_limit_gb: f64,
+        parallel_downloads: usize,
+    ) -> PyResult<Self> {
+        if !cache_limit_gb.is_finite() || cache_limit_gb <= 0.0 || parallel_downloads == 0 {
+            return Err(PyValueError::new_err(
+                "Cache size and parallel_downloads must be positive",
+            ));
+        }
+        py.detach(move || {
+            let mut cache = ShardCache::new(location.into(), cache_limit_gb, parallel_downloads);
+            runtime()
+                .map_err(python_error)?
+                .block_on(async {
+                    cache.ensure_cache_dir().await?;
+                    cache.initialize_from_disk().await
+                })
+                .map_err(PyErr::from)?;
+            Ok(Self { cache })
+        })
+    }
+}
+
 #[pyclass(name = "_ParquetFile")]
 pub struct PyParquetFile {
+    reader: Arc<SerializedFileReader<RangeSource>>,
     source: Arc<Source>,
     info_json: String,
     num_rows: usize,
@@ -226,7 +373,8 @@ pub struct PyParquetFile {
 #[pymethods]
 impl PyParquetFile {
     #[new]
-    #[pyo3(signature = (path, size=None, hf_token=None, max_page_bytes=536870912, cache_bytes=0))]
+    #[pyo3(signature = (path, size=None, hf_token=None, max_page_bytes=536870912, cache_bytes=0, s3=None, cache=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         path: String,
@@ -234,22 +382,47 @@ impl PyParquetFile {
         hf_token: Option<String>,
         max_page_bytes: usize,
         cache_bytes: usize,
+        s3: Option<PyRef<'_, PyS3Store>>,
+        cache: Option<PyRef<'_, PyParquetCache>>,
     ) -> PyResult<Self> {
         if max_page_bytes == 0 {
             return Err(PyValueError::new_err("max_page_bytes must be positive"));
         }
+        let store = s3.map(|s| s.inner.clone());
+        let cache = cache.map(|c| c.cache.clone());
         py.detach(move || {
-            let remote = path.starts_with("https://") || path.starts_with("http://");
-            let size = if remote {
-                size.ok_or_else(|| PyValueError::new_err("Remote Parquet files require their exact size"))?
+            let mut remote = path.starts_with("https://") || path.starts_with("http://");
+            let mut actual_path = path.clone();
+            let mut s3_source = None;
+            let mut guard = None;
+            let mut etag = None;
+            let size = if let Some(uri) = path.strip_prefix("s3://") {
+                let (bucket, key) = uri.split_once('/').ok_or_else(|| PyValueError::new_err("S3 Parquet URI requires an object key"))?;
+                let store = store.ok_or_else(|| PyValueError::new_err("S3 Parquet reads require an S3 store"))?;
+                if bucket != store.bucket { return Err(PyValueError::new_err("S3 store belongs to a different bucket")); }
+                let meta = runtime().map_err(python_error)?.block_on(store.head(key)).map_err(crate::s3::python_error)?;
+                if size.is_some_and(|expected| expected != meta.size) { return Err(PyValueError::new_err("S3 object size does not match its manifest")); }
+                etag = meta.e_tag.clone();
+                if let Some(cache) = &cache {
+                    let name = format!("{}.parquet", crate::digest_to_hex(Sha256::digest(format!("{}:{key}:{:?}", store.identity, meta.e_tag).as_bytes())));
+                    let (cached, lock) = runtime().map_err(python_error)?.block_on(cache.ensure_cached_with(&name, true, |target| { let store = store.clone(); let meta = meta.clone(); async move { store.download(key, &meta, &target).await } })).map_err(PyErr::from)?;
+                    actual_path = cached.to_string_lossy().into_owned(); guard = lock;
+                } else { s3_source = Some((store, key.to_string(), meta.e_tag.clone())); }
+                meta.size
+            } else if remote {
+                let size = size.ok_or_else(|| PyValueError::new_err("Remote Parquet files require their exact size"))?;
+                if let Some(cache) = &cache {
+                    let name = format!("{}.parquet", crate::digest_to_hex(Sha256::digest(path.as_bytes())));
+                    let (cached, lock) = runtime().map_err(python_error)?.block_on(cache.cache_shard_for_reading(&name, &path, hf_token.clone())).map_err(PyErr::from)?;
+                    actual_path = cached.to_string_lossy().into_owned(); guard = Some(lock); remote = false;
+                }
+                size
             } else {
                 let actual = std::fs::metadata(&path)?.len();
-                if size.is_some_and(|expected| expected != actual) {
-                    return Err(PyValueError::new_err("Parquet source size does not match its manifest"));
-                }
+                if size.is_some_and(|expected| expected != actual) { return Err(PyValueError::new_err("Parquet source size does not match its manifest")); }
                 actual
             };
-            let source = Arc::new(Source { path, size, token: hf_token, remote, bytes_read: AtomicU64::new(0), max_page_bytes, cache: Mutex::new(None) });
+            let source = Arc::new(Source { path: actual_path, size, token: hf_token, remote, s3: s3_source, _cache_guard: guard, bytes_read: AtomicU64::new(0), max_page_bytes, cache: Mutex::new(None), cached_ranges: Mutex::new(BTreeMap::new()) });
             if size <= cache_bytes as u64 {
                 let data = source.read(0, size as usize).map_err(python_error)?;
                 *source.cache.lock().map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))? = Some(data.into());
@@ -261,8 +434,8 @@ impl PyParquetFile {
             let binary_columns: Vec<_> = fields.iter().filter(|field| binary_field(field)).map(|field| field.name()).collect();
             let row_groups: Vec<_> = metadata.row_groups().iter().map(|group| group.num_rows()).collect();
             let num_rows = metadata.file_metadata().num_rows() as usize;
-            let info_json = serde_json::json!({"num_rows": num_rows, "columns": columns, "binary_columns": binary_columns, "row_groups": row_groups, "size": size}).to_string();
-            Ok(Self { source, info_json, num_rows })
+            let info_json = serde_json::json!({"num_rows": num_rows, "columns": columns, "binary_columns": binary_columns, "row_groups": row_groups, "size": size, "etag": etag}).to_string();
+            Ok(Self { reader: Arc::new(reader), source, info_json, num_rows })
         })
     }
 
@@ -282,11 +455,25 @@ impl PyParquetFile {
             if self.source.size > max_bytes as u64 {
                 return Ok(false);
             }
-            if self.source.cache.lock().map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))?.is_some() {
+            if self
+                .source
+                .cache
+                .lock()
+                .map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))?
+                .is_some()
+            {
                 return Ok(true);
             }
-            let data = self.source.read(0, self.source.size as usize).map_err(python_error)?;
-            *self.source.cache.lock().map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))? = Some(data.into());
+            let data = self
+                .source
+                .read(0, self.source.size as usize)
+                .map_err(python_error)?;
+            *self
+                .source
+                .cache
+                .lock()
+                .map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))? =
+                Some(data.into());
             Ok(true)
         })
     }
@@ -305,6 +492,176 @@ impl PyParquetFile {
             }
             Ok(())
         })
+    }
+
+    /// Coalesce only selected column chunks into a bounded metadata cache.
+    #[pyo3(signature=(columns, max_bytes=67108864, parallel_reads=4))]
+    fn prefetch_columns(
+        &self,
+        py: Python<'_>,
+        columns: Vec<String>,
+        max_bytes: usize,
+        parallel_reads: usize,
+    ) -> PyResult<bool> {
+        if parallel_reads == 0 {
+            return Err(PyValueError::new_err("parallel_reads must be positive"));
+        }
+        py.detach(|| {
+            project_columns(
+                self.reader
+                    .metadata()
+                    .file_metadata()
+                    .schema_descr()
+                    .root_schema(),
+                Some(columns.clone()),
+            )?;
+            let mut spans: Vec<_> = self
+                .reader
+                .metadata()
+                .row_groups()
+                .iter()
+                .flat_map(|group| group.columns())
+                .filter(|column| columns.contains(&column.column_path().parts()[0]))
+                .map(|column| {
+                    let (start, length) = column.byte_range();
+                    start
+                        .checked_add(length)
+                        .map(|end| start..end)
+                        .ok_or_else(|| PyValueError::new_err("Parquet column range overflow"))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            spans.sort_unstable_by_key(|span| span.start);
+            let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+            for span in spans {
+                if let Some(previous) = ranges.last_mut() {
+                    if span.start <= previous.end {
+                        previous.end = previous.end.max(span.end);
+                        continue;
+                    }
+                }
+                ranges.push(span);
+            }
+            let total = ranges
+                .iter()
+                .try_fold(0u64, |sum, span| sum.checked_add(span.end - span.start))
+                .ok_or_else(|| PyValueError::new_err("Parquet metadata size overflow"))?;
+            if total > max_bytes as u64 {
+                return Ok(false);
+            }
+            let data = runtime()
+                .map_err(python_error)?
+                .block_on(async {
+                    stream::iter(ranges.into_iter().map(|span| {
+                        let source = self.source.clone();
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                source
+                                    .read(span.start, (span.end - span.start) as usize)
+                                    .map(|data| (span.start, Bytes::from(data)))
+                            })
+                            .await
+                            .map_err(|_| parquet_error("Parquet metadata prefetch failed"))?
+                        }
+                    }))
+                    .buffer_unordered(parallel_reads)
+                    .try_collect::<BTreeMap<_, _>>()
+                    .await
+                })
+                .map_err(python_error)?;
+            *self
+                .source
+                .cached_ranges
+                .lock()
+                .map_err(|_| PyOSError::new_err("Parquet range cache lock poisoned"))? = data;
+            Ok(true)
+        })
+    }
+
+    /// Read each selected row group once, preserving request order and duplicates.
+    #[pyo3(signature=(indices, columns=None, parallel_reads=4))]
+    fn rows_at(
+        &self,
+        py: Python<'_>,
+        indices: Vec<usize>,
+        columns: Option<Vec<String>>,
+        parallel_reads: usize,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        if parallel_reads == 0 {
+            return Err(PyValueError::new_err("parallel_reads must be positive"));
+        }
+        if indices.iter().any(|&i| i >= self.num_rows) {
+            return Err(PyIndexError::new_err("Parquet row index out of bounds"));
+        }
+        let rows = py.detach(|| {
+            let projection = project_columns(
+                self.reader
+                    .metadata()
+                    .file_metadata()
+                    .schema_descr()
+                    .root_schema(),
+                columns,
+            )?;
+            let mut starts = vec![0];
+            for group in self.reader.metadata().row_groups() {
+                starts.push(starts.last().unwrap() + group.num_rows() as usize);
+            }
+            let mut groups: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+            for (position, index) in indices.iter().copied().enumerate() {
+                let group = starts.partition_point(|&start| start <= index) - 1;
+                groups
+                    .entry(group)
+                    .or_default()
+                    .push((index - starts[group], position));
+            }
+            let output = runtime()
+                .map_err(python_error)?
+                .block_on(async {
+                    stream::iter(groups.into_iter().map(|(group, mut selected)| {
+                        let reader = self.reader.clone();
+                        let projection = projection.clone();
+                        async move {
+                            tokio::task::spawn_blocking(
+                                move || -> ParquetResult<Vec<(usize, Row)>> {
+                                    selected.sort_unstable();
+                                    let group_reader = reader.get_row_group(group)?;
+                                    let mut rows =
+                                        RowIter::from_row_group(projection, group_reader.as_ref())?
+                                            .with_batch_size(1);
+                                    let mut current = 0;
+                                    let mut output = Vec::new();
+                                    let mut selected = selected.into_iter().peekable();
+                                    while let Some(&(wanted, _)) = selected.peek() {
+                                        while current < wanted {
+                                            rows.next().ok_or_else(|| {
+                                                parquet_error("Parquet ended before requested row")
+                                            })??;
+                                            current += 1;
+                                        }
+                                        let row = rows.next().ok_or_else(|| {
+                                            parquet_error("Parquet ended before requested row")
+                                        })??;
+                                        current += 1;
+                                        while selected.peek().is_some_and(|&(i, _)| i == wanted) {
+                                            output.push((selected.next().unwrap().1, row.clone()));
+                                        }
+                                    }
+                                    Ok(output)
+                                },
+                            )
+                            .await
+                            .map_err(|_| parquet_error("Parquet batch reader failed"))?
+                        }
+                    }))
+                    .buffer_unordered(parallel_reads)
+                    .try_collect::<Vec<_>>()
+                    .await
+                })
+                .map_err(python_error)?;
+            let mut rows: Vec<_> = output.into_iter().flatten().collect();
+            rows.sort_unstable_by_key(|(position, _)| *position);
+            Ok::<_, PyErr>(rows)
+        })?;
+        rows.iter().map(|(_, row)| row_to_python(py, row)).collect()
     }
 
     #[pyo3(signature = (columns=None, start=0, stop=None))]
@@ -342,33 +699,7 @@ impl PyParquetFile {
                 .file_metadata()
                 .schema_descr()
                 .root_schema();
-            let projection = if let Some(columns) = columns {
-                if columns.is_empty() {
-                    return Err(PyValueError::new_err("Select at least one Parquet column"));
-                }
-                let mut fields = Vec::new();
-                for name in columns {
-                    let field = schema
-                        .get_fields()
-                        .iter()
-                        .find(|field| field.name() == name)
-                        .ok_or_else(|| {
-                            PyValueError::new_err(format!("Unknown Parquet column: {name}"))
-                        })?;
-                    if fields.contains(field) {
-                        return Err(PyValueError::new_err("Duplicate Parquet projection column"));
-                    }
-                    fields.push(field.clone());
-                }
-                Some(
-                    Type::group_type_builder(schema.name())
-                        .with_fields(fields)
-                        .build()
-                        .map_err(python_error)?,
-                )
-            } else {
-                None
-            };
+            let projection = project_columns(schema, columns)?;
             let rows = RowIter::from_file_into(Box::new(reader))
                 .project(projection)
                 .map_err(python_error)?
