@@ -463,6 +463,19 @@ Hub discovery requires `webshart[hub]`; payload decoding is native Rust and does
 not require PyArrow, `datasets`, or `hf_xet`. Hub payload ranges reuse webshart's
 native Xet transport, with HTTP Range for non-Xet files.
 
+### Counting Parquet image rows
+
+`len(dataset)` counts physical rows. Call
+`dataset.count_rows(exclude_null_images=True)` when you need to count rows
+with embedded image bytes. Pass `shard_index` to limit either count to one
+shard. A zero-length byte string is present, and the count leaves physical row
+indices unchanged.
+
+The image count uses footer statistics where available. For row groups without
+null statistics, the reader scans the selected image column in bounded batches.
+The count applies to embedded bytes, including the `bytes` field in an image
+struct.
+
 ### Projected metadata reads
 
 Read selected physical rows and columns without materializing every row's

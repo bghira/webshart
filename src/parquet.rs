@@ -1,5 +1,8 @@
 use bytes::Bytes;
 use futures::{stream, StreamExt, TryStreamExt};
+use parquet::basic::Type as PhysicalType;
+use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
+use parquet::data_type::DataType;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, FileReader, Length};
 use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
@@ -25,6 +28,32 @@ const RANGE_CHUNK: usize = 8 * 1024 * 1024;
 
 fn parquet_error(message: impl ToString) -> ParquetError {
     ParquetError::General(message.to_string())
+}
+
+fn count_present_values<T: DataType>(
+    mut reader: ColumnReaderImpl<T>,
+    expected_rows: usize,
+) -> ParquetResult<usize> {
+    let mut levels = Vec::new();
+    let mut values = Vec::new();
+    let mut rows = 0;
+    let mut present = 0;
+    while rows < expected_rows {
+        levels.clear();
+        values.clear();
+        let (read, non_null, _) = reader.read_records(
+            (expected_rows - rows).min(256),
+            Some(&mut levels),
+            None,
+            &mut values,
+        )?;
+        if read == 0 {
+            return Err(parquet_error("Truncated Parquet image column"));
+        }
+        rows += read;
+        present += non_null;
+    }
+    Ok(present)
 }
 
 fn python_error(error: ParquetError) -> PyErr {
@@ -448,6 +477,56 @@ impl PyParquetFile {
         let value: serde_json::Value = serde_json::from_str(&self.info_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(pythonize::pythonize(py, &value)?.unbind())
+    }
+
+    /// Count non-null values in a scalar image column or an image struct's bytes field.
+    fn count_present_images(&self, py: Python<'_>, column: &str) -> PyResult<usize> {
+        py.detach(|| {
+            let metadata = self.reader.metadata();
+            let descriptor = metadata.file_metadata().schema_descr();
+            let (index, leaf) = descriptor
+                .columns()
+                .iter()
+                .enumerate()
+                .find(|(_, field)| {
+                    matches!(field.path().parts(), [name] if name == column)
+                        || matches!(field.path().parts(), [name, bytes] if name == column && bytes == "bytes")
+                })
+                .filter(|(_, field)| {
+                    field.max_rep_level() == 0
+                        && matches!(
+                            field.physical_type(),
+                            PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY
+                        )
+                })
+                .ok_or_else(|| PyValueError::new_err("Expected a scalar binary image column or an image struct with binary bytes"))?;
+
+            if leaf.max_def_level() == 0 {
+                return Ok(self.num_rows);
+            }
+
+            let mut present = 0;
+            for (group_index, group) in metadata.row_groups().iter().enumerate() {
+                let rows = group.num_rows() as usize;
+                let nulls = group.column(index).statistics().and_then(|stats| stats.null_count_opt());
+                if let Some(nulls) = nulls {
+                    let count = (rows as u64)
+                        .checked_sub(nulls)
+                        .ok_or_else(|| PyValueError::new_err("Parquet image null count exceeds row count"))?;
+                    present += count as usize;
+                } else {
+                    let group = self.reader.get_row_group(group_index).map_err(python_error)?;
+                    let reader = group.get_column_reader(index).map_err(python_error)?;
+                    present += match reader {
+                        ColumnReader::ByteArrayColumnReader(reader) => count_present_values(reader, rows),
+                        ColumnReader::FixedLenByteArrayColumnReader(reader) => count_present_values(reader, rows),
+                        _ => Err(parquet_error("Unexpected Parquet image column type")),
+                    }
+                    .map_err(python_error)?;
+                }
+            }
+            Ok(present)
+        })
     }
 
     #[getter]

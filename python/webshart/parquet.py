@@ -685,10 +685,26 @@ class ParquetDataset:
         return {**shard, "num_samples": shard["num_rows"], "format": "parquet"}
 
     def __len__(self) -> int:
-        if isinstance(self._shards, _CaptureCatalogue):
-            return self._shards.rows
+        return self.count_rows()
+
+    def count_rows(self, *, exclude_null_images=False, shard_index=None) -> int:
+        """Count physical rows, optionally requiring embedded non-null image bytes.
+
+        Null counts use Parquet footer statistics when available. Missing
+        statistics require reading the affected image column. An empty byte
+        string counts as present. Physical row indices are unchanged.
+        """
+        indices = range(self.num_shards) if shard_index is None else (shard_index,)
+        if not exclude_null_images:
+            published = self.physical_row_count if shard_index is None else None
+            if published is not None:
+                return published
+            return sum(self.get_shard_info(index)["num_rows"] for index in indices)
+        if self.image_url_column:
+            raise ValueError("Excluding null images requires an embedded image column")
         return sum(
-            self.get_shard_info(index)["num_rows"] for index in range(self.num_shards)
+            self._file(index).count_present_images(self.image_column)
+            for index in indices
         )
 
     def list_samples_in_shard(self, index: int) -> list[str]:

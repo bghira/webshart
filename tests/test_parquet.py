@@ -200,6 +200,49 @@ def test_json_caption_objects_and_mixed_lists_are_not_stringified(tmp_path):
     assert entries[2].caption is None
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("write_statistics", [False, True])
+def test_count_rows_can_exclude_null_image_bytes(tmp_path, nested, write_statistics):
+    values = [b"embedded", None, b"", None, b"last"]
+    rows = [
+        {
+            "image": (
+                None if index == 3 else {"bytes": value, "path": f"{index}.jpg"}
+            )
+            if nested
+            else value
+        }
+        for index, value in enumerate(values)
+    ]
+    write_source(tmp_path, rows, write_statistics=write_statistics)
+    write_source(tmp_path / "second", rows[:2], write_statistics=write_statistics)
+    dataset = webshart.discover_parquet_dataset(str(tmp_path))
+    assert len(dataset) == dataset.count_rows() == 7
+    assert dataset.count_rows(shard_index=0) in (2, 5)
+    for index in range(2):
+        reader = dataset._file(index)
+        before = reader.bytes_read
+        expected = {2: 1, 5: 3}[dataset.count_rows(shard_index=index)]
+        assert dataset.count_rows(shard_index=index, exclude_null_images=True) == expected
+        if write_statistics:
+            assert reader.bytes_read == before
+        else:
+            assert reader.bytes_read > before
+    assert dataset.count_rows(exclude_null_images=True) == 4
+    loader = webshart.ParquetDataLoader(dataset)
+    assert [entry["sample_idx"] for entry in loader.list_samples_in_shard(0)] == list(
+        range(dataset.count_rows(shard_index=0))
+    )
+
+
+def test_count_rows_does_not_treat_external_image_urls_as_embedded_bytes(tmp_path):
+    write_source(tmp_path, [{"image_url": "https://invalid.example/image.jpg"}])
+    dataset = webshart.discover_parquet_dataset(str(tmp_path), image_url_column="image_url")
+    assert dataset.count_rows() == 1
+    with pytest.raises(ValueError, match="embedded image column"):
+        dataset.count_rows(exclude_null_images=True)
+
+
 def test_native_lists_of_objects_and_huggingface_image_structs(tmp_path):
     write_source(
         tmp_path,
