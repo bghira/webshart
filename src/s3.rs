@@ -4,22 +4,38 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::{
     aws::{AmazonS3Builder, AwsCredential},
     path::Path as ObjectPath,
-    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, StaticCredentialProvider,
+    Attributes, GetOptions, GetRange, ObjectMeta, ObjectStore, StaticCredentialProvider,
 };
 use pyo3::{
     exceptions::{PyFileNotFoundError, PyOSError, PyPermissionError, PyValueError},
     prelude::*,
     types::PyBytes,
 };
-use sha2::{Digest, Sha256};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 use tokio::{io::AsyncWriteExt, sync::Semaphore};
+
+#[derive(Default)]
+struct TransportCounts {
+    heads: AtomicU64,
+    ranges: AtomicU64,
+    range_bytes: AtomicU64,
+    downloads: AtomicU64,
+    download_bytes: AtomicU64,
+    lists: AtomicU64,
+}
 
 pub(crate) struct Store {
     pub bucket: String,
     pub identity: String,
     store: Arc<dyn ObjectStore>,
     permits: Semaphore,
+    counts: TransportCounts,
 }
 
 pub(crate) fn python_error(error: object_store::Error) -> PyErr {
@@ -42,12 +58,24 @@ fn path(key: &str) -> object_store::Result<ObjectPath> {
 
 impl Store {
     pub async fn head(&self, key: &str) -> object_store::Result<ObjectMeta> {
+        Ok(self.head_with_attributes(key).await?.0)
+    }
+
+    pub async fn head_with_attributes(
+        &self,
+        key: &str,
+    ) -> object_store::Result<(ObjectMeta, Attributes)> {
         let _permit = self
             .permits
             .acquire()
             .await
             .expect("S3 semaphore stays open");
-        self.store.head(&path(key)?).await
+        self.counts.heads.fetch_add(1, Ordering::Relaxed);
+        let result = self
+            .store
+            .get_opts(&path(key)?, GetOptions::new().with_head(true))
+            .await?;
+        Ok((result.meta, result.attributes))
     }
 
     pub async fn range(
@@ -67,11 +95,17 @@ impl Store {
             if_match: etag,
             ..Default::default()
         };
-        self.store
+        self.counts.ranges.fetch_add(1, Ordering::Relaxed);
+        let data = self
+            .store
             .get_opts(&path(key)?, options)
             .await?
             .bytes()
-            .await
+            .await?;
+        self.counts
+            .range_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(data)
     }
 
     pub async fn read(&self, key: &str, limit: usize) -> PyResult<Vec<u8>> {
@@ -105,6 +139,7 @@ impl Store {
             if_match: meta.e_tag.clone(),
             ..Default::default()
         };
+        self.counts.downloads.fetch_add(1, Ordering::Relaxed);
         let mut stream = self
             .store
             .get_opts(&path(key).map_err(|_| error())?, options)
@@ -116,6 +151,9 @@ impl Store {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| error())?;
             written += chunk.len() as u64;
+            self.counts
+                .download_bytes
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
             if written > meta.size {
                 return Err(error());
             }
@@ -204,9 +242,23 @@ impl PyS3Store {
                     identity,
                     store: Arc::new(store),
                     permits: Semaphore::new(max_connections),
+                    counts: TransportCounts::default(),
                 }),
             })
         })
+    }
+
+    fn io_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let counts = &self.inner.counts;
+        let result = serde_json::json!({
+            "head_requests": counts.heads.load(Ordering::Relaxed),
+            "range_requests": counts.ranges.load(Ordering::Relaxed),
+            "range_bytes": counts.range_bytes.load(Ordering::Relaxed),
+            "downloads": counts.downloads.load(Ordering::Relaxed),
+            "download_bytes": counts.download_bytes.load(Ordering::Relaxed),
+            "list_operations": counts.lists.load(Ordering::Relaxed)
+        });
+        Ok(pythonize::pythonize(py, &result)?.unbind())
     }
 
     fn head(&self, py: Python<'_>, key: String) -> PyResult<Py<PyAny>> {
@@ -230,96 +282,36 @@ impl PyS3Store {
         Ok(PyBytes::new(py, &data).unbind())
     }
 
-    #[pyo3(signature=(key, expected_sha256=None, max_bytes=536870912))]
-    fn read_jsonl(
+    #[pyo3(signature=(key, destination, max_bytes=536870912))]
+    fn download_manifest(
         &self,
         py: Python<'_>,
         key: String,
-        expected_sha256: Option<String>,
-        max_bytes: usize,
-    ) -> PyResult<Py<PyAny>> {
-        let records = py.detach(|| {
+        destination: std::path::PathBuf,
+        max_bytes: u64,
+    ) -> PyResult<()> {
+        py.detach(|| {
             crate::parquet::runtime()
                 .map_err(|_| PyOSError::new_err("I/O runtime unavailable"))?
                 .block_on(async {
                     let meta = self.inner.head(&key).await.map_err(python_error)?;
-                    if meta.size > max_bytes as u64 {
+                    if meta.size > max_bytes {
                         return Err(PyValueError::new_err("Manifest exceeds max_bytes"));
                     }
-                    let options = GetOptions {
-                        if_match: meta.e_tag,
-                        ..Default::default()
-                    };
-                    let _permit = self
-                        .inner
-                        .permits
-                        .acquire()
+                    self.inner
+                        .download(&key, &meta, &destination)
                         .await
-                        .expect("S3 semaphore stays open");
-                    let mut stream = self
-                        .inner
-                        .store
-                        .get_opts(&path(&key).map_err(python_error)?, options)
-                        .await
-                        .map_err(python_error)?
-                        .into_stream();
-                    let mut buffer = Vec::new();
-                    let mut records = Vec::new();
-                    let mut size = 0;
-                    let mut hash = Sha256::new();
-                    while let Some(chunk) = stream.next().await {
-                        let chunk = chunk.map_err(python_error)?;
-                        size += chunk.len();
-                        if size > max_bytes {
-                            return Err(PyValueError::new_err("Manifest exceeds max_bytes"));
-                        }
-                        hash.update(&chunk);
-                        buffer.extend_from_slice(&chunk);
-                        let mut start = 0;
-                        for end in 0..buffer.len() {
-                            if buffer[end] == b'\n' {
-                                if end > start {
-                                    records.push(
-                                        serde_json::from_slice::<serde_json::Value>(
-                                            &buffer[start..end],
-                                        )
-                                        .map_err(|_| {
-                                            PyValueError::new_err("Invalid JSONL manifest")
-                                        })?,
-                                    );
-                                }
-                                start = end + 1;
-                            }
-                        }
-                        buffer.drain(..start);
-                        if buffer.len() > 1024 * 1024 {
-                            return Err(PyValueError::new_err("Manifest line exceeds 1 MiB"));
-                        }
-                    }
-                    if size as u64 != meta.size {
-                        return Err(PyOSError::new_err("Manifest length mismatch"));
-                    }
-                    if !buffer.is_empty() {
-                        records.push(
-                            serde_json::from_slice(&buffer)
-                                .map_err(|_| PyValueError::new_err("Invalid JSONL manifest"))?,
-                        );
-                    }
-                    if expected_sha256
-                        .is_some_and(|expected| expected != crate::digest_to_hex(hash.finalize()))
-                    {
-                        return Err(PyValueError::new_err("Manifest SHA-256 mismatch"));
-                    }
-                    Ok(records)
+                        .map_err(PyErr::from)?;
+                    Ok(())
                 })
-        })?;
-        Ok(pythonize::pythonize(py, &records)?.unbind())
+        })
     }
 
     #[pyo3(signature=(prefix=""))]
     fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<PyAny>> {
         let data = py.detach(|| {
             let prefix = path(prefix).map_err(python_error)?;
+            self.inner.counts.lists.fetch_add(1, Ordering::Relaxed);
             crate::parquet::runtime().map_err(|_| PyOSError::new_err("I/O runtime unavailable"))?.block_on(async {
                 self.inner.store.list(Some(&prefix)).map_ok(|m| serde_json::json!({"key":m.location.as_ref(),"size":m.size,"etag":m.e_tag})).try_collect::<Vec<_>>().await.map_err(python_error)
             })

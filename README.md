@@ -463,6 +463,60 @@ Hub discovery requires `webshart[hub]`; payload decoding is native Rust and does
 not require PyArrow, `datasets`, or `hf_xet`. Hub payload ranges reuse webshart's
 native Xet transport, with HTTP Range for non-Xet files.
 
+### Projected metadata reads
+
+Read selected physical rows and columns without materializing every row's
+metadata in the shard:
+
+```python
+rows = dataset.read_metadata_rows(0, [12, 3, 12], fields=["width", "height"])
+samples = loader.load_samples([(0, 12), (0, 3), (0, 12)], metadata_fields=[])
+for entry in loader.iter_samples_in_shard(0, metadata_fields=["width", "height"], batch_size=256):
+    print(entry["sample_idx"], entry["width"], entry["height"])
+```
+
+Requested order and duplicates are preserved. Every metadata result includes
+`source_path` and `source_row`; `fields=[]` returns only that identity.
+`captions`, `width`, and `height` resolve configured column aliases and custom
+overrides. Payload columns are excluded. `metadata_fields=[]` on `load_samples`
+loads image payloads without captions or other optional metadata. Omitting
+`fields` or `metadata_fields` returns all non-payload metadata.
+
+Projected sample listings still read capture status fields and omit failed
+captures. Aspect buckets accept `metadata_fields` too and add the dimensions
+needed for bucketing. `list_samples_in_shard` materializes the resulting list;
+`iter_samples_in_shard` bounds each projected read by `batch_size`.
+
+Capture manifests and custom metadata overlays use temporary SQLite indexes.
+Discovery streams and verifies the capture JSONL manifest without retaining a
+Python dictionary per shard or sending a HEAD request per object. For capture
+manifests, `dataset.physical_row_count` and `len(dataset)` return the published
+physical row count without opening payloads; this includes failed fetches.
+`physical_row_count` is `None` for other discovery modes.
+
+Custom overlays are fully validated when their index is built, including sparse
+row identity, duplicate rows, replacement coverage, and optional checksums.
+Only requested source columns are decoded by the native reader. Index and reader
+counts follow `metadata_cache_size`; large selected dictionaries can still cost
+substantial memory, and JSON companions retain their 16 MiB limit.
+Cached payload readers also follow the shard cache's byte budget, while allowing
+one oversized shard to be opened.
+
+For a persisted dataset view, save `dataset.source_revision_for_shard(index)`
+alongside each shard's accepted rows, then call
+`dataset.bind_source_revisions(lookup)` on the reopened dataset. `lookup(index)`
+returns the saved revision or `None` for an unpinned shard. New reader opens reject
+changed content: local files use SHA-256, Hub files use the pinned commit, and S3
+objects use ETags. Unhashed custom overlays are included in the revision. Binding
+a lookup clears existing reader and metadata caches.
+
+`dataset.io_stats()` reports logical S3 HEAD, range, download, and listing
+operations, plus transferred range/download bytes; SDK retries are internal.
+It returns an empty dictionary for other transports. These counters include
+manifest I/O. Per-shard `sha256` fields in a capture manifest are compared with
+S3's `sha256` object metadata when that metadata is present; range reads retain
+their ETag checks.
+
 ### Captured images on S3
 
 Native S3 access and batched row-group reads require webshart 0.8.0 or later.
@@ -750,8 +804,9 @@ overrides. Custom `captions`, `width`, and `height` override configured aliases.
 be present. It avoids reading upstream metadata columns. Payload columns cannot
 be overridden. Metadata is cached per shard with a bounded LRU (default: one
 shard; adjust `metadata_cache_size`). Recreate the dataset after changing files.
-Companion files up to 64 MiB are buffered while decoding so many small Parquet
-pages do not cause repeated network round trips; image payload files are not.
+Custom companion rows are indexed on temporary disk and read back by physical
+row. Overlay indexes are retained up to `metadata_cache_size`; eviction closes
+the least recently used index.
 
 Parquet structs, lists, and maps retain their native Python representations.
 For mixed strings/objects that Parquet cannot represent in one homogeneous

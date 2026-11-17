@@ -6,11 +6,15 @@ from dataclasses import dataclass
 from functools import wraps
 import hashlib
 import json
+import sqlite3
 import os
+import pickle
 from pathlib import Path, PurePosixPath
 import re
+from tempfile import TemporaryDirectory
 from threading import RLock
 from typing import Any, Iterator
+from weakref import finalize
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -151,7 +155,7 @@ class _Repository:
             Path(self.location(path)).stat().st_size if self.local else self.files[path]
         )
 
-    def read_json(self, path: str, expected_hash: str | None = None) -> Any:
+    def _json_bytes(self, path: str, expected_hash: str | None = None) -> bytes:
         if self.size(path) > 16 * 1024 * 1024:
             raise ValueError(
                 "JSON metadata exceeds 16 MiB; use Parquet metadata instead"
@@ -170,46 +174,80 @@ class _Repository:
                 raise ValueError("JSON metadata exceeds 16 MiB")
         if expected_hash and hashlib.sha256(content).hexdigest() != expected_hash:
             raise ValueError("Metadata SHA-256 mismatch")
-        return json.loads(content)
+        return content
 
-    def capture_records(self, manifest: str) -> list[dict]:
+    def read_json(self, path: str, expected_hash: str | None = None) -> Any:
+        return json.loads(self._json_bytes(path, expected_hash))
+
+    def iter_json_rows(self, path, expected_hash):
+        text = self._json_bytes(path, expected_hash).decode("utf-8-sig")
+        whitespace = re.compile(r"[ \t\n\r]*")
+        pos = whitespace.match(text).end()
+        if text[pos : pos + 1] != "[":
+            raise ValueError("JSON metadata must be a list of row objects")
+        decoder = json.JSONDecoder()
+        pos = whitespace.match(text, pos + 1).end()
+        if text[pos : pos + 1] != "]":
+            while True:
+                row, pos = decoder.raw_decode(text, pos)
+                yield row
+                pos = whitespace.match(text, pos).end()
+                if text[pos : pos + 1] == "]":
+                    break
+                if text[pos : pos + 1] != ",":
+                    raise ValueError("Invalid JSON metadata array separator")
+                pos = whitespace.match(text, pos + 1).end()
+        if whitespace.match(text, pos + 1).end() != len(text):
+            raise ValueError("Unexpected data after JSON metadata array")
+
+    def capture_records(self, manifest: str):
         descriptor = self.read_json(manifest)
         if descriptor.get("format") != "parquet-image-capture" or descriptor.get(
             "version"
         ) not in (1, 2):
             raise ValueError("Unsupported image capture manifest")
         path = _relative_path(descriptor["files_manifest"])
-        expected = descriptor.get("manifest_sha256")
-        if expected is not None and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        self.capture_digest = descriptor.get("manifest_sha256")
+        if self.capture_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.capture_digest
+        ):
             raise ValueError("Invalid manifest SHA-256")
-        if self.s3 is not None:
-            records = self.s3.read_jsonl(self.prefix + path, expected_sha256=expected)
-        elif self.local:
-            content = Path(self.location(path)).read_bytes()
-            if expected and hashlib.sha256(content).hexdigest() != expected:
-                raise ValueError("Manifest SHA-256 mismatch")
-            records = [
-                json.loads(line) for line in content.splitlines() if line.strip()
-            ]
-        else:
-            raise ValueError(
-                "Capture manifests currently require a local directory or S3 source"
-            )
-        output = []
-        for record in records:
-            key = _relative_path(record["key"])
-            size = _integer(record["size_bytes"], "size_bytes", 1)
+        return self._iter_capture_records(path)
+
+    def _iter_capture_records(self, path):
+        with TemporaryDirectory() as directory:
             if self.s3 is not None:
-                self.files[key] = size
-            output.append(
-                {
-                    "path": key,
-                    "size": size,
-                    "num_rows": _integer(record["num_rows"], "num_rows"),
-                }
-            )
-        self.capture_digest = expected
-        return output
+                local = Path(directory) / "manifest.jsonl"
+                self.s3.download_manifest(self.prefix + path, local)
+            elif self.local:
+                local = Path(self.location(path))
+            else:
+                raise ValueError(
+                    "Capture manifests currently require a local directory or S3 source"
+                )
+            digest = hashlib.sha256()
+            with local.open("rb") as stream:
+                while line := stream.readline(1024 * 1024 + 1):
+                    if len(line) > 1024 * 1024:
+                        raise ValueError("Manifest line exceeds 1 MiB")
+                    digest.update(line)
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    checksum = entry.get("sha256")
+                    if checksum is not None and (
+                        not isinstance(checksum, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+                    ):
+                        raise ValueError("Invalid capture shard SHA-256")
+                    yield {
+                        **({"sha256": checksum} if checksum is not None else {}),
+                        "path": _relative_path(entry["key"]),
+                        "size": _integer(entry["size_bytes"], "size_bytes", 1),
+                        "num_rows": _integer(entry["num_rows"], "num_rows"),
+                    }
+            if self.capture_digest and digest.hexdigest() != self.capture_digest:
+                raise ValueError("Manifest SHA-256 mismatch")
 
     def parquet_paths(self) -> list[str]:
         if self.local:
@@ -224,6 +262,59 @@ class _Repository:
                 if entry["key"].endswith(".parquet")
             }
         return sorted(path for path in self.files if path.endswith(".parquet"))
+
+
+class _CaptureCatalogue:
+    """Indexed capture manifest. SQLite removes its temporary database when closed."""
+
+    def __init__(self):
+        self.connection = sqlite3.connect("", check_same_thread=False)
+        finalize(self, self.connection.close)
+        self.connection.execute("PRAGMA journal_mode=OFF")
+        self.connection.execute(
+            "CREATE TABLE shards (path TEXT PRIMARY KEY, position INTEGER UNIQUE, size INTEGER, num_rows INTEGER, sha256 TEXT, etag TEXT)"
+        )
+        self.count = 0
+        self.rows = 0
+
+    def add(self, record, included):
+        position = self.count if included else None
+        try:
+            self.connection.execute(
+                "INSERT INTO shards(path, position, size, num_rows, sha256) VALUES (?, ?, ?, ?, ?)",
+                (
+                    record["path"],
+                    position,
+                    record["size"],
+                    record["num_rows"],
+                    record.get("sha256"),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Duplicate source shard: {record['path']}") from exc
+        if included:
+            self.count += 1
+            self.rows += record["num_rows"]
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        path, size, rows, checksum, etag = self.connection.execute(
+            "SELECT path, size, num_rows, sha256, etag FROM shards WHERE position = ?",
+            (index,),
+        ).fetchone()
+        shard = {"path": path, "size": size, "num_rows": rows}
+        if checksum is not None:
+            shard["sha256"] = checksum
+        if etag is not None:
+            shard["etag"] = etag
+        return shard
+
+    def set_etag(self, index, etag):
+        self.connection.execute(
+            "UPDATE shards SET etag=? WHERE position=?", (etag, index)
+        )
 
 
 class ParquetDataset:
@@ -281,6 +372,9 @@ class ParquetDataset:
         self._payload_files: OrderedDict[int, _ParquetFile] = OrderedDict()
         self._metadata_repo = None
         self._shard_cache = None
+        self._expected_source_revision = None
+        self._local_digests = OrderedDict()
+        self._overlays = OrderedDict()
         self._metadata_cache_dir = None
         capture_manifest = manifest
         manifest: dict = {}
@@ -383,21 +477,28 @@ class ParquetDataset:
                 sort_keys=True,
             ).encode()
         )
-        self._shards: list[dict] = []
+        self._shards = _CaptureCatalogue() if capture_manifest is not None else []
         paths = set()
         for record in records:
             record = dict(record)
             path = _relative_path(record["path"])
-            if path in paths:
-                raise ValueError(f"Duplicate source shard: {path}")
-            paths.add(path)
+            included = path.startswith(prefix)
+            if isinstance(self._shards, _CaptureCatalogue):
+                self._shards.add(record, included)
+            else:
+                if path in paths:
+                    raise ValueError(f"Duplicate source shard: {path}")
+                paths.add(path)
             if not path.endswith(".parquet"):
                 raise ValueError("Source shards must be Parquet files")
-            if not path.startswith(prefix):
+            if not included:
                 continue
-            if not self._source_repo.exists(path):
-                raise ValueError(f"Missing source shard: {path}")
-            actual_size = self._source_repo.size(path)
+            if capture_manifest is not None and self._source_repo.s3 is not None:
+                actual_size = record["size"]
+            else:
+                if not self._source_repo.exists(path):
+                    raise ValueError(f"Missing source shard: {path}")
+                actual_size = self._source_repo.size(path)
             if (
                 "size" in record
                 and _integer(record["size"], "shard size", 1) != actual_size
@@ -418,8 +519,14 @@ class ParquetDataset:
                 r"[0-9a-f]{64}", record["metadata_sha256"]
             ):
                 raise ValueError("Invalid metadata SHA-256")
-            self._shards.append(record)
+            if isinstance(self._shards, list):
+                self._shards.append(record)
+            # The manifest digest already covers the per-object hashes. Keep the existing catalogue ID.
+            if capture_manifest is not None and self._source_repo.capture_digest:
+                record.pop("sha256", None)
             fingerprint.update(json.dumps(record, sort_keys=True).encode())
+        if isinstance(self._shards, _CaptureCatalogue):
+            self._shards.connection.commit()
         self.fingerprint = fingerprint.hexdigest()
         if not self._shards:
             raise ValueError("No Parquet shards found")
@@ -431,10 +538,25 @@ class ParquetDataset:
             str(location), cache_limit_gb, parallel_downloads
         )
         self._payload_files.clear()
+        self._payload_budget = int(cache_limit_gb * 1024**3)
+        self._payload_sizes = {}
+
+    def io_stats(self):
+        """Logical S3 transport operations and transferred bytes. SDK retries are internal."""
+        return (
+            self._source_repo.s3.io_stats() if self._source_repo.s3 is not None else {}
+        )
 
     @property
     def num_shards(self) -> int:
         return len(self._shards)
+
+    @property
+    def physical_row_count(self):
+        """A published row count, available without opening any shard."""
+        return (
+            self._shards.rows if isinstance(self._shards, _CaptureCatalogue) else None
+        )
 
     def _shard(self, index: int) -> dict:
         if (
@@ -445,6 +567,61 @@ class ParquetDataset:
             raise IndexError("Parquet shard index out of bounds")
         return self._shards[index]
 
+    def _reader_revision(self, shard, reader):
+        repository = self._source_repo
+        if repository.local:
+            with Path(repository.location(shard["path"])).open("rb") as stream:
+                stat = os.fstat(stream.fileno())
+                stamp = (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+                if stamp not in self._local_digests:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                    if os.fstat(stream.fileno()).st_ctime_ns != stat.st_ctime_ns:
+                        raise ValueError(
+                            "Parquet object changed while computing its content revision."
+                        )
+                    self._local_digests[stamp] = digest
+                    if len(self._local_digests) > self.metadata_cache_size:
+                        self._local_digests.popitem(last=False)
+                self._local_digests.move_to_end(stamp)
+                return f"sha256:{self._local_digests[stamp]}"
+        if repository.s3 is None:
+            return f"hub:{repository.revision}"
+        etag = reader.info().get("etag")
+        if etag is None:
+            raise ValueError("An S3 ETag is required to pin a prepared Parquet source.")
+        return f"s3:{etag}"
+
+    @_synchronized
+    def bind_source_revisions(self, lookup):
+        """Look up prepared content pins by shard index on subsequent reader opens."""
+        self._expected_source_revision = lookup
+        self._files.clear()
+        self._payload_files.clear()
+        if self._shard_cache is not None:
+            self._payload_sizes.clear()
+        self._metadata_cache.clear()
+        for db in self._overlays.values():
+            db.close()
+        self._overlays.clear()
+
+    @_synchronized
+    def source_revision_for_shard(self, index):
+        return self._view_revision(index, self._shard(index), self._file(index))
+
+    def _view_revision(self, index, shard, reader):
+        physical = self._reader_revision(shard, reader)
+        if "metadata_path" in shard and "metadata_sha256" not in shard:
+            overlay = self._overlay_index(index, shard, reader.info())
+            (digest,) = overlay.execute("SELECT digest FROM revision").fetchone()
+            return json.dumps([physical, digest], separators=(",", ":"))
+        return physical
+
     @_synchronized
     def _file(self, index: int, *, payload: bool = False) -> _ParquetFile:
         shard = self._shard(index)
@@ -454,6 +631,14 @@ class ParquetDataset:
             else self._files
         )
         if index not in files:
+            if files is self._payload_files:
+                while files and (
+                    len(files) >= self.metadata_cache_size
+                    or sum(self._payload_sizes.values()) + shard["size"]
+                    > self._payload_budget
+                ):
+                    evicted = next(iter(files))
+                    del files[evicted], self._payload_sizes[evicted]
             reader = _ParquetFile(
                 self._source_repo.location(shard["path"]),
                 size=shard["size"],
@@ -461,19 +646,33 @@ class ParquetDataset:
                 max_page_bytes=self.max_page_bytes,
                 s3=self._source_repo.s3,
                 cache=self._shard_cache if payload else None,
+                expected_sha256=shard.get("sha256"),
             )
+            if self._expected_source_revision is not None:
+                expected = self._expected_source_revision(index)
+                if (
+                    expected is not None
+                    and self._view_revision(index, shard, reader) != expected
+                ):
+                    raise ValueError(
+                        "Parquet object changed since the accepted dataset view was prepared."
+                    )
             info = reader.info()
             if info.get("etag") is not None:
                 if "etag" in shard and shard["etag"] != info["etag"]:
                     raise OSError(
                         "S3 object changed since its first read; reopen the dataset"
                     )
+                if "etag" not in shard and isinstance(self._shards, _CaptureCatalogue):
+                    self._shards.set_etag(index, info["etag"])
                 shard["etag"] = info["etag"]
             count = info["num_rows"]
             if "num_rows" in shard and count != shard["num_rows"]:
                 raise ValueError("Source row count does not match metadata manifest")
             shard["num_rows"] = count
             files[index] = reader
+            if files is self._payload_files:
+                self._payload_sizes[index] = shard["size"]
             if len(files) > self.metadata_cache_size:
                 files.popitem(last=False)
         files.move_to_end(index)
@@ -486,6 +685,8 @@ class ParquetDataset:
         return {**shard, "num_samples": shard["num_rows"], "format": "parquet"}
 
     def __len__(self) -> int:
+        if isinstance(self._shards, _CaptureCatalogue):
+            return self._shards.rows
         return sum(
             self.get_shard_info(index)["num_rows"] for index in range(self.num_shards)
         )
@@ -529,78 +730,182 @@ class ParquetDataset:
                     )
                 )
             }
-        if "metadata_path" in shard:
-            path = shard["metadata_path"]
-            expected_hash = shard.get("metadata_sha256")
-            repository = self._metadata_repo
-            assert repository is not None
-            if path.endswith(".json"):
-                overlay = repository.read_json(path, expected_hash)
-                if not isinstance(overlay, list):
-                    raise ValueError("JSON metadata must be a list of row objects")
-            else:
-                metadata_reader = _ParquetFile(
-                    repository.location(path),
-                    size=repository.size(path),
-                    hf_token=self.hf_token,
-                    max_page_bytes=self.max_page_bytes,
-                    cache_bytes=64 * 1024 * 1024,
-                    s3=repository.s3,
-                )
-                if expected_hash:
-                    metadata_reader.verify_sha256(expected_hash)
-                if metadata_reader.info()["binary_columns"]:
-                    raise ValueError(
-                        "Custom metadata must not contain binary payload columns"
-                    )
-                overlay = metadata_reader.rows()
-            seen = set()
-            for row in overlay:
-                if not isinstance(row, dict):
-                    raise ValueError("Custom metadata rows must be objects")
-                row_index = _integer(row.get("source_row"), "source_row")
-                if row_index >= info["num_rows"] or row_index in seen:
-                    raise ValueError("Duplicate or out-of-bounds metadata source_row")
-                if "source_path" in row and row["source_path"] != shard["path"]:
-                    raise ValueError("Metadata source_path does not match its shard")
-                if (
-                    binary_columns.intersection(row)
-                    or self.image_column in row
-                    or self.image_url_column in row
-                ):
-                    raise ValueError("Custom metadata cannot override payload columns")
-                seen.add(row_index)
-                records.setdefault(row_index, {}).update(self._decode(row))
-            if self.metadata_mode == "replace" and len(seen) != info["num_rows"]:
-                raise ValueError("Replacement metadata must cover every source row")
-        elif self.metadata_mode == "replace":
-            raise ValueError(
-                "Replacement metadata requires a metadata file for every shard"
-            )
+        if "metadata_path" in shard or self.metadata_mode == "replace":
+            db = self._overlay_index(index, shard, info)
+            for row_index, value in db.execute("SELECT position, value FROM overlay"):
+                records.setdefault(row_index, {}).update(pickle.loads(value))
         self._metadata_cache[index] = records
         if len(self._metadata_cache) > self.metadata_cache_size:
             self._metadata_cache.popitem(last=False)
         return records
 
-    def get_metadata(self, shard_index: int, sample_index: int) -> dict:
-        shard = self.get_shard_info(shard_index)
+    def _overlay_index(self, index, shard, info):
+        if index in self._overlays:
+            self._overlays.move_to_end(index)
+            return self._overlays[index]
+        if "metadata_path" not in shard:
+            raise ValueError(
+                "Replacement metadata requires a metadata file for every shard"
+            )
+        path = shard["metadata_path"]
+        expected_hash = shard.get("metadata_sha256")
+        repository = self._metadata_repo
+        if path.endswith(".json"):
+            rows = repository.iter_json_rows(path, expected_hash)
+        else:
+            reader = _ParquetFile(
+                repository.location(path),
+                size=repository.size(path),
+                hf_token=self.hf_token,
+                max_page_bytes=self.max_page_bytes,
+                s3=repository.s3,
+            )
+            if expected_hash:
+                reader.verify_sha256(expected_hash)
+            if reader.info()["binary_columns"]:
+                raise ValueError(
+                    "Custom metadata must not contain binary payload columns"
+                )
+            rows = reader.rows()
+        forbidden = set(info["binary_columns"]) | {
+            self.image_column,
+            self.image_url_column,
+        }
+        db = sqlite3.connect("", check_same_thread=False)
+        try:
+            db.execute(
+                "CREATE TABLE overlay(position INTEGER PRIMARY KEY, value BLOB NOT NULL)"
+            )
+            digest = hashlib.sha256() if expected_hash is None else None
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("Custom metadata rows must be objects")
+                i = _integer(row.get("source_row"), "source_row")
+                if i >= info["num_rows"]:
+                    raise ValueError("Invalid out-of-bounds metadata source_row")
+                if "source_path" in row and row["source_path"] != shard["path"]:
+                    raise ValueError("Metadata source_path does not match its shard")
+                if forbidden.intersection(row):
+                    raise ValueError("Custom metadata cannot override payload columns")
+                try:
+                    encoded = pickle.dumps(self._decode(row), protocol=5)
+                    db.execute("INSERT INTO overlay VALUES (?,?)", (i, encoded))
+                    if digest is not None:
+                        digest.update(encoded)
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError("Duplicate metadata source_row") from exc
+            if self.metadata_mode == "replace" and db.total_changes != info["num_rows"]:
+                raise ValueError("Replacement metadata must cover every source row")
+            if digest is not None:
+                db.execute("CREATE TABLE revision(digest TEXT)")
+                db.execute("INSERT INTO revision VALUES (?)", (digest.hexdigest(),))
+            db.commit()
+        except BaseException:
+            db.close()
+            raise
+        self._overlays[index] = db
+        if len(self._overlays) > self.metadata_cache_size:
+            self._overlays.popitem(last=False)[1].close()
+        return db
+
+    @staticmethod
+    def _check_row(shard, index):
         if (
-            not isinstance(sample_index, int)
-            or isinstance(sample_index, bool)
-            or not 0 <= sample_index < shard["num_rows"]
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not 0 <= index < shard["num_rows"]
         ):
             raise IndexError("Parquet sample index out of bounds")
-        metadata = deepcopy(self._metadata(shard_index).get(sample_index, {}))
-        metadata["source_path"] = shard["path"]
-        metadata["source_row"] = sample_index
+
+    def _row_metadata(self, shard, index, record, fields=None):
+        metadata = deepcopy(
+            record
+            if fields is None
+            else {name: record[name] for name in fields if name in record}
+        )
         for output, column in (
             ("captions", self.caption_column),
             ("width", self.width_column),
             ("height", self.height_column),
         ):
-            if column in metadata and output not in metadata:
-                metadata[output] = metadata[column]
+            if (
+                (fields is None or output in fields)
+                and column in record
+                and output not in metadata
+            ):
+                metadata[output] = deepcopy(record[column])
+        metadata["source_path"] = shard["path"]
+        metadata["source_row"] = index
         return metadata
+
+    def get_metadata(self, shard_index: int, sample_index: int) -> dict:
+        shard = self.get_shard_info(shard_index)
+        self._check_row(shard, sample_index)
+        record = self._metadata(shard_index).get(sample_index, {})
+        return self._row_metadata(shard, sample_index, record)
+
+    def read_metadata_rows(
+        self, shard_index, indices, *, fields=None, parallel_reads=4
+    ):
+        """Read selected physical rows in order. Identity is always returned.
+
+        Source columns are projected at the reader. A disk-backed index validates
+        custom metadata coverage and uniqueness independently of the requested rows.
+        """
+        shard = self.get_shard_info(shard_index)
+        indices = list(indices)
+        for index in indices:
+            self._check_row(shard, index)
+        if isinstance(fields, str):
+            raise TypeError("fields must be a collection of column names")
+        fields = None if fields is None else frozenset(fields)
+        if not indices or fields == frozenset():
+            return [
+                {"source_path": shard["path"], "source_row": index} for index in indices
+            ]
+        info = self._file(shard_index).info()
+        if self.metadata_mode == "replace":
+            rows = ({} for _ in indices)
+        else:
+            reader = self._file(shard_index)
+            excluded = set(info["binary_columns"]) | {self.image_column}
+            columns = [name for name in info["columns"] if name not in excluded]
+            if fields is not None:
+                aliases = {
+                    "captions": self.caption_column,
+                    "width": self.width_column,
+                    "height": self.height_column,
+                }
+                requested = fields.union(
+                    aliases[name] for name in fields if name in aliases
+                )
+                columns = [name for name in columns if name in requested]
+            rows = (
+                (
+                    self._decode(row)
+                    for row in reader.rows_at(
+                        indices, columns=columns, parallel_reads=parallel_reads
+                    )
+                )
+                if columns
+                else ({} for _ in indices)
+            )
+        if "metadata_path" in shard or self.metadata_mode == "replace":
+            with self._lock:
+                overlay = self._overlay_index(shard_index, shard, info)
+                output = []
+                for index, row in zip(indices, rows, strict=True):
+                    value = overlay.execute(
+                        "SELECT value FROM overlay WHERE position=?", (index,)
+                    ).fetchone()
+                    if value is not None:
+                        row.update(pickle.loads(value[0]))
+                    output.append(self._row_metadata(shard, index, row, fields))
+                return output
+        return [
+            self._row_metadata(shard, index, row, fields)
+            for index, row in zip(indices, rows, strict=True)
+        ]
 
 
 @dataclass
@@ -692,26 +997,51 @@ class ParquetDataLoader:
             for entry in self.list_samples_in_shard(shard_index)
         }
 
-    def list_samples_in_shard(self, shard_index: int) -> list[dict]:
-        records = self.dataset._metadata(shard_index)
-        output = []
-        for row_index in range(self.dataset.get_shard_info(shard_index)["num_rows"]):
-            row = records.get(row_index, {})
-            if row.get("url_status", "ok") != "ok" or (
-                "stored_bytes" in row and not row["stored_bytes"]
+    def iter_samples_in_shard(
+        self, shard_index: int, *, metadata_fields=None, batch_size=256
+    ):
+        """Yield valid physical rows in capture order. Projected reads fetch at most one batch at a time."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        shard = self.dataset.get_shard_info(shard_index)
+        if metadata_fields is None:
+            records = self.dataset._metadata(shard_index)
+            rows = (
+                self.dataset._row_metadata(shard, index, records.get(index, {}))
+                for index in range(shard["num_rows"])
+            )
+        else:
+            fields = {*metadata_fields, "url_status", "stored_bytes", "stored_format"}
+            rows = (
+                row
+                for start in range(0, shard["num_rows"], batch_size)
+                for row in self.dataset.read_metadata_rows(
+                    shard_index,
+                    range(start, min(start + batch_size, shard["num_rows"])),
+                    fields=fields,
+                    parallel_reads=self.dataset.parallel_reads,
+                )
+            )
+        for metadata in rows:
+            row_index = metadata["source_row"]
+            if metadata.get("url_status", "ok") != "ok" or (
+                "stored_bytes" in metadata and not metadata["stored_bytes"]
             ):
                 continue
-            metadata = self.dataset.get_metadata(shard_index, row_index)
             extension = "jxl" if metadata.get("stored_format") == "jxl" else "jpg"
-            output.append(
-                {
-                    **metadata,
-                    "sample_idx": row_index,
-                    "shard_idx": shard_index,
-                    "filename": f"{metadata['source_path']}/{row_index:012d}.{extension}",
-                }
-            )
-        return output
+            yield {
+                **metadata,
+                "sample_idx": row_index,
+                "shard_idx": shard_index,
+                "filename": f"{metadata['source_path']}/{row_index:012d}.{extension}",
+            }
+
+    def list_samples_in_shard(
+        self, shard_index: int, *, metadata_fields=None
+    ) -> list[dict]:
+        return list(
+            self.iter_samples_in_shard(shard_index, metadata_fields=metadata_fields)
+        )
 
     def list_shard_sample_aspect_buckets(
         self,
@@ -721,12 +1051,17 @@ class ParquetDataLoader:
         target_pixel_area=None,
         target_resolution_multiple=64,
         round_to=2,
+        metadata_fields=None,
     ) -> list[dict]:
+        if metadata_fields is not None:
+            metadata_fields = {*metadata_fields, "width", "height"}
         output = []
         for shard in shard_indices:
             entries = [
                 entry
-                for entry in self.list_samples_in_shard(shard)
+                for entry in self.list_samples_in_shard(
+                    shard, metadata_fields=metadata_fields
+                )
                 if entry.get("width", 0)
                 and entry.get("height", 0)
                 and entry["width"] > 0
@@ -752,7 +1087,7 @@ class ParquetDataLoader:
         return output
 
     def _sample(
-        self, shard_index: int, sample_index: int, payloads: dict
+        self, shard_index: int, sample_index: int, payloads: dict, metadata=None
     ) -> ParquetSample:
         error = None
         if self.dataset.image_url_column:
@@ -773,7 +1108,8 @@ class ParquetDataLoader:
             raise TypeError(
                 "Image column must contain binary bytes or an image struct with bytes/path"
             )
-        metadata = self.get_metadata(shard_index, sample_index)
+        if metadata is None:
+            metadata = self.get_metadata(shard_index, sample_index)
         return ParquetSample(
             path=f"{metadata['source_path']}/{sample_index:012d}",
             data=data,
@@ -790,22 +1126,31 @@ class ParquetDataLoader:
         return self._sample(shard_index, sample_index, next(rows))
 
     def load_samples(
-        self, requests: list[tuple[int, int]], *, parallel_reads: int = 4
+        self,
+        requests: list[tuple[int, int]],
+        *,
+        parallel_reads: int = 4,
+        metadata_fields=None,
     ) -> list[ParquetSample]:
         """Batch physical rows, sharing row-group reads and preserving duplicates/order."""
         groups = {}
         for position, (shard, row) in enumerate(requests):
-            self.dataset.get_metadata(shard, row)
             groups.setdefault(shard, []).append((position, row))
         output = [None] * len(requests)
         for shard, selected in groups.items():
+            indices = [row for _, row in selected]
+            metadata = self.dataset.read_metadata_rows(
+                shard, indices, fields=metadata_fields, parallel_reads=parallel_reads
+            )
             rows = self.dataset._file(shard, payload=True).rows_at(
-                [row for _, row in selected],
+                indices,
                 columns=self.image_columns,
                 parallel_reads=parallel_reads,
             )
-            for (position, row), payloads in zip(selected, rows):
-                output[position] = self._sample(shard, row, payloads)
+            for (position, row), payloads, sample_metadata in zip(
+                selected, rows, metadata, strict=True
+            ):
+                output[position] = self._sample(shard, row, payloads, sample_metadata)
         return output
 
     def iter_shard(

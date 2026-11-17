@@ -373,7 +373,7 @@ pub struct PyParquetFile {
 #[pymethods]
 impl PyParquetFile {
     #[new]
-    #[pyo3(signature = (path, size=None, hf_token=None, max_page_bytes=536870912, cache_bytes=0, s3=None, cache=None))]
+    #[pyo3(signature = (path, size=None, hf_token=None, max_page_bytes=536870912, cache_bytes=0, s3=None, cache=None, expected_sha256=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -384,6 +384,7 @@ impl PyParquetFile {
         cache_bytes: usize,
         s3: Option<PyRef<'_, PyS3Store>>,
         cache: Option<PyRef<'_, PyParquetCache>>,
+        expected_sha256: Option<String>,
     ) -> PyResult<Self> {
         if max_page_bytes == 0 {
             return Err(PyValueError::new_err("max_page_bytes must be positive"));
@@ -400,7 +401,11 @@ impl PyParquetFile {
                 let (bucket, key) = uri.split_once('/').ok_or_else(|| PyValueError::new_err("S3 Parquet URI requires an object key"))?;
                 let store = store.ok_or_else(|| PyValueError::new_err("S3 Parquet reads require an S3 store"))?;
                 if bucket != store.bucket { return Err(PyValueError::new_err("S3 store belongs to a different bucket")); }
-                let meta = runtime().map_err(python_error)?.block_on(store.head(key)).map_err(crate::s3::python_error)?;
+                let (meta, attributes) = runtime().map_err(python_error)?.block_on(store.head_with_attributes(key)).map_err(crate::s3::python_error)?;
+                let digest = attributes.get(&object_store::Attribute::Metadata("sha256".into()));
+                if let (Some(expected), Some(actual)) = (&expected_sha256, digest) {
+                    if expected != actual.as_ref() { return Err(PyValueError::new_err("S3 object SHA-256 metadata does not match its capture manifest")); }
+                }
                 if size.is_some_and(|expected| expected != meta.size) { return Err(PyValueError::new_err("S3 object size does not match its manifest")); }
                 etag = meta.e_tag.clone();
                 if let Some(cache) = &cache {
