@@ -1,10 +1,11 @@
 """Authenticated S3 transport and captured-Parquet training reads."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import multiprocessing
 import threading
 
 import pyarrow as pa
@@ -148,6 +149,88 @@ def capture(tmp_path):
     }
 
 
+def _open_shared_capture(options, cache):
+    dataset = ParquetDataset(
+        "s3://test-bucket",
+        manifest="combined/dataset.json",
+        s3_options=options,
+        catalogue_cache_dir=cache,
+    )
+    return dataset.fingerprint, dataset.physical_row_count
+
+
+def test_capture_catalogue_is_published_once_and_reused_across_processes(tmp_path):
+    objects = capture(tmp_path)
+    cache = tmp_path / "shared"
+    with s3_server(objects) as (options, calls, etags):
+        with ProcessPoolExecutor(
+            max_workers=4, mp_context=multiprocessing.get_context("spawn")
+        ) as pool:
+            futures = [
+                pool.submit(_open_shared_capture, options, cache) for _ in range(8)
+            ]
+            opened = [future.result(timeout=60) for future in futures]
+        assert len(set(opened)) == 1
+        assert opened[0][1] == 4
+        assert (
+            sum(
+                method == "GET" and key == "catalog/manifest.jsonl"
+                for method, key, _ in calls
+            )
+            == 1
+        )
+        assert len(list(cache.glob("*.sqlite3"))) == 1
+
+        dataset = ParquetDataset(
+            "s3://test-bucket",
+            manifest="combined/dataset.json",
+            s3_options=options,
+            catalogue_cache_dir=cache,
+        )
+        assert ParquetDataLoader(dataset).load_sample(0, 0).data == b"first"
+        assert "etag" in dataset.get_shard_info(0)
+        other = ParquetDataset(
+            "s3://test-bucket",
+            manifest="combined/dataset.json",
+            s3_options=options,
+            catalogue_cache_dir=cache,
+        )
+        assert "etag" not in other.get_shard_info(0)
+        assert (
+            sum(
+                method == "GET" and key == "catalog/manifest.jsonl"
+                for method, key, _ in calls
+            )
+            == 1
+        )
+
+        manifest_key = "catalog/manifest.jsonl"
+        replaced = objects[manifest_key].replace(b'"num_rows": 4', b'"num_rows": 5')
+        descriptor = json.loads(objects["combined/dataset.json"])
+        descriptor["manifest_sha256"] = hashlib.sha256(replaced).hexdigest()
+        for key, data in (
+            (manifest_key, replaced),
+            ("combined/dataset.json", json.dumps(descriptor).encode()),
+        ):
+            objects[key] = data
+            etags[key] = '"' + hashlib.md5(data).hexdigest() + '"'
+        revised = _open_shared_capture(options, cache)
+        assert revised[1] == 5
+        assert revised[0] != opened[0][0]
+        assert dataset.physical_row_count == 4
+        assert len(list(cache.glob("*.sqlite3"))) == 2
+
+
+def test_failed_capture_index_build_does_not_publish(tmp_path):
+    objects = capture(tmp_path)
+    objects["catalog/manifest.jsonl"] += b"\n"
+    cache = tmp_path / "shared"
+    with s3_server(objects) as (options, _, _):
+        with pytest.raises(ValueError, match="Manifest SHA-256"):
+            _open_shared_capture(options, cache)
+    assert not list(cache.glob("*.sqlite3"))
+
+
 def test_signed_capture_discovery_projection_batch_and_cache(tmp_path):
     objects = capture(tmp_path)
     with s3_server(objects) as (options, calls, _):
@@ -156,6 +239,8 @@ def test_signed_capture_discovery_projection_batch_and_cache(tmp_path):
         )
         assert dataset.num_shards == 1
         assert dataset.physical_row_count == len(dataset) == 4
+        assert dataset.get_shard_position("parts/part.parquet") == 0
+        assert dataset.get_shard_position("parts/missing.parquet") is None
         assert not any(key == "parts/part.parquet" for _, key, _ in calls)
         assert dataset.count_rows(exclude_null_images=True) == 3
         assert all(
@@ -411,6 +496,62 @@ def test_metadata_prefetch_coalesces_columns_and_respects_budget(tmp_path):
         rows = reader.rows_at([3, 0, 2], columns=columns)
         assert [row["captions"] for row in rows] == ["four", "one", "three"]
         assert sum(method == "GET" for method, _, _ in calls) == gets
+
+
+def test_projected_scan_coalesces_remote_metadata_ranges(tmp_path):
+    with s3_server(capture(tmp_path)) as (options, calls, _):
+        dataset = ParquetDataset(
+            "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+        )
+        dataset.get_metadata(0, 0)
+        calls.clear()
+        rows = list(
+            ParquetDataLoader(dataset).iter_samples_in_shard(
+                0, metadata_fields=["captions"], batch_size=1
+            )
+        )
+        assert [row["captions"] for row in rows] == ["one", "three", "four"]
+        gets = [headers for method, _, headers in calls if method == "GET"]
+        assert len(gets) <= 5
+        assert all(headers.get("range") for headers in gets)
+
+
+def test_projected_scan_prefetches_windows_when_a_shard_exceeds_budget(
+    tmp_path, monkeypatch
+):
+    with s3_server(capture(tmp_path)) as (options, calls, _):
+        dataset = ParquetDataset(
+            "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+        )
+        reader = dataset._file(0)
+        columns = dataset._metadata_columns(
+            reader.info(), {"captions", "url_status", "stored_bytes", "stored_format"}
+        )
+
+        def prefetched_ranges(group):
+            calls.clear()
+            assert reader.prefetch_columns(
+                columns, start_group=group, stop_group=group + 1
+            )
+            return [headers["range"] for method, _, headers in calls if method == "GET"]
+
+        def range_bytes(ranges):
+            bounds = (value.removeprefix("bytes=").split("-") for value in ranges)
+            return sum(int(stop) - int(start) + 1 for start, stop in bounds)
+
+        windows = [prefetched_ranges(group) for group in range(2)]
+        budget = max(map(range_bytes, windows))
+        assert not reader.prefetch_columns(columns, max_bytes=budget)
+        monkeypatch.setattr("webshart.parquet.PROJECTED_SCAN_CACHE_BYTES", budget)
+
+        calls.clear()
+        rows = list(ParquetDataLoader(dataset).iter_samples_in_shard(0, metadata_fields=["captions"]))
+        assert [(row["sample_idx"], row["captions"]) for row in rows] == [
+            (0, "one"), (2, "three"), (3, "four")
+        ]
+        gets = [headers["range"] for method, _, headers in calls if method == "GET"]
+        # Each projected column run is fetched in its window without falling back to page reads.
+        assert sorted(gets) == sorted(windows[0] + windows[1])
 
 
 def test_explicit_credentials_do_not_inherit_environment_session_token(

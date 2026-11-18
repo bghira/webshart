@@ -622,6 +622,7 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
     loader = webshart.ParquetDataLoader(dataset)
     native = dataset._file(0)
     reads = []
+    yielded = []
 
     class Reader:
         def info(self):
@@ -633,6 +634,12 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
             return native.rows_at(
                 indices, columns=columns, parallel_reads=parallel_reads
             )
+
+        def rows(self, *, columns):
+            reads.append(("stream", columns))
+            for index, row in enumerate(native.rows(columns=columns)):
+                yielded.append(index)
+                yield row
 
     monkeypatch.setattr(dataset, "_file", lambda *args, **kwargs: Reader())
 
@@ -653,11 +660,36 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
     reads.clear()
     entries = loader.iter_samples_in_shard(0, metadata_fields=["width"], batch_size=1)
     assert next(entries)["source_row"] == 0
-    assert len(reads) == 1 and reads[0][0] == [0] and "image" not in reads[0][1]
-    entries.close()
-    assert len(reads) == 1
+    assert yielded == [0]
+    assert len(reads) == 1 and reads[0][0] == "stream" and "image" not in reads[0][1]
+    list(entries)
+    assert yielded == [0, 1, 2] and len(reads) == 1
     with pytest.raises(IndexError):
         dataset.read_metadata_rows(0, [True], fields=[])
+
+
+def test_distinct_shard_readers_can_open_in_parallel(tmp_path, monkeypatch):
+    from webshart import parquet as module
+
+    first = write_source(tmp_path)
+    first.with_name("second.parquet").write_bytes(first.read_bytes())
+    dataset = webshart.discover_parquet_dataset(str(tmp_path), metadata_cache_size=2)
+    ready = threading.Barrier(2)
+
+    def open_reader(*args, **kwargs):
+        ready.wait(timeout=5)
+        return _ParquetFile(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_ParquetFile", open_reader)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = list(
+            pool.map(
+                lambda shard: dataset.read_metadata_rows(shard, [0], fields=["width"]),
+                (0, 1),
+            )
+        )
+    assert [result[0]["width"] for result in rows] == [4, 4]
+    assert len(dataset._files) == 2
 
 
 def test_projected_overlay_preserves_native_decimal_values(tmp_path):
