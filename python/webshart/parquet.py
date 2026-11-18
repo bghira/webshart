@@ -713,9 +713,10 @@ class ParquetDataset:
             db.close()
         self._overlays.clear()
 
-    @_synchronized
     def source_revision_for_shard(self, index):
-        return self._view_revision(index, self._shard(index), self._file(index))
+        reader = self._file(index)
+        with self._lock:
+            return self._view_revision(index, self._shard(index), reader)
 
     def _view_revision(self, index, shard, reader):
         physical = self._reader_revision(shard, reader)
@@ -725,32 +726,27 @@ class ParquetDataset:
             return json.dumps([physical, digest], separators=(",", ":"))
         return physical
 
-    @_synchronized
     def _file(self, index: int, *, payload: bool = False) -> _ParquetFile:
-        shard = self._shard(index)
-        files = (
-            self._payload_files
-            if payload and self._shard_cache is not None
-            else self._files
+        with self._lock:
+            shard = self._shard(index)
+            cache = self._shard_cache if payload else None
+            files = self._payload_files if cache is not None else self._files
+            if index in files:
+                files.move_to_end(index)
+                return files[index]
+
+        reader = _ParquetFile(
+            self._source_repo.location(shard["path"]),
+            size=shard["size"],
+            hf_token=self.hf_token,
+            max_page_bytes=self.max_page_bytes,
+            s3=self._source_repo.s3,
+            cache=cache,
+            expected_sha256=shard.get("sha256"),
         )
-        if index not in files:
-            if files is self._payload_files:
-                while files and (
-                    len(files) >= self.metadata_cache_size
-                    or sum(self._payload_sizes.values()) + shard["size"]
-                    > self._payload_budget
-                ):
-                    evicted = next(iter(files))
-                    del files[evicted], self._payload_sizes[evicted]
-            reader = _ParquetFile(
-                self._source_repo.location(shard["path"]),
-                size=shard["size"],
-                hf_token=self.hf_token,
-                max_page_bytes=self.max_page_bytes,
-                s3=self._source_repo.s3,
-                cache=self._shard_cache if payload else None,
-                expected_sha256=shard.get("sha256"),
-            )
+        info = reader.info()
+        with self._lock:
+            shard = self._shard(index)
             if self._expected_source_revision is not None:
                 expected = self._expected_source_revision(index)
                 if (
@@ -760,7 +756,6 @@ class ParquetDataset:
                     raise ValueError(
                         "Parquet object changed since the accepted dataset view was prepared."
                     )
-            info = reader.info()
             if info.get("etag") is not None:
                 if "etag" in shard and shard["etag"] != info["etag"]:
                     raise OSError(
@@ -773,13 +768,23 @@ class ParquetDataset:
             if "num_rows" in shard and count != shard["num_rows"]:
                 raise ValueError("Source row count does not match metadata manifest")
             shard["num_rows"] = count
+            if index in files:
+                files.move_to_end(index)
+                return files[index]
+            if files is self._payload_files:
+                while files and (
+                    len(files) >= self.metadata_cache_size
+                    or sum(self._payload_sizes.values()) + shard["size"]
+                    > self._payload_budget
+                ):
+                    evicted = next(iter(files))
+                    del files[evicted], self._payload_sizes[evicted]
             files[index] = reader
             if files is self._payload_files:
                 self._payload_sizes[index] = shard["size"]
             if len(files) > self.metadata_cache_size:
                 files.popitem(last=False)
-        files.move_to_end(index)
-        return files[index]
+            return reader
 
     def get_shard_info(self, index: int) -> dict:
         shard = self._shard(index)

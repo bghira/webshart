@@ -668,6 +668,30 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
         dataset.read_metadata_rows(0, [True], fields=[])
 
 
+def test_distinct_shard_readers_can_open_in_parallel(tmp_path, monkeypatch):
+    from webshart import parquet as module
+
+    first = write_source(tmp_path)
+    first.with_name("second.parquet").write_bytes(first.read_bytes())
+    dataset = webshart.discover_parquet_dataset(str(tmp_path), metadata_cache_size=2)
+    ready = threading.Barrier(2)
+
+    def open_reader(*args, **kwargs):
+        ready.wait(timeout=5)
+        return _ParquetFile(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_ParquetFile", open_reader)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = list(
+            pool.map(
+                lambda shard: dataset.read_metadata_rows(shard, [0], fields=["width"]),
+                (0, 1),
+            )
+        )
+    assert [result[0]["width"] for result in rows] == [4, 4]
+    assert len(dataset._files) == 2
+
+
 def test_projected_overlay_preserves_native_decimal_values(tmp_path):
     from decimal import Decimal
 
