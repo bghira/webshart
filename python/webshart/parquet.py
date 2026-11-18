@@ -868,8 +868,9 @@ class ParquetDataset:
     ):
         """Read selected physical rows in order. Identity is always returned.
 
-        Source columns are projected at the reader. A disk-backed index validates
-        custom metadata coverage and uniqueness independently of the requested rows.
+        Source columns are projected at the reader, using a cached S3 shard when
+        available. A disk-backed index validates custom metadata coverage and
+        uniqueness independently of the requested rows.
         """
         shard = self.get_shard_info(shard_index)
         indices = list(indices)
@@ -903,7 +904,10 @@ class ParquetDataset:
                 (
                     self._decode(row)
                     for row in reader.rows_at(
-                        indices, columns=columns, parallel_reads=parallel_reads
+                        indices,
+                        columns=columns,
+                        parallel_reads=parallel_reads,
+                        shard_cache=self._shard_cache,
                     )
                 )
                 if columns

@@ -216,6 +216,63 @@ def test_signed_capture_discovery_projection_batch_and_cache(tmp_path):
         assert stats["list_operations"] == 0
 
 
+def test_s3_projection_reuses_a_shard_populated_by_another_reader(tmp_path):
+    objects = capture(tmp_path)
+    cache = tmp_path / "cache"
+    path = "parts/part.parquet"
+    with s3_server(objects) as (options, calls, etags):
+
+        def open_dataset():
+            dataset = ParquetDataset(
+                "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+            )
+            dataset.enable_shard_cache(str(cache), 0.01)
+            return dataset
+
+        def projection(dataset):
+            return dataset.read_metadata_rows(0, [3, 0, 3], fields=["captions"])
+
+        projecting = open_dataset()
+        before = len(calls)
+        expected = projection(projecting)
+        assert [row["captions"] for row in expected] == ["four", "one", "four"]
+        assert all(set(row) == {"captions", "source_path", "source_row"} for row in expected)
+        reads = [
+            headers
+            for method, key, headers in calls[before:]
+            if method == "GET" and key == path
+        ]
+        assert reads and all(headers.get("range") for headers in reads)
+        assert not list(cache.glob("*.parquet"))
+
+        payload_reader = open_dataset()
+        assert ParquetDataLoader(payload_reader).load_sample(0, 3).data == b"fourth"
+        assert len(list(cache.glob("*.parquet"))) == 1
+
+        before = len(calls)
+        assert projection(projecting) == expected
+        assert len(calls) == before
+
+        reopened = open_dataset()
+        revision = projecting.source_revision_for_shard(0)
+        reopened.bind_source_revisions({0: revision}.get)
+        assert reopened.source_revision_for_shard(0) == revision
+        before = len(calls)
+        assert projection(reopened) == expected
+        assert len(calls) == before
+
+        etags[path] = '"replacement"'
+        replaced = open_dataset()
+        replaced.source_revision_for_shard(0)
+        before = len(calls)
+        assert projection(replaced) == expected
+        assert any(method == "GET" and key == path for method, key, _ in calls[before:])
+        assert len(list(cache.glob("*.parquet"))) == 1
+        replaced.bind_source_revisions({0: revision}.get)
+        with pytest.raises(ValueError, match="accepted dataset view"):
+            projection(replaced)
+
+
 def test_s3_limits_missing_and_etag_change(tmp_path):
     objects = capture(tmp_path)
     with s3_server(objects) as (options, calls, etags):
