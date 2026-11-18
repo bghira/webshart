@@ -410,6 +410,8 @@ def discover_dataset(
     Returns:
         DiscoveredDataset, or ParquetDataset when format="parquet". Parquet
         options include revision, image_column, caption_column and json_columns.
+        Pass catalogue_cache_dir with a capture manifest to share the indexed
+        catalogue across processes that use the same filesystem.
     """
     if format == "parquet":
         return discover_parquet_dataset(

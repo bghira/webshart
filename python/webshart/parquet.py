@@ -18,6 +18,8 @@ from weakref import finalize
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from filelock import FileLock
+
 from ._webshart import _ParquetFile, _ParquetCache, _S3Store, _parquet_bucket_keys
 from .url_images import URLImageError, URLImageOptions, URLImageClient
 
@@ -200,7 +202,7 @@ class _Repository:
         if whitespace.match(text, pos + 1).end() != len(text):
             raise ValueError("Unexpected data after JSON metadata array")
 
-    def capture_records(self, manifest: str):
+    def capture_manifest_path(self, manifest: str):
         descriptor = self.read_json(manifest)
         if descriptor.get("format") != "parquet-image-capture" or descriptor.get(
             "version"
@@ -212,9 +214,25 @@ class _Repository:
             r"[0-9a-f]{64}", self.capture_digest
         ):
             raise ValueError("Invalid manifest SHA-256")
-        return self._iter_capture_records(path)
+        return path
 
-    def _iter_capture_records(self, path):
+    def capture_manifest_version(self, path):
+        if self.s3 is not None:
+            head = self.s3.head(self.prefix + path)
+            etag = head.get("etag")
+            if etag is None:
+                raise ValueError("An S3 ETag is required to cache a capture manifest.")
+            return (etag, head["size"])
+        stat = Path(self.location(path)).stat()
+        return (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+
+    def iter_capture_records(self, path):
         with TemporaryDirectory() as directory:
             if self.s3 is not None:
                 local = Path(directory) / "manifest.jsonl"
@@ -265,17 +283,43 @@ class _Repository:
 
 
 class _CaptureCatalogue:
-    """Indexed capture manifest. SQLite removes its temporary database when closed."""
+    """Immutable manifest rows with a private index of ETags observed by this reader."""
 
-    def __init__(self):
-        self.connection = sqlite3.connect("", check_same_thread=False)
-        finalize(self, self.connection.close)
-        self.connection.execute("PRAGMA journal_mode=OFF")
-        self.connection.execute(
-            "CREATE TABLE shards (path TEXT PRIMARY KEY, position INTEGER UNIQUE, size INTEGER, num_rows INTEGER, sha256 TEXT, etag TEXT)"
+    def __init__(self, path=None, *, readonly=False):
+        location = (
+            path.resolve().as_uri() + "?mode=ro&immutable=1"
+            if readonly
+            else str(path or "")
         )
-        self.count = 0
-        self.rows = 0
+        self.connection = sqlite3.connect(
+            location, uri=readonly, check_same_thread=False
+        )
+        finalize(self, self.connection.close)
+        self.connection.execute("PRAGMA temp_store=FILE")
+        self.connection.execute(
+            "CREATE TEMP TABLE observed_etags(position INTEGER PRIMARY KEY, etag TEXT NOT NULL)"
+        )
+        if readonly:
+            self.count, self.rows, self.fingerprint = self.connection.execute(
+                "SELECT shards, rows, fingerprint FROM catalogue"
+            ).fetchone()
+        else:
+            self.connection.execute("PRAGMA journal_mode=OFF")
+            self.connection.execute(
+                "CREATE TABLE shards (path TEXT PRIMARY KEY, position INTEGER UNIQUE, size INTEGER, num_rows INTEGER, sha256 TEXT)"
+            )
+            self.count = self.rows = 0
+
+    def finish(self, fingerprint):
+        self.connection.execute(
+            "CREATE TABLE catalogue(shards INTEGER, rows INTEGER, fingerprint TEXT)"
+        )
+        self.connection.execute(
+            "INSERT INTO catalogue VALUES (?, ?, ?)",
+            (self.count, self.rows, fingerprint),
+        )
+        self.connection.commit()
+        self.fingerprint = fingerprint
 
     def add(self, record, included):
         position = self.count if included else None
@@ -301,7 +345,7 @@ class _CaptureCatalogue:
 
     def __getitem__(self, index):
         path, size, rows, checksum, etag = self.connection.execute(
-            "SELECT path, size, num_rows, sha256, etag FROM shards WHERE position = ?",
+            "SELECT path, size, num_rows, sha256, etag FROM shards LEFT JOIN observed_etags USING(position) WHERE position = ?",
             (index,),
         ).fetchone()
         shard = {"path": path, "size": size, "num_rows": rows}
@@ -313,7 +357,7 @@ class _CaptureCatalogue:
 
     def set_etag(self, index, etag):
         self.connection.execute(
-            "UPDATE shards SET etag=? WHERE position=?", (etag, index)
+            "INSERT INTO observed_etags VALUES (?, ?)", (index, etag)
         )
 
 
@@ -326,6 +370,7 @@ class ParquetDataset:
     """
 
     supports_parallel_metadata_reads = True
+    supports_catalogue_cache = True
 
     def __init__(
         self,
@@ -349,6 +394,7 @@ class ParquetDataset:
         metadata_cache_size: int = 1,
         url_metadata_cache_bytes: int = 128 * 1024 * 1024,
         max_page_bytes: int = 512 * 1024 * 1024,
+        catalogue_cache_dir: str | Path | None = None,
     ):
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         if self.hf_token is None:
@@ -443,18 +489,13 @@ class ParquetDataset:
         if self.metadata_mode not in ("overlay", "replace"):
             raise ValueError("metadata_mode must be 'overlay' or 'replace'")
         prefix = _relative_path(subfolder.rstrip("/")) + "/" if subfolder else ""
+        capture_path = None
         if capture_manifest is not None:
             if metadata is not None:
                 raise ValueError("Select either a capture manifest or custom metadata")
-            records = self._source_repo.capture_records(
+            capture_path = self._source_repo.capture_manifest_path(
                 _relative_path(capture_manifest)
             )
-        elif metadata is not None:
-            records = manifest.get("shards")
-            if not isinstance(records, list):
-                raise ValueError("Manifest shards must be a list")
-        else:
-            records = [{"path": path} for path in self._source_repo.parquet_paths()]
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -479,14 +520,71 @@ class ParquetDataset:
                 sort_keys=True,
             ).encode()
         )
-        self._shards = _CaptureCatalogue() if capture_manifest is not None else []
+        if capture_path is not None:
+            self._shards = self._open_capture_catalogue(
+                capture_path, prefix, fingerprint, catalogue_cache_dir
+            )
+            self.fingerprint = self._shards.fingerprint
+        else:
+            if metadata is not None:
+                records = manifest.get("shards")
+                if not isinstance(records, list):
+                    raise ValueError("Manifest shards must be a list")
+            else:
+                records = ({"path": path} for path in self._source_repo.parquet_paths())
+            self._shards = []
+            self._scan_shards(records, prefix, fingerprint, self._shards)
+            self.fingerprint = fingerprint.hexdigest()
+        if not self._shards:
+            raise ValueError("No Parquet shards found")
+
+    def _open_capture_catalogue(self, path, prefix, fingerprint, cache_dir):
+        repository = self._source_repo
+
+        def build(catalogue):
+            records = repository.iter_capture_records(path)
+            self._scan_shards(records, prefix, fingerprint, catalogue)
+            if not catalogue:
+                raise ValueError("No Parquet shards found")
+            catalogue.finish(fingerprint.hexdigest())
+
+        if cache_dir is None:
+            catalogue = _CaptureCatalogue()
+            build(catalogue)
+            return catalogue
+
+        directory = Path(cache_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        version = repository.capture_manifest_version(path)
+        identity = [fingerprint.hexdigest(), path, prefix, version]
+        key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        publication = directory / f"capture-catalogue-v1-{key}.sqlite3"
+        if not publication.is_file():
+            with FileLock(str(publication) + ".lock"):
+                if not publication.is_file():
+                    with TemporaryDirectory(dir=directory) as staging:
+                        temporary = Path(staging) / "catalogue.sqlite3"
+                        catalogue = _CaptureCatalogue(temporary)
+                        try:
+                            build(catalogue)
+                            if repository.capture_manifest_version(path) != version:
+                                raise ValueError(
+                                    "Capture manifest changed while indexing it."
+                                )
+                        finally:
+                            catalogue.connection.close()
+                        temporary.replace(publication)
+        return _CaptureCatalogue(publication, readonly=True)
+
+    def _scan_shards(self, records, prefix, fingerprint, shards):
+        capture = isinstance(shards, _CaptureCatalogue)
         paths = set()
         for record in records:
             record = dict(record)
             path = _relative_path(record["path"])
             included = path.startswith(prefix)
-            if isinstance(self._shards, _CaptureCatalogue):
-                self._shards.add(record, included)
+            if capture:
+                shards.add(record, included)
             else:
                 if path in paths:
                     raise ValueError(f"Duplicate source shard: {path}")
@@ -495,7 +593,7 @@ class ParquetDataset:
                 raise ValueError("Source shards must be Parquet files")
             if not included:
                 continue
-            if capture_manifest is not None and self._source_repo.s3 is not None:
+            if capture and self._source_repo.s3 is not None:
                 actual_size = record["size"]
             else:
                 if not self._source_repo.exists(path):
@@ -521,17 +619,12 @@ class ParquetDataset:
                 r"[0-9a-f]{64}", record["metadata_sha256"]
             ):
                 raise ValueError("Invalid metadata SHA-256")
-            if isinstance(self._shards, list):
-                self._shards.append(record)
+            if not capture:
+                shards.append(record)
             # The manifest digest already covers the per-object hashes. Keep the existing catalogue ID.
-            if capture_manifest is not None and self._source_repo.capture_digest:
+            if capture and self._source_repo.capture_digest:
                 record.pop("sha256", None)
             fingerprint.update(json.dumps(record, sort_keys=True).encode())
-        if isinstance(self._shards, _CaptureCatalogue):
-            self._shards.connection.commit()
-        self.fingerprint = fingerprint.hexdigest()
-        if not self._shards:
-            raise ValueError("No Parquet shards found")
 
     def enable_shard_cache(
         self, location: str, cache_limit_gb: float = 25.0, parallel_downloads: int = 4
