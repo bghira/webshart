@@ -325,6 +325,8 @@ class ParquetDataset:
     Image bytes and external image URLs are not read during metadata discovery.
     """
 
+    supports_parallel_metadata_reads = True
+
     def __init__(
         self,
         source: str,
@@ -558,6 +560,7 @@ class ParquetDataset:
             self._shards.rows if isinstance(self._shards, _CaptureCatalogue) else None
         )
 
+    @_synchronized
     def _shard(self, index: int) -> dict:
         if (
             not isinstance(index, int)

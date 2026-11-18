@@ -1,5 +1,6 @@
 """Authenticated S3 transport and captured-Parquet training reads."""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -258,6 +259,27 @@ def test_batch_reads_share_row_groups_and_preserve_order(tmp_path):
         reader.rows_at([4])
     with pytest.raises(ValueError):
         reader.rows_at([0], parallel_reads=0)
+
+
+def test_capture_catalogue_supports_parallel_reads(tmp_path):
+    objects = capture(tmp_path)
+    with s3_server(objects) as (options, _, _):
+        dataset = ParquetDataset(
+            "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+        )
+        start = threading.Barrier(8)
+
+        def visit(worker):
+            start.wait(timeout=10)
+            for index in range(200):
+                assert dataset.get_shard_info(0)["num_rows"] == 4
+                if (index + worker) % 32 == 0:
+                    row = dataset.read_metadata_rows(0, [0], fields=("captions",))
+                    assert row[0]["captions"] == "one"
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for _ in executor.map(visit, range(8)):
+                pass
 
 
 def test_capture_manifest_rejects_unsafe_paths_and_wrong_sizes(tmp_path):
