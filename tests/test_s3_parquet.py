@@ -1,5 +1,6 @@
 """Authenticated S3 transport and captured-Parquet training reads."""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,7 +16,7 @@ from webshart._webshart import _ParquetFile, _S3Store
 
 
 @contextmanager
-def s3_server(objects):
+def s3_server(objects, hashes=None):
     calls = []
     etags = {
         key: '"' + hashlib.md5(data).hexdigest() + '"' for key, data in objects.items()
@@ -54,6 +55,8 @@ def s3_server(objects):
                 data = data[start : end + 1]
             self.send_header("Content-Length", str(len(data)))
             self.send_header("ETag", etags[key])
+            if hashes and key in hashes:
+                self.send_header("x-amz-meta-sha256", hashes[key])
             self.send_header("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
             self.end_headers()
             if body:
@@ -152,7 +155,14 @@ def test_signed_capture_discovery_projection_batch_and_cache(tmp_path):
             "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
         )
         assert dataset.num_shards == 1
+        assert dataset.physical_row_count == len(dataset) == 4
         assert not any(key == "parts/part.parquet" for _, key, _ in calls)
+        assert dataset.count_rows(exclude_null_images=True) == 3
+        assert all(
+            headers.get("range")
+            for method, key, headers in calls
+            if method == "GET" and key == "parts/part.parquet"
+        )
         loader = ParquetDataLoader(dataset)
         assert [r["sample_idx"] for r in loader.list_samples_in_shard(0)] == [0, 2, 3]
         assert set(loader.list_shard_sample_aspect_buckets([0])[0]["buckets"]) == {
@@ -191,6 +201,76 @@ def test_signed_capture_discovery_projection_batch_and_cache(tmp_path):
             == before
         )
         assert len(list((tmp_path / "cache").glob("*.parquet"))) == 1
+        stats = dataset.io_stats()
+        assert stats["head_requests"] == sum(method == "HEAD" for method, _, _ in calls)
+        assert stats["range_requests"] == sum(
+            method == "GET" and "range" in headers for method, _, headers in calls
+        )
+        assert stats["downloads"] == sum(
+            method == "GET" and "range" not in headers for method, _, headers in calls
+        )
+        assert stats["download_bytes"] == len(objects["catalog/manifest.jsonl"]) + len(
+            objects["parts/part.parquet"]
+        )
+        assert stats["range_bytes"] > 0
+        assert stats["list_operations"] == 0
+
+
+def test_s3_projection_reuses_a_shard_populated_by_another_reader(tmp_path):
+    objects = capture(tmp_path)
+    cache = tmp_path / "cache"
+    path = "parts/part.parquet"
+    with s3_server(objects) as (options, calls, etags):
+
+        def open_dataset():
+            dataset = ParquetDataset(
+                "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+            )
+            dataset.enable_shard_cache(str(cache), 0.01)
+            return dataset
+
+        def projection(dataset):
+            return dataset.read_metadata_rows(0, [3, 0, 3], fields=["captions"])
+
+        projecting = open_dataset()
+        before = len(calls)
+        expected = projection(projecting)
+        assert [row["captions"] for row in expected] == ["four", "one", "four"]
+        assert all(set(row) == {"captions", "source_path", "source_row"} for row in expected)
+        reads = [
+            headers
+            for method, key, headers in calls[before:]
+            if method == "GET" and key == path
+        ]
+        assert reads and all(headers.get("range") for headers in reads)
+        assert not list(cache.glob("*.parquet"))
+
+        payload_reader = open_dataset()
+        assert ParquetDataLoader(payload_reader).load_sample(0, 3).data == b"fourth"
+        assert len(list(cache.glob("*.parquet"))) == 1
+
+        before = len(calls)
+        assert projection(projecting) == expected
+        assert len(calls) == before
+
+        reopened = open_dataset()
+        revision = projecting.source_revision_for_shard(0)
+        reopened.bind_source_revisions({0: revision}.get)
+        assert reopened.source_revision_for_shard(0) == revision
+        before = len(calls)
+        assert projection(reopened) == expected
+        assert len(calls) == before
+
+        etags[path] = '"replacement"'
+        replaced = open_dataset()
+        replaced.source_revision_for_shard(0)
+        before = len(calls)
+        assert projection(replaced) == expected
+        assert any(method == "GET" and key == path for method, key, _ in calls[before:])
+        assert len(list(cache.glob("*.parquet"))) == 1
+        replaced.bind_source_revisions({0: revision}.get)
+        with pytest.raises(ValueError, match="accepted dataset view"):
+            projection(replaced)
 
 
 def test_s3_limits_missing_and_etag_change(tmp_path):
@@ -206,7 +286,12 @@ def test_s3_limits_missing_and_etag_change(tmp_path):
         with pytest.raises(OSError, match="S3"):
             list(reader.rows(columns=["image"]))
         with pytest.raises(ValueError, match="SHA-256"):
-            store.read_jsonl("catalog/manifest.jsonl", expected_sha256="0" * 64)
+            key = "combined/dataset.json"
+            descriptor = json.loads(objects[key])
+            objects[key] = json.dumps(
+                {**descriptor, "manifest_sha256": "0" * 64}
+            ).encode()
+            ParquetDataset("s3://test-bucket", manifest=key, s3_options=options)
 
 
 def test_batch_reads_share_row_groups_and_preserve_order(tmp_path):
@@ -231,6 +316,27 @@ def test_batch_reads_share_row_groups_and_preserve_order(tmp_path):
         reader.rows_at([4])
     with pytest.raises(ValueError):
         reader.rows_at([0], parallel_reads=0)
+
+
+def test_capture_catalogue_supports_parallel_reads(tmp_path):
+    objects = capture(tmp_path)
+    with s3_server(objects) as (options, _, _):
+        dataset = ParquetDataset(
+            "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+        )
+        start = threading.Barrier(8)
+
+        def visit(worker):
+            start.wait(timeout=10)
+            for index in range(200):
+                assert dataset.get_shard_info(0)["num_rows"] == 4
+                if (index + worker) % 32 == 0:
+                    row = dataset.read_metadata_rows(0, [0], fields=("captions",))
+                    assert row[0]["captions"] == "one"
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for _ in executor.map(visit, range(8)):
+                pass
 
 
 def test_capture_manifest_rejects_unsafe_paths_and_wrong_sizes(tmp_path):
@@ -327,3 +433,56 @@ def test_environment_credentials_are_used_when_keys_are_omitted(tmp_path, monkey
         _S3Store("test-bucket", **options).head("parts/part.parquet")
         assert calls[-1][2]["x-amz-security-token"] == "environment-session"
         assert "Credential=environment-access/" in calls[-1][2]["authorization"]
+
+
+def test_capture_hash_is_checked_on_new_process_equivalent_open(tmp_path):
+    objects = capture(tmp_path)
+    path = "parts/part.parquet"
+    manifest = "catalog/manifest.jsonl"
+    descriptor = "combined/dataset.json"
+    original = hashlib.sha256(objects[path]).hexdigest()
+    hashes = {path: original}
+    record = json.loads(objects[manifest])
+    objects[manifest] = (json.dumps({**record, "sha256": original}) + "\n").encode()
+    objects[descriptor] = json.dumps(
+        {
+            **json.loads(objects[descriptor]),
+            "manifest_sha256": hashlib.sha256(objects[manifest]).hexdigest(),
+        }
+    ).encode()
+    with s3_server(objects, hashes) as (options, calls, etags):
+
+        def reopen():
+            return ParquetDataset(
+                "s3://test-bucket", manifest=descriptor, s3_options=options
+            )
+
+        first = reopen()
+        assert first.get_shard_info(0)["sha256"] == original
+        assert first.read_metadata_rows(0, [2], fields=["width"])[0]["width"] == 4
+        hashes[path] = "0" * 64
+        etags[path] = '"replacement"'
+        second = reopen()
+        assert first.fingerprint == second.fingerprint
+        calls.clear()
+        with pytest.raises(ValueError, match="SHA-256 metadata"):
+            second.read_metadata_rows(0, [2], fields=["width"])
+        assert [(method, key) for method, key, _ in calls] == [("HEAD", path)]
+
+
+def test_prepared_etag_pin_survives_reopen_without_object_checksum(tmp_path):
+    objects = capture(tmp_path)
+    with s3_server(objects) as (options, _, etags):
+
+        def open_source():
+            return ParquetDataset(
+                "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+            )
+
+        first = open_source()
+        revision = first.source_revision_for_shard(0)
+        second = open_source()
+        etags["parts/part.parquet"] = '"new-object"'
+        second.bind_source_revisions({0: revision}.get)
+        with pytest.raises(ValueError, match="accepted dataset view"):
+            second.read_metadata_rows(0, [0], fields=["width"])

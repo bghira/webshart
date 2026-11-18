@@ -139,6 +139,42 @@ def test_custom_metadata_joins_by_row_not_id_or_order(tmp_path, kind):
     assert loader.get_metadata(0, 0)["captions"]["text"] == "changed first"
 
 
+@pytest.mark.parametrize("kind", ["json", "parquet"])
+def test_projected_overlay_and_source_pin_after_restart(tmp_path, monkeypatch, kind):
+    source = tmp_path / "source"
+    path = write_source(source)
+    metadata = tmp_path / "metadata"
+
+    def publish(caption):
+        descriptor = write_metadata(
+            metadata,
+            path,
+            [{"source_row": 2, "captions": {"text": caption}}],
+            kind=kind,
+        )
+        del descriptor["shards"][0]["metadata_sha256"]
+        (metadata / "webshart-parquet.json").write_text(json.dumps(descriptor))
+
+    publish("first revision")
+    dataset = webshart.discover_parquet_dataset(str(source), metadata=str(metadata))
+    monkeypatch.setattr(
+        dataset, "_metadata", lambda *_: pytest.fail("Full-shard metadata read")
+    )
+    fields = ["captions", "width"]
+    old = dataset.read_metadata_rows(0, [2, 0, 2], fields=fields)
+    assert [row["source_row"] for row in old] == [2, 0, 2]
+    assert old[0]["captions"] == {"text": "first revision"}
+    assert old[0] == old[2] and old[0] is not old[2]
+    assert all(set(row) == {"source_row", "source_path", *fields} for row in old)
+    revision = dataset.source_revision_for_shard(0)
+    publish("other revision")
+    reopened = webshart.discover_parquet_dataset(str(source), metadata=str(metadata))
+    assert reopened.fingerprint == dataset.fingerprint
+    reopened.bind_source_revisions(lambda index: revision)
+    with pytest.raises(ValueError, match="changed"):
+        reopened.read_metadata_rows(0, [2], fields=fields)
+
+
 def test_json_caption_objects_and_mixed_lists_are_not_stringified(tmp_path):
     source = tmp_path / "source"
     path = write_source(source)
@@ -162,6 +198,49 @@ def test_json_caption_objects_and_mixed_lists_are_not_stringified(tmp_path):
     assert [entry.captions for entry in entries] == values
     assert entries[1].caption == {"text": "structured"}
     assert entries[2].caption is None
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("write_statistics", [False, True])
+def test_count_rows_can_exclude_null_image_bytes(tmp_path, nested, write_statistics):
+    values = [b"embedded", None, b"", None, b"last"]
+    rows = [
+        {
+            "image": (
+                None if index == 3 else {"bytes": value, "path": f"{index}.jpg"}
+            )
+            if nested
+            else value
+        }
+        for index, value in enumerate(values)
+    ]
+    write_source(tmp_path, rows, write_statistics=write_statistics)
+    write_source(tmp_path / "second", rows[:2], write_statistics=write_statistics)
+    dataset = webshart.discover_parquet_dataset(str(tmp_path))
+    assert len(dataset) == dataset.count_rows() == 7
+    assert dataset.count_rows(shard_index=0) in (2, 5)
+    for index in range(2):
+        reader = dataset._file(index)
+        before = reader.bytes_read
+        expected = {2: 1, 5: 3}[dataset.count_rows(shard_index=index)]
+        assert dataset.count_rows(shard_index=index, exclude_null_images=True) == expected
+        if write_statistics:
+            assert reader.bytes_read == before
+        else:
+            assert reader.bytes_read > before
+    assert dataset.count_rows(exclude_null_images=True) == 4
+    loader = webshart.ParquetDataLoader(dataset)
+    assert [entry["sample_idx"] for entry in loader.list_samples_in_shard(0)] == list(
+        range(dataset.count_rows(shard_index=0))
+    )
+
+
+def test_count_rows_does_not_treat_external_image_urls_as_embedded_bytes(tmp_path):
+    write_source(tmp_path, [{"image_url": "https://invalid.example/image.jpg"}])
+    dataset = webshart.discover_parquet_dataset(str(tmp_path), image_url_column="image_url")
+    assert dataset.count_rows() == 1
+    with pytest.raises(ValueError, match="embedded image column"):
+        dataset.count_rows(exclude_null_images=True)
 
 
 def test_native_lists_of_objects_and_huggingface_image_structs(tmp_path):
@@ -454,9 +533,9 @@ def test_hub_metadata_pins_source_and_metadata_revisions(monkeypatch):
                 else ["part.parquet"]
             )
             return SimpleNamespace(
-                sha=metadata_revision
-                if source == "owner/metadata"
-                else source_revision,
+                sha=(
+                    metadata_revision if source == "owner/metadata" else source_revision
+                ),
                 siblings=[SimpleNamespace(rfilename=name, size=1000) for name in names],
             )
 
@@ -520,9 +599,169 @@ def test_repository_endpoint_and_model_type(monkeypatch):
         calls.append(kwargs)
         return "https://hub.example/file"
 
-    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(HfApi=FakeApi, hf_hub_url=url))
-    repo = _Repository("owner/images", "upload-token", endpoint="https://hub.example", repo_type="model")
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", SimpleNamespace(HfApi=FakeApi, hf_hub_url=url)
+    )
+    repo = _Repository(
+        "owner/images",
+        "upload-token",
+        endpoint="https://hub.example",
+        repo_type="model",
+    )
     assert repo.location("data/part.parquet") == "https://hub.example/file"
     assert calls[0] == {"token": "upload-token", "endpoint": "https://hub.example"}
     assert calls[1][1]["repo_type"] == calls[2]["repo_type"] == "model"
     assert calls[2]["endpoint"] == "https://hub.example"
+
+
+def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metadata(
+    tmp_path, monkeypatch
+):
+    write_source(tmp_path)
+    dataset = webshart.discover_parquet_dataset(str(tmp_path), caption_column="id")
+    loader = webshart.ParquetDataLoader(dataset)
+    native = dataset._file(0)
+    reads = []
+
+    class Reader:
+        def info(self):
+            return native.info()
+
+        def rows_at(self, indices, *, columns, parallel_reads, shard_cache=None):
+            assert shard_cache is None
+            reads.append((list(indices), columns))
+            return native.rows_at(
+                indices, columns=columns, parallel_reads=parallel_reads
+            )
+
+    monkeypatch.setattr(dataset, "_file", lambda *args, **kwargs: Reader())
+
+    def unexpected(*args):
+        raise AssertionError("Projected reads must not materialize the complete shard")
+
+    monkeypatch.setattr(dataset, "_metadata", unexpected)
+    requested = [2, 0, 2]
+    values = dataset.read_metadata_rows(0, requested, fields=["width"])
+    assert [r["width"] for r in values] == [2, 4, 2]
+    assert [r["source_row"] for r in values] == requested
+    assert all(set(r) == {"source_path", "source_row", "width"} for r in values)
+    assert reads == [(requested, ["width"])]
+    reads.clear()
+    samples = loader.load_samples([(0, i) for i in requested], metadata_fields=[])
+    assert [v.data for v in samples] == [b"third", b"first", b"third"]
+    assert reads == [(requested, ["image"])]
+    reads.clear()
+    entries = loader.iter_samples_in_shard(0, metadata_fields=["width"], batch_size=1)
+    assert next(entries)["source_row"] == 0
+    assert len(reads) == 1 and reads[0][0] == [0] and "image" not in reads[0][1]
+    entries.close()
+    assert len(reads) == 1
+    with pytest.raises(IndexError):
+        dataset.read_metadata_rows(0, [True], fields=[])
+
+
+def test_projected_overlay_preserves_native_decimal_values(tmp_path):
+    from decimal import Decimal
+
+    source = tmp_path / "source"
+    path = write_source(source)
+    metadata = tmp_path / "metadata"
+    expected = {"score": Decimal("12.30"), "tags": ["first", "second"]}
+    write_metadata(
+        metadata, path, [{"source_row": 0, "captions": expected}], kind="parquet"
+    )
+    dataset = webshart.discover_parquet_dataset(str(source), metadata=str(metadata))
+    assert dataset.get_metadata(0, 0)["captions"] == expected
+    projected = dataset.read_metadata_rows(0, [0, 0], fields=["captions"])
+    assert [row["captions"] for row in projected] == [expected, expected]
+    projected[0]["captions"]["tags"].append("changed")
+    assert projected[1]["captions"] == expected
+    assert (
+        dataset.read_metadata_rows(0, [0], fields=["captions"])[0]["captions"]
+        == expected
+    )
+
+
+def test_large_overlay_and_row_group_remain_bounded(tmp_path):
+    import gc
+    import os
+    import tracemalloc
+
+    source = tmp_path / "source"
+    source.mkdir()
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    rows = 16_384
+    table = arrow.table(
+        {"width": [8] * rows, "height": [4] * rows, "image": [b"p" * 2048] * rows}
+    )
+    first = source / "0.parquet"
+    parquet.write_table(
+        table, first, row_group_size=rows, compression="NONE", use_dictionary=False
+    )
+    del table
+    overlay = metadata / "custom.json"
+    with overlay.open("w") as f:
+        f.write("[")
+        for i in range(rows):
+            if i:
+                f.write(",")
+            json.dump({"source_row": i, "captions": {"text": "a" * 720}}, f)
+        f.write("]")
+    with overlay.open("rb") as f:
+        checksum = hashlib.file_digest(f, "sha256").hexdigest()
+    shards = []
+    for i in range(12):
+        name = f"{i}.parquet"
+        if i:
+            os.link(first, source / name)
+        shards.append(
+            {
+                "path": name,
+                "size": first.stat().st_size,
+                "num_rows": rows,
+                "metadata_path": overlay.name,
+                "metadata_sha256": checksum,
+            }
+        )
+    (metadata / "webshart-parquet.json").write_text(
+        json.dumps(
+            {
+                "format": "webshart-parquet",
+                "version": 1,
+                "shards": shards,
+                "metadata_mode": "overlay",
+            }
+        )
+    )
+    dataset = webshart.discover_parquet_dataset(
+        str(source), metadata=str(metadata), metadata_cache_size=2
+    )
+    gc.collect()
+    warm_heap = None
+    tracemalloc.start()
+    try:
+        for i in range(len(shards)):
+            result = dataset.read_metadata_rows(
+                i, [rows - 1, 0, rows - 1], fields=["width", "captions"]
+            )
+            assert [r["source_row"] for r in result] == [rows - 1, 0, rows - 1]
+            assert all(
+                r["width"] == 8 and len(r["captions"]["text"]) == 720 for r in result
+            )
+            assert len(dataset._overlays) <= 2 and len(dataset._files) <= 2
+            assert not dataset._metadata_cache
+            assert dataset._file(i).bytes_read < first.stat().st_size // 10
+            gc.collect()
+            current, peak = tracemalloc.get_traced_memory()
+            if i == 2:
+                warm_heap = current
+        assert current < warm_heap + 2 * 1024**2
+        assert peak < 48 * 1024**2
+        print(
+            f"shards={len(shards)} group_bytes={first.stat().st_size} overlay_bytes={overlay.stat().st_size} "
+            f"warm_heap={warm_heap} final_heap={current} peak_heap={peak}"
+        )
+    finally:
+        tracemalloc.stop()
+        dataset.bind_source_revisions(None)

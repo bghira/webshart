@@ -399,7 +399,7 @@ impl ShardCache {
         fs::metadata(path).await.ok().map(|metadata| metadata.len())
     }
 
-    async fn touch_shard(&self, shard_name: &str) {
+    pub(crate) async fn touch_shard(&self, shard_name: &str) {
         // The marker's mtime is a process-shared LRU signal.
         let _ = fs::write(self.access_path(shard_name), b"").await;
 
