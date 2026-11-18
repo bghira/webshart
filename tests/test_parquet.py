@@ -622,6 +622,7 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
     loader = webshart.ParquetDataLoader(dataset)
     native = dataset._file(0)
     reads = []
+    yielded = []
 
     class Reader:
         def info(self):
@@ -633,6 +634,12 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
             return native.rows_at(
                 indices, columns=columns, parallel_reads=parallel_reads
             )
+
+        def rows(self, *, columns):
+            reads.append(("stream", columns))
+            for index, row in enumerate(native.rows(columns=columns)):
+                yielded.append(index)
+                yield row
 
     monkeypatch.setattr(dataset, "_file", lambda *args, **kwargs: Reader())
 
@@ -653,9 +660,10 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
     reads.clear()
     entries = loader.iter_samples_in_shard(0, metadata_fields=["width"], batch_size=1)
     assert next(entries)["source_row"] == 0
-    assert len(reads) == 1 and reads[0][0] == [0] and "image" not in reads[0][1]
-    entries.close()
-    assert len(reads) == 1
+    assert yielded == [0]
+    assert len(reads) == 1 and reads[0][0] == "stream" and "image" not in reads[0][1]
+    list(entries)
+    assert yielded == [0, 1, 2] and len(reads) == 1
     with pytest.raises(IndexError):
         dataset.read_metadata_rows(0, [True], fields=[])
 

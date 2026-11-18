@@ -1002,18 +1002,7 @@ class ParquetDataset:
             rows = ({} for _ in indices)
         else:
             reader = self._file(shard_index)
-            excluded = set(info["binary_columns"]) | {self.image_column}
-            columns = [name for name in info["columns"] if name not in excluded]
-            if fields is not None:
-                aliases = {
-                    "captions": self.caption_column,
-                    "width": self.width_column,
-                    "height": self.height_column,
-                }
-                requested = fields.union(
-                    aliases[name] for name in fields if name in aliases
-                )
-                columns = [name for name in columns if name in requested]
+            columns = self._metadata_columns(info, fields)
             rows = (
                 (
                     self._decode(row)
@@ -1043,6 +1032,30 @@ class ParquetDataset:
             self._row_metadata(shard, index, row, fields)
             for index, row in zip(indices, rows, strict=True)
         ]
+
+    def _metadata_columns(self, info, fields):
+        excluded = set(info["binary_columns"]) | {self.image_column}
+        columns = [name for name in info["columns"] if name not in excluded]
+        if fields is None:
+            return columns
+        aliases = {
+            "captions": self.caption_column,
+            "width": self.width_column,
+            "height": self.height_column,
+        }
+        requested = fields.union(aliases[name] for name in fields if name in aliases)
+        return [name for name in columns if name in requested]
+
+    def _iter_source_metadata(self, shard_index, shard, fields):
+        reader = self._file(shard_index)
+        columns = self._metadata_columns(reader.info(), fields)
+        rows = (
+            reader.rows(columns=columns)
+            if columns
+            else ({} for _ in range(shard["num_rows"]))
+        )
+        for index, row in enumerate(rows):
+            yield self._row_metadata(shard, index, self._decode(row), fields)
 
 
 @dataclass
@@ -1137,7 +1150,7 @@ class ParquetDataLoader:
     def iter_samples_in_shard(
         self, shard_index: int, *, metadata_fields=None, batch_size=256
     ):
-        """Yield valid physical rows in capture order. Projected reads fetch at most one batch at a time."""
+        """Yield valid physical rows in capture order, with bounded batches for custom overlays."""
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         shard = self.dataset.get_shard_info(shard_index)
@@ -1149,16 +1162,19 @@ class ParquetDataLoader:
             )
         else:
             fields = {*metadata_fields, "url_status", "stored_bytes", "stored_format"}
-            rows = (
-                row
-                for start in range(0, shard["num_rows"], batch_size)
-                for row in self.dataset.read_metadata_rows(
-                    shard_index,
-                    range(start, min(start + batch_size, shard["num_rows"])),
-                    fields=fields,
-                    parallel_reads=self.dataset.parallel_reads,
+            if "metadata_path" not in shard and self.dataset.metadata_mode != "replace":
+                rows = self.dataset._iter_source_metadata(shard_index, shard, fields)
+            else:
+                rows = (
+                    row
+                    for start in range(0, shard["num_rows"], batch_size)
+                    for row in self.dataset.read_metadata_rows(
+                        shard_index,
+                        range(start, min(start + batch_size, shard["num_rows"])),
+                        fields=fields,
+                        parallel_reads=self.dataset.parallel_reads,
+                    )
                 )
-            )
         for metadata in rows:
             row_index = metadata["source_row"]
             if metadata.get("url_status", "ok") != "ok" or (
