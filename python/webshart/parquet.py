@@ -360,6 +360,12 @@ class _CaptureCatalogue:
             "INSERT INTO observed_etags VALUES (?, ?)", (index, etag)
         )
 
+    def position(self, path):
+        row = self.connection.execute(
+            "SELECT position FROM shards WHERE path = ?", (path,)
+        ).fetchone()
+        return row[0] if row is not None else None
+
 
 class ParquetDataset:
     """Discover local/Hub Parquet shards, optionally paired with a metadata manifest.
@@ -779,6 +785,21 @@ class ParquetDataset:
         if "num_rows" not in shard:
             self._file(index)
         return {**shard, "num_samples": shard["num_rows"], "format": "parquet"}
+
+    @_synchronized
+    def get_shard_position(self, path: str) -> int | None:
+        """Resolve a repository-relative shard path within this dataset selection."""
+        path = _relative_path(path)
+        if isinstance(self._shards, _CaptureCatalogue):
+            return self._shards.position(path)
+        return next(
+            (
+                index
+                for index, shard in enumerate(self._shards)
+                if shard["path"] == path
+            ),
+            None,
+        )
 
     def __len__(self) -> int:
         return self.count_rows()

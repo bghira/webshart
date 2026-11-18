@@ -239,6 +239,8 @@ def test_signed_capture_discovery_projection_batch_and_cache(tmp_path):
         )
         assert dataset.num_shards == 1
         assert dataset.physical_row_count == len(dataset) == 4
+        assert dataset.get_shard_position("parts/part.parquet") == 0
+        assert dataset.get_shard_position("parts/missing.parquet") is None
         assert not any(key == "parts/part.parquet" for _, key, _ in calls)
         assert dataset.count_rows(exclude_null_images=True) == 3
         assert all(
