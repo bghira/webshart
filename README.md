@@ -117,6 +117,23 @@ missing rows as `None`. Repeated writes keep the first committed value, so a
 recipe must compute deterministic values. `flush` and `close` wait for accepted
 writes and report writer errors. Open a separate handle in each process.
 
+Set `max_disk_bytes` to a positive byte limit to enable automatic eviction.
+The limit applies to the shard databases and SQLite journals for all recipes
+and revisions in the cache directory. When the option is omitted, existing
+cache entries are retained indefinitely.
+
+```python
+cache = TransformCache("cache/transforms", "recipe-fingerprint", max_disk_bytes=10 * 1024**3)
+```
+
+The cache checks its disk usage on open, periodically after writes, and when
+`flush()` or `close()` waits for writes. It removes oversized databases first,
+then evicts the least recently used idle databases until the cache fits. Reads
+of evicted entries return `None`, so callers can recompute those values.
+Active readers and transactions can temporarily keep the cache over budget.
+All processes sharing an eviction-enabled directory must use the same limit
+and an eviction-aware version of Webshart on storage that supports file locks.
+
 ## Native Hugging Face Xet Downloads
 
 Hugging Face files stored in Xet are read directly by webshart's Rust transport.

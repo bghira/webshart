@@ -1,17 +1,23 @@
+mod disk;
+
+use disk::Disk;
+use fs2::FileExt;
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type Records = Vec<(i64, Vec<u8>)>;
 type CacheResult<T> = Result<T, CacheError>;
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 enum CacheError {
@@ -22,8 +28,14 @@ enum CacheError {
 }
 
 struct Location {
-    directory: PathBuf,
+    disk: Disk,
     recipe: String,
+    max_disk_bytes: Option<u64>,
+}
+
+struct ShardWriter {
+    db: Connection,
+    _guard: File,
 }
 
 impl Location {
@@ -34,7 +46,10 @@ impl Location {
         digest.update(self.recipe.as_bytes());
         digest.update(shard.as_bytes());
         let id = crate::digest_to_hex(digest.finalize());
-        self.directory.join(&id[..2]).join(format!("{id}.sqlite3"))
+        self.disk
+            .directory()
+            .join(&id[..2])
+            .join(format!("{id}.sqlite3"))
     }
 
     fn read(&self, requests: Vec<(String, i64)>) -> CacheResult<Vec<Option<Vec<u8>>>> {
@@ -48,7 +63,12 @@ impl Location {
             if !path.try_exists()? {
                 continue;
             }
-            let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let guard = self.disk.entry_lock(&path)?;
+            FileExt::lock_shared(&guard)?;
+            if !path.try_exists()? {
+                continue;
+            }
+            let mut db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             db.busy_timeout(Duration::from_secs(5))?;
             let transaction = db.transaction()?;
             // The file can be visible before its first writer has installed the schema.
@@ -60,43 +80,86 @@ impl Location {
             if ready {
                 let mut select =
                     transaction.prepare("SELECT value FROM transforms WHERE row = ?1")?;
+                let mut hit = false;
                 for (position, row) in rows {
                     result[position] = select.query_row([row], |row| row.get(0)).optional()?;
+                    hit |= result[position].is_some();
+                }
+                if hit && self.max_disk_bytes.is_some() {
+                    Disk::touch(&path)?;
                 }
             }
         }
         Ok(result)
     }
 
-    fn open_writer(&self, shard: &str) -> CacheResult<Connection> {
+    fn open_writer(&self, shard: &str) -> CacheResult<ShardWriter> {
         let path = self.shard_path(shard);
         std::fs::create_dir_all(path.parent().expect("cache shard has a parent"))?;
-        let db = Connection::open(path)?;
+        let guard = self.disk.entry_lock(&path)?;
+        FileExt::lock_shared(&guard)?;
+        let _creation = if path.try_exists()? {
+            None
+        } else {
+            let creation = self.disk.creation_lock(&path)?;
+            if !path.try_exists()? {
+                Disk::clear_sidecars(&path)?;
+            }
+            Some(creation)
+        };
+        let db = Connection::open(&path)?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute(
             "CREATE TABLE IF NOT EXISTS transforms (row INTEGER PRIMARY KEY, value BLOB NOT NULL)",
             [],
         )?;
-        Ok(db)
+        Ok(ShardWriter { db, _guard: guard })
+    }
+
+    fn trim(&self, wait: bool) -> CacheResult<bool> {
+        self.max_disk_bytes
+            .map_or(Ok(true), |limit| self.disk.trim(limit, wait))
+            .map_err(CacheError::from)
     }
 }
 
 enum Write {
     Batch(String, Records),
-    Flush(mpsc::Sender<()>),
+    Flush(mpsc::Sender<Result<(), String>>),
 }
 
-fn write_batches(location: &Location, receiver: &mpsc::Receiver<Write>) -> CacheResult<()> {
-    let mut writer = None::<(String, Connection)>;
-    for command in receiver {
+fn write_batches(
+    location: &Location,
+    receiver: &mpsc::Receiver<Write>,
+    needs_retry: bool,
+) -> CacheResult<()> {
+    let mut next_sweep = needs_retry.then(|| Instant::now() + SWEEP_INTERVAL);
+    let mut writer = None::<(String, ShardWriter)>;
+    loop {
+        let command = if let Some(deadline) = next_sweep {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                next_sweep = (!location.trim(false)?).then(|| Instant::now() + SWEEP_INTERVAL);
+                continue;
+            }
+            match receiver.recv_timeout(remaining) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            let Ok(command) = receiver.recv() else {
+                break;
+            };
+            command
+        };
         match command {
             Write::Batch(shard, records) => {
                 if writer.as_ref().is_none_or(|(current, _)| current != &shard) {
-                    let db = location.open_writer(&shard)?;
-                    writer = Some((shard, db));
+                    writer = Some((shard.clone(), location.open_writer(&shard)?));
                 }
-                let (_, db) = writer.as_mut().expect("cache writer is open");
-                let transaction = db.transaction()?;
+                let (_, active) = writer.as_mut().expect("cache writer is open");
+                let transaction = active.db.transaction()?;
                 {
                     let mut insert = transaction.prepare_cached(
                         "INSERT INTO transforms VALUES (?1, ?2) ON CONFLICT(row) DO NOTHING",
@@ -106,12 +169,25 @@ fn write_batches(location: &Location, receiver: &mpsc::Receiver<Write>) -> Cache
                     }
                 }
                 transaction.commit()?;
+                if location.max_disk_bytes.is_some() {
+                    Disk::touch(&location.shard_path(&shard))?;
+                    writer = None;
+                    next_sweep.get_or_insert_with(|| Instant::now() + SWEEP_INTERVAL);
+                }
             }
             Write::Flush(done) => {
-                let _ = done.send(());
+                if location.max_disk_bytes.is_some() {
+                    let trimmed = location.trim(true);
+                    if let Err(error) = &trimmed {
+                        let _ = done.send(Err(format!("transform cache trim failed: {error}")));
+                    }
+                    next_sweep = (!trimmed?).then(|| Instant::now() + SWEEP_INTERVAL);
+                }
+                let _ = done.send(Ok(()));
             }
         }
     }
+    location.trim(true)?;
     Ok(())
 }
 
@@ -172,22 +248,33 @@ impl TransformCache {
 impl TransformCache {
     /// Open a cache for the given transform recipe fingerprint.
     #[new]
-    #[pyo3(signature = (directory, recipe, *, queue_batches=16, max_batch_bytes=1048576))]
+    #[pyo3(signature = (directory, recipe, *, queue_batches=16, max_batch_bytes=1048576, max_disk_bytes=None))]
     fn new(
         py: Python<'_>,
         directory: PathBuf,
         recipe: String,
         queue_batches: usize,
         max_batch_bytes: usize,
+        max_disk_bytes: Option<u64>,
     ) -> PyResult<Self> {
         if recipe.is_empty() || queue_batches == 0 || max_batch_bytes == 0 {
             return Err(PyValueError::new_err(
                 "recipe must be nonempty and queue limits must be positive",
             ));
         }
+        if max_disk_bytes == Some(0) {
+            return Err(PyValueError::new_err("max_disk_bytes must be positive"));
+        }
         py.detach(move || {
             std::fs::create_dir_all(&directory).map_err(PyOSError::new_err)?;
-            let location = Arc::new(Location { directory, recipe });
+            let location = Arc::new(Location {
+                disk: Disk::new(directory),
+                recipe,
+                max_disk_bytes,
+            });
+            let needs_retry = !location.trim(true).map_err(|error| {
+                PyOSError::new_err(format!("transform cache trim failed: {error}"))
+            })?;
             let failure = Arc::new(Mutex::new(None));
             let (sender, receiver) = mpsc::sync_channel(queue_batches);
             let writer_location = Arc::clone(&location);
@@ -195,7 +282,7 @@ impl TransformCache {
             let thread = thread::Builder::new()
                 .name("webshart-transform-cache".to_owned())
                 .spawn(move || {
-                    if let Err(error) = write_batches(&writer_location, &receiver) {
+                    if let Err(error) = write_batches(&writer_location, &receiver, needs_retry) {
                         *writer_failure.lock().expect("cache error mutex") =
                             Some(format!("transform cache write failed: {error}"));
                     }
@@ -265,7 +352,9 @@ impl TransformCache {
         py.detach(|| {
             let (done, wait) = mpsc::channel();
             self.send(Write::Flush(done))?;
-            wait.recv().map_err(|_| self.write_error())
+            wait.recv()
+                .map_err(|_| self.write_error())?
+                .map_err(PyOSError::new_err)
         })
     }
 
