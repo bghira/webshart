@@ -30,6 +30,7 @@ from webshart._webshart import (
     MetadataExtractor,
     TarDataLoader,
     BucketDataLoader,
+    TransformCache,
 )
 from .optimize import DEFAULT_PAYLOAD_EXTENSIONS, optimize_dataset
 from .parquet import (
@@ -53,6 +54,7 @@ __all__ = [
     "MetadataExtractor",
     "TarDataLoader",
     "BucketDataLoader",
+    "TransformCache",
     "discover_dataset",
     "discover_paired_dataset",
     "PairedDataset",

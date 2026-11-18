@@ -34,6 +34,7 @@ url = { version = "2.5", features = ["serde"] }
 bytes = "1"
 object_store = { version = "0.14.2", features = ["aws"] }
 parquet = { version = "60", default-features = false, features = ["snap", "zstd", "flate2-zlib-rs", "lz4", "brotli"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 
 [dev-dependencies]
 mockito = "1.7.2"
