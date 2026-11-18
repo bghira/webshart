@@ -88,6 +88,35 @@ and aspect buckets instead of being returned with empty data. Direct
 `filename`, so filtered listings retain the stable index required by
 `load_sample()`.
 
+## Native transform cache
+
+`TransformCache` stores caller-computed transform values in local SQLite files
+partitioned by shard. Supply a recipe fingerprint that covers the transform
+settings and value format, and identify each shard by its pinned source object
+and revision. Values are opaque bytes keyed by physical row number.
+
+```python
+from webshart import TransformCache
+
+cache = TransformCache("cache/transforms", "recipe-fingerprint")
+shard = "capture/shard-00003.parquet@source-version"
+try:
+    cache.enqueue(shard, [(7, b"packed-transform"), (11, b"another-transform")])
+    cache.flush()
+    assert cache.read_batch([(shard, 11), (shard, 8), (shard, 11)]) == [
+        b"another-transform", None, b"another-transform",
+    ]
+finally:
+    cache.close()
+```
+
+`enqueue` hands a shard batch to the Rust writer. It applies backpressure when
+the queue is full and rejects batches above `max_batch_bytes`. A batch commits
+in one SQLite transaction. Reads preserve order and duplicates and report
+missing rows as `None`. Repeated writes keep the first committed value, so a
+recipe must compute deterministic values. `flush` and `close` wait for accepted
+writes and report writer errors. Open a separate handle in each process.
+
 ## Native Hugging Face Xet Downloads
 
 Hugging Face files stored in Xet are read directly by webshart's Rust transport.

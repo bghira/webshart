@@ -10,6 +10,7 @@ mod metadata_resolver;
 mod parquet;
 mod recompress;
 mod s3;
+mod transform_cache;
 mod url_images;
 mod xet;
 // Re-export main types
@@ -47,6 +48,7 @@ fn _webshart(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parquet::_parquet_bucket_keys, m)?)?;
     m.add_class::<parquet::PyParquetFile>()?;
     m.add_class::<parquet::PyParquetRows>()?;
+    m.add_class::<transform_cache::TransformCache>()?;
     m.add_class::<url_images::PyURLImageClient>()?;
     m.add_function(wrap_pyfunction!(scale_dimensions, m)?)?;
 
