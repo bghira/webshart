@@ -1,6 +1,8 @@
+import os
 import sqlite3
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from threading import Event
@@ -130,5 +132,129 @@ cache.close()
     try:
         requests = [("shared", row) for row in [0, *range(2, 202)]]
         assert cache.read_batch(requests) == [b"same", *([b"\x00", b"\x01"] * 100)]
+    finally:
+        cache.close()
+
+
+def test_transform_cache_budget_evicts_across_recipes_and_keeps_recent_hits(tmp_path):
+    first = TransformCache(tmp_path, "first")
+    first.enqueue("recent", [(0, b"recent")])
+    first.close()
+    recent = next(tmp_path.rglob("*.sqlite3"))
+    shard_bytes = recent.stat().st_size
+    second = TransformCache(tmp_path, "second")
+    second.enqueue("old", [(0, b"old")])
+    second.close()
+    old = next(path for path in tmp_path.rglob("*.sqlite3") if path != recent)
+    os.utime(recent, (1, 1))
+    os.utime(old, (2, 2))
+
+    limit = 2 * shard_bytes
+    first = TransformCache(tmp_path, "first", max_disk_bytes=limit)
+    second = TransformCache(tmp_path, "second", max_disk_bytes=limit)
+    try:
+        assert first.read_batch([("recent", 0)]) == [b"recent"]
+        second.enqueue("new", [(0, b"new")])
+        second.flush()
+
+        assert first.read_batch([("recent", 0)]) == [b"recent"]
+        assert second.read_batch([("old", 0), ("new", 0)]) == [None, b"new"]
+        assert sum(path.stat().st_size for path in tmp_path.rglob("*.sqlite3")) <= limit
+    finally:
+        first.close()
+        second.close()
+
+
+def test_transform_cache_automatically_drops_oversized_database(tmp_path):
+    cache = TransformCache(tmp_path, "recipe")
+    cache.enqueue("small", [(0, b"keep")])
+    cache.close()
+    small = next(tmp_path.rglob("*.sqlite3"))
+    cache = TransformCache(tmp_path, "recipe", max_disk_bytes=small.stat().st_size)
+    try:
+        cache.enqueue("oversized", [(0, b"x" * 65536)])
+        deadline = time.monotonic() + 15
+        saw_oversized = False
+        while time.monotonic() < deadline:
+            oversized = set(tmp_path.rglob("*.sqlite3")) - {small}
+            if oversized:
+                saw_oversized = True
+            elif saw_oversized:
+                break
+            time.sleep(0.02)
+        assert saw_oversized and not oversized
+        assert cache.read_batch([("small", 0), ("oversized", 0)]) == [b"keep", None]
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("access", ["read", "write"])
+def test_transform_cache_budget_preserves_active_database_in_another_process(tmp_path, access):
+    fcntl = pytest.importorskip("fcntl")
+    cache = TransformCache(tmp_path, "recipe")
+    cache.enqueue("shard", [(0, b"existing")])
+    cache.close()
+    path = next(tmp_path.rglob("*.sqlite3"))
+    limit = path.stat().st_size - 1
+    gate = tmp_path / ".webshart-transform-locks" / path.stem[:3]
+    worker = """
+import sys
+from webshart import TransformCache
+cache = TransformCache(sys.argv[1], "recipe")
+if sys.argv[2] == "read":
+    assert cache.read_batch([("shard", 0)]) == [b"existing"]
+else:
+    cache.enqueue("shard", [(1, b"new")])
+cache.close()
+"""
+    with closing(sqlite3.connect(path)) as blocker:
+        blocker.execute("BEGIN EXCLUSIVE")
+        process = subprocess.Popen([sys.executable, "-c", worker, str(tmp_path), access])
+        with gate.open("rb+") as probe:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    break
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                time.sleep(0.01)
+            else:
+                blocker.rollback()
+                process.wait(timeout=10)
+                pytest.fail("child process did not acquire its cache lock")
+        evictor = None
+        try:
+            evictor = TransformCache(tmp_path, "recipe", max_disk_bytes=limit)
+            evictor.flush()
+            assert path.exists()
+        finally:
+            blocker.rollback()
+            assert process.wait(timeout=10) == 0
+            if evictor is not None:
+                evictor.close()
+    assert not path.exists()
+
+
+def test_transform_cache_budget_cleans_orphaned_sidecars_on_reopen(tmp_path):
+    cache = TransformCache(tmp_path, "recipe")
+    cache.enqueue("shard", [(0, b"old")])
+    cache.close()
+    path = next(tmp_path.rglob("*.sqlite3"))
+    path.unlink()
+    orphan = path.with_suffix(".sqlite3-journal")
+    orphan.write_bytes(b"simulated interrupted eviction")
+    unrelated = path.parent / "other.sqlite3"
+    unrelated.write_bytes(b"unrelated")
+    with pytest.raises(ValueError, match="max_disk_bytes"):
+        TransformCache(tmp_path, "recipe", max_disk_bytes=0)
+    cache = TransformCache(tmp_path, "recipe", max_disk_bytes=1 << 20)
+    try:
+        assert not orphan.exists()
+        assert unrelated.read_bytes() == b"unrelated"
+        assert cache.read_batch([("shard", 0)]) == [None]
+        cache.enqueue("shard", [(0, b"new")])
+        cache.flush()
+        assert cache.read_batch([("shard", 0)]) == [b"new"]
     finally:
         cache.close()
