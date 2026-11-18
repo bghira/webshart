@@ -498,6 +498,24 @@ def test_metadata_prefetch_coalesces_columns_and_respects_budget(tmp_path):
         assert sum(method == "GET" for method, _, _ in calls) == gets
 
 
+def test_projected_scan_coalesces_remote_metadata_ranges(tmp_path):
+    with s3_server(capture(tmp_path)) as (options, calls, _):
+        dataset = ParquetDataset(
+            "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+        )
+        dataset.get_metadata(0, 0)
+        calls.clear()
+        rows = list(
+            ParquetDataLoader(dataset).iter_samples_in_shard(
+                0, metadata_fields=["captions"], batch_size=1
+            )
+        )
+        assert [row["captions"] for row in rows] == ["one", "three", "four"]
+        gets = [headers for method, _, headers in calls if method == "GET"]
+        assert len(gets) <= 5
+        assert all(headers.get("range") for headers in gets)
+
+
 def test_explicit_credentials_do_not_inherit_environment_session_token(
     tmp_path, monkeypatch
 ):

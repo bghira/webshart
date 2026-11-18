@@ -24,6 +24,7 @@ from ._webshart import _ParquetFile, _ParquetCache, _S3Store, _parquet_bucket_ke
 from .url_images import URLImageError, URLImageOptions, URLImageClient
 
 MANIFEST = "webshart-parquet.json"
+PROJECTED_SCAN_CACHE_BYTES = 8 * 1024 * 1024
 
 
 def _synchronized(method):
@@ -1049,6 +1050,12 @@ class ParquetDataset:
     def _iter_source_metadata(self, shard_index, shard, fields):
         reader = self._file(shard_index)
         columns = self._metadata_columns(reader.info(), fields)
+        if columns and not self._source_repo.local:
+            reader.prefetch_columns(
+                columns,
+                max_bytes=PROJECTED_SCAN_CACHE_BYTES,
+                parallel_reads=self.parallel_reads,
+            )
         rows = (
             reader.rows(columns=columns)
             if columns
