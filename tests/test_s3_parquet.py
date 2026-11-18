@@ -516,6 +516,44 @@ def test_projected_scan_coalesces_remote_metadata_ranges(tmp_path):
         assert all(headers.get("range") for headers in gets)
 
 
+def test_projected_scan_prefetches_windows_when_a_shard_exceeds_budget(
+    tmp_path, monkeypatch
+):
+    with s3_server(capture(tmp_path)) as (options, calls, _):
+        dataset = ParquetDataset(
+            "s3://test-bucket", manifest="combined/dataset.json", s3_options=options
+        )
+        reader = dataset._file(0)
+        columns = dataset._metadata_columns(
+            reader.info(), {"captions", "url_status", "stored_bytes", "stored_format"}
+        )
+
+        def prefetched_ranges(group):
+            calls.clear()
+            assert reader.prefetch_columns(
+                columns, start_group=group, stop_group=group + 1
+            )
+            return [headers["range"] for method, _, headers in calls if method == "GET"]
+
+        def range_bytes(ranges):
+            bounds = (value.removeprefix("bytes=").split("-") for value in ranges)
+            return sum(int(stop) - int(start) + 1 for start, stop in bounds)
+
+        windows = [prefetched_ranges(group) for group in range(2)]
+        budget = max(map(range_bytes, windows))
+        assert not reader.prefetch_columns(columns, max_bytes=budget)
+        monkeypatch.setattr("webshart.parquet.PROJECTED_SCAN_CACHE_BYTES", budget)
+
+        calls.clear()
+        rows = list(ParquetDataLoader(dataset).iter_samples_in_shard(0, metadata_fields=["captions"]))
+        assert [(row["sample_idx"], row["captions"]) for row in rows] == [
+            (0, "one"), (2, "three"), (3, "four")
+        ]
+        gets = [headers["range"] for method, _, headers in calls if method == "GET"]
+        # Each projected column run is fetched in its window without falling back to page reads.
+        assert sorted(gets) == sorted(windows[0] + windows[1])
+
+
 def test_explicit_credentials_do_not_inherit_environment_session_token(
     tmp_path, monkeypatch
 ):

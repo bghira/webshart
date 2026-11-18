@@ -4,6 +4,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import wraps
+from itertools import accumulate
 import hashlib
 import json
 import sqlite3
@@ -1052,17 +1053,39 @@ class ParquetDataset:
         requested = fields.union(aliases[name] for name in fields if name in aliases)
         return [name for name in columns if name in requested]
 
-    def _iter_source_metadata(self, shard_index, shard, fields):
-        reader = self._file(shard_index)
-        columns = self._metadata_columns(reader.info(), fields)
-        if columns and not self._source_repo.local:
-            reader.prefetch_columns(
+    def _iter_projected_rows(self, reader, info, columns):
+        if self._source_repo.local:
+            yield from reader.rows(columns=columns)
+            return
+
+        starts = tuple(accumulate(info["row_groups"], initial=0))
+
+        def read_groups(start, stop):
+            cached = reader.prefetch_columns(
                 columns,
                 max_bytes=PROJECTED_SCAN_CACHE_BYTES,
                 parallel_reads=self.parallel_reads,
+                start_group=start,
+                stop_group=stop,
             )
+            if cached or stop - start <= 1:
+                yield from reader.rows(
+                    columns=columns, start=starts[start], stop=starts[stop]
+                )
+            else:
+                mid = (start + stop) // 2
+                yield from read_groups(start, mid)
+                yield from read_groups(mid, stop)
+
+        if len(starts) > 1:
+            yield from read_groups(0, len(starts) - 1)
+
+    def _iter_source_metadata(self, shard_index, shard, fields):
+        reader = self._file(shard_index)
+        info = reader.info()
+        columns = self._metadata_columns(info, fields)
         rows = (
-            reader.rows(columns=columns)
+            self._iter_projected_rows(reader, info, columns)
             if columns
             else ({} for _ in range(shard["num_rows"]))
         )

@@ -4,8 +4,9 @@ use parquet::basic::Type as PhysicalType;
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
 use parquet::data_type::DataType;
 use parquet::errors::{ParquetError, Result as ParquetResult};
-use parquet::file::reader::{ChunkReader, FileReader, Length};
-use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::reader::{ChunkReader, FileReader, Length, RowGroupReader};
+use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::record::reader::RowIter;
 use parquet::record::{Field, Row};
 use parquet::schema::types::Type;
@@ -446,12 +447,37 @@ impl PyParquetCache {
     }
 }
 
+struct RowGroupWindow {
+    reader: Arc<SerializedFileReader<RangeSource>>,
+    start: usize,
+    stop: usize,
+}
+
+impl FileReader for RowGroupWindow {
+    fn metadata(&self) -> &ParquetMetaData {
+        self.reader.metadata()
+    }
+
+    fn num_row_groups(&self) -> usize {
+        self.stop - self.start
+    }
+
+    fn get_row_group(&self, index: usize) -> ParquetResult<Box<dyn RowGroupReader + '_>> {
+        self.reader.get_row_group(self.start + index)
+    }
+
+    fn get_row_iter(&self, projection: Option<Type>) -> ParquetResult<RowIter<'_>> {
+        RowIter::from_file(projection, self)
+    }
+}
+
 #[pyclass(name = "_ParquetFile")]
 pub struct PyParquetFile {
     reader: Arc<SerializedFileReader<RangeSource>>,
     source: Arc<Source>,
     info_json: String,
     num_rows: usize,
+    row_group_starts: Vec<usize>,
 }
 
 #[pymethods]
@@ -524,7 +550,13 @@ impl PyParquetFile {
             let row_groups: Vec<_> = metadata.row_groups().iter().map(|group| group.num_rows()).collect();
             let num_rows = metadata.file_metadata().num_rows() as usize;
             let info_json = serde_json::json!({"num_rows": num_rows, "columns": columns, "binary_columns": binary_columns, "row_groups": row_groups, "size": size, "etag": etag}).to_string();
-            Ok(Self { reader: Arc::new(reader), source, info_json, num_rows })
+            let row_group_starts = std::iter::once(0)
+                .chain(row_groups.iter().scan(0, |start, &length| {
+                    *start += length as usize;
+                    Some(*start)
+                }))
+                .collect();
+            Ok(Self { reader: Arc::new(reader), source, info_json, num_rows, row_group_starts })
         })
     }
 
@@ -634,13 +666,15 @@ impl PyParquetFile {
     }
 
     /// Coalesce only selected column chunks into a bounded metadata cache.
-    #[pyo3(signature=(columns, max_bytes=67108864, parallel_reads=4))]
+    #[pyo3(signature=(columns, max_bytes=67108864, parallel_reads=4, start_group=0, stop_group=None))]
     fn prefetch_columns(
         &self,
         py: Python<'_>,
         columns: Vec<String>,
         max_bytes: usize,
         parallel_reads: usize,
+        start_group: usize,
+        stop_group: Option<usize>,
     ) -> PyResult<bool> {
         if parallel_reads == 0 {
             return Err(PyValueError::new_err("parallel_reads must be positive"));
@@ -654,10 +688,12 @@ impl PyParquetFile {
                     .root_schema(),
                 Some(columns.clone()),
             )?;
-            let mut spans: Vec<_> = self
-                .reader
-                .metadata()
-                .row_groups()
+            let groups = self.reader.metadata().row_groups();
+            let stop_group = stop_group.unwrap_or(groups.len());
+            let groups = groups
+                .get(start_group..stop_group)
+                .ok_or_else(|| PyIndexError::new_err("Parquet row group range is out of bounds"))?;
+            let mut spans: Vec<_> = groups
                 .iter()
                 .flat_map(|group| group.columns())
                 .filter(|column| columns.contains(&column.column_path().parts()[0]))
@@ -747,10 +783,7 @@ impl PyParquetFile {
                     .root_schema(),
                 columns,
             )?;
-            let mut starts = vec![0];
-            for group in reader.metadata().row_groups() {
-                starts.push(starts.last().unwrap() + group.num_rows() as usize);
-            }
+            let starts = &self.row_group_starts;
             let mut groups: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
             for (position, index) in indices.iter().copied().enumerate() {
                 let group = starts.partition_point(|&start| start <= index) - 1;
@@ -822,24 +855,17 @@ impl PyParquetFile {
         if start > stop || stop > self.num_rows {
             return Err(PyIndexError::new_err("Parquet row range is out of bounds"));
         }
-        let source = self.source.clone();
-        py.detach(move || {
-            let mut row_start = 0usize;
-            let skipped = Arc::new(AtomicU64::new(0));
-            let skipped_by_predicate = skipped.clone();
-            let options = ReadOptionsBuilder::new()
-                .with_predicate(Box::new(move |group, _| {
-                    let row_end = row_start + group.num_rows() as usize;
-                    let selected = row_end > start && row_start < stop;
-                    if row_end <= start {
-                        skipped_by_predicate.store(row_end as u64, Ordering::Relaxed);
-                    }
-                    row_start = row_end;
-                    selected
-                }))
-                .build();
-            let reader = SerializedFileReader::new_with_options(RangeSource(source), options)
-                .map_err(python_error)?;
+        py.detach(|| {
+            let group_start = self
+                .row_group_starts
+                .partition_point(|&index| index <= start)
+                - 1;
+            let group_stop = self.row_group_starts.partition_point(|&index| index < stop);
+            let reader = RowGroupWindow {
+                reader: self.reader.clone(),
+                start: group_start,
+                stop: group_stop.max(group_start),
+            };
             let schema = reader
                 .metadata()
                 .file_metadata()
@@ -853,7 +879,7 @@ impl PyParquetFile {
             Ok(PyParquetRows {
                 state: Mutex::new(RowState {
                     rows,
-                    skip: start - skipped.load(Ordering::Relaxed) as usize,
+                    skip: start - self.row_group_starts[group_start],
                     remaining: stop - start,
                 }),
             })
