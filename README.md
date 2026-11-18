@@ -743,6 +743,12 @@ rather than silently skipping rows. Deferred mode is part of scan identity;
 existing immediate-upload scans require an explicit checkpoint migration or a
 fresh destination before changing modes.
 
+For independent workers claiming source shards dynamically, use the
+[object-store shard queue](docs/shard-queue.md). Conditional writes give each
+attempt a separate output prefix and prevent a replaced owner from publishing
+its result. Keep renewing claims until their outputs and manifest are uploaded;
+the shard queue coordinates ownership separately from the upload queue.
+
 The resulting `webshart-parquet.json` and `metadata/` files can be used locally
 or hosted together in a metadata-only Hub repository. Keep `scan-state.json`,
 `checkpoints/`, and `parts/` locally for resuming. Each completed invocation
