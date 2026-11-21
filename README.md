@@ -88,6 +88,30 @@ and aspect buckets instead of being returned with empty data. Direct
 `filename`, so filtered listings retain the stable index required by
 `load_sample()`.
 
+### Byte-bounded read-ahead
+
+Use `iter_prefetched()` on a `TarDataLoader` or `ParquetDataLoader` to overlap
+sequential reads with work on the previous sample. Each iterator starts one
+background thread and yields entries in source order.
+
+```python
+with loader.iter_prefetched(max_bytes=64 * 1024**2, max_items=128) as entries:
+    for entry in entries:
+        consume(entry)
+```
+
+The queue counts file bytes for tar and all requested binary payloads for
+Parquet, including secondary image columns. `max_items` also bounds the number
+of queued entries with empty or missing payloads. One oversized entry can pass
+through an empty queue on its own. The worker can have a read in flight beyond
+the queue, and the readers still use their own transport and decoding buffers.
+
+Tar prefetch starts from a snapshot of the loader's current cursor and leaves
+its checkpoint state untouched. Parquet prefetch starts at the first shard by
+default. Pass `shard_index`, `start`, and `stop` to stream a physical row range
+within one shard. The context manager closes the iterator on early exit and
+waits for any in-flight read. Create the iterator in the process that consumes it.
+
 ## Native transform cache
 
 `TransformCache` stores caller-computed transform values in local SQLite files

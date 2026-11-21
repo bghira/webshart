@@ -21,7 +21,13 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from filelock import FileLock
 
-from ._webshart import _ParquetFile, _ParquetCache, _S3Store, _parquet_bucket_keys
+from ._webshart import (
+    _ParquetFile,
+    _ParquetCache,
+    _PrefetchIterator,
+    _S3Store,
+    _parquet_bucket_keys,
+)
 from .url_images import URLImageError, URLImageOptions, URLImageClient
 
 MANIFEST = "webshart-parquet.json"
@@ -1133,6 +1139,25 @@ class ParquetSample:
         return self.width / self.height if self.width and self.height else None
 
 
+def _sample_payload_bytes(sample: ParquetSample) -> int:
+    pending = [sample.data, sample.payloads]
+    seen = set()
+    total = 0
+    while pending:
+        value = pending.pop()
+        if isinstance(value, bytes):
+            identity = id(value)
+            if identity not in seen:
+                seen.add(identity)
+                total += len(value)
+        elif isinstance(value, dict):
+            pending.extend(value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return total
+
+
 class ParquetDataLoader:
     """Stream selected payload columns page by page, not whole column chunks.
 
@@ -1354,6 +1379,26 @@ class ParquetDataLoader:
     def __iter__(self) -> Iterator[ParquetSample]:
         for shard_index in range(self.dataset.num_shards):
             yield from self.iter_shard(shard_index)
+
+    def iter_prefetched(
+        self,
+        max_bytes: int,
+        *,
+        max_items: int = 128,
+        shard_index: int | None = None,
+        start: int = 0,
+        stop: int | None = None,
+    ) -> _PrefetchIterator:
+        """Read ahead in order on one background thread, optionally within a shard."""
+        if shard_index is None:
+            if start != 0 or stop is not None:
+                raise ValueError("start and stop require shard_index")
+            source = iter(self)
+        else:
+            source = self.iter_shard(shard_index, start, stop)
+        return _PrefetchIterator._from_python(
+            source, _sample_payload_bytes, max_bytes, max_items
+        )
 
 
 def discover_parquet_dataset(source: str, **kwargs) -> ParquetDataset:

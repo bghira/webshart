@@ -1,6 +1,7 @@
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset, PyDiscoveredDataset};
 use crate::error::{Result, WebshartError};
 use crate::metadata::{CaptionValue, ShardMetadata};
+use crate::prefetch::{PrefetchIterator, Sample};
 use crate::FileInfo;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
@@ -584,6 +585,31 @@ impl PyTarDataLoader {
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyTarFileEntry>> {
         slf.next_entry()
+    }
+
+    /// Read files on a background thread from a snapshot of the current cursor.
+    #[pyo3(signature = (max_bytes, *, max_items=128))]
+    fn iter_prefetched(&self, max_bytes: usize, max_items: usize) -> PyResult<PrefetchIterator> {
+        let mut reader = Self {
+            dataset: self.dataset.clone(),
+            runtime: self.runtime.clone(),
+            config: self.config.clone(),
+            current_shard: self.current_shard,
+            entry_buffer: Vec::new(),
+            buffer_position: 0,
+            next_file_to_load: self.calculate_current_file_index(),
+            source: self.source.clone(),
+            metadata_source: self.metadata_source.clone(),
+            ranges: self.ranges.clone(),
+            current_range_idx: self.current_range_idx,
+        };
+        PrefetchIterator::start(max_bytes, max_items, move |bytes, items| {
+            let entry = reader.next_entry_with_limits(bytes as u64, items)?;
+            Ok(entry.map(|entry| {
+                let bytes = entry.data.len();
+                (Sample::Tar(entry), bytes)
+            }))
+        })
     }
 
     fn next_batch(&mut self) -> PyResult<Option<Vec<PyTarFileEntry>>> {
@@ -2140,6 +2166,14 @@ impl PyTarDataLoader {
     }
 
     fn next_entry(&mut self) -> PyResult<Option<PyTarFileEntry>> {
+        self.next_entry_with_limits(u64::MAX, usize::MAX)
+    }
+
+    fn next_entry_with_limits(
+        &mut self,
+        max_bytes: u64,
+        max_entries: usize,
+    ) -> PyResult<Option<PyTarFileEntry>> {
         if let Some(ranges) = &self.ranges {
             // Check if we're within current range
             let current_idx = self.calculate_global_file_index()?;
@@ -2167,7 +2201,7 @@ impl PyTarDataLoader {
             return Ok(self.take_buffered_entry());
         }
 
-        self.refill_buffer()?;
+        self.refill_buffer(max_bytes, max_entries)?;
 
         if self.buffer_position < self.entry_buffer.len() {
             Ok(self.take_buffered_entry())
@@ -2202,7 +2236,7 @@ impl PyTarDataLoader {
         Some(result)
     }
 
-    fn refill_buffer(&mut self) -> PyResult<()> {
+    fn refill_buffer(&mut self, max_bytes: u64, max_entries: usize) -> PyResult<()> {
         self.entry_buffer.clear();
         self.buffer_position = 0;
 
@@ -2210,7 +2244,7 @@ impl PyTarDataLoader {
             && self.current_shard < self.dataset.lock().unwrap().num_shards()
         {
             let previous_next_file = self.next_file_to_load;
-            self.load_entries_from_current_shard()?;
+            self.load_entries_from_current_shard(max_bytes, max_entries)?;
 
             if self.entry_buffer.is_empty() && self.next_file_to_load == previous_next_file {
                 self.current_shard += 1;
@@ -2221,7 +2255,11 @@ impl PyTarDataLoader {
         Ok(())
     }
 
-    fn load_entries_from_current_shard(&mut self) -> PyResult<()> {
+    fn load_entries_from_current_shard(
+        &mut self,
+        max_bytes: u64,
+        max_entries: usize,
+    ) -> PyResult<()> {
         let mut dataset = self.dataset.lock().unwrap();
 
         if self.current_shard >= dataset.num_shards() {
@@ -2257,19 +2295,27 @@ impl PyTarDataLoader {
         }
 
         let start_idx = self.next_file_to_load;
-        let end_idx = std::cmp::min(start_idx + self.config.buffer_size, total_files);
-        let file_entries: Vec<IndexedFileEntry> = metadata
-            .file_range(start_idx, end_idx)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(offset, (filename, file_info))| {
-                (file_info.length <= self.config.max_file_size).then_some((
-                    start_idx + offset,
-                    filename,
-                    file_info,
-                ))
-            })
-            .collect();
+        let scan_end = start_idx
+            .saturating_add(self.config.buffer_size.min(max_entries))
+            .min(total_files);
+        let mut file_entries = Vec::new();
+        let mut end_idx = start_idx;
+        let mut bytes = 0u64;
+        for (filename, file_info) in metadata.file_range(start_idx, scan_end) {
+            if file_info.length <= self.config.max_file_size {
+                let length = if self.config.load_file_data {
+                    file_info.length
+                } else {
+                    0
+                };
+                if !file_entries.is_empty() && (bytes > max_bytes || length > max_bytes - bytes) {
+                    break;
+                }
+                bytes += length;
+                file_entries.push((end_idx, filename, file_info));
+            }
+            end_idx += 1;
+        }
 
         drop(dataset);
 

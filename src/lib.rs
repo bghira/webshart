@@ -8,6 +8,7 @@ mod field_rename;
 mod metadata;
 mod metadata_resolver;
 mod parquet;
+mod prefetch;
 mod recompress;
 mod s3;
 mod transform_cache;
@@ -48,6 +49,7 @@ fn _webshart(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parquet::_parquet_bucket_keys, m)?)?;
     m.add_class::<parquet::PyParquetFile>()?;
     m.add_class::<parquet::PyParquetRows>()?;
+    m.add_class::<prefetch::PrefetchIterator>()?;
     m.add_class::<transform_cache::TransformCache>()?;
     m.add_class::<url_images::PyURLImageClient>()?;
     m.add_function(wrap_pyfunction!(scale_dimensions, m)?)?;

@@ -64,6 +64,25 @@ def discovered_dataset(mock_dataset_dir):
     return webshart.discover_dataset(mock_dataset_dir)
 
 
+@pytest.mark.parametrize("max_bytes", [1, 8000])
+def test_tar_prefetch_starts_at_cursor_without_advancing_loader(discovered_dataset, max_bytes):
+    loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
+    for _ in range(8):
+        next(loader)
+    state = loader.state_dict()
+    expected = webshart.TarDataLoader.from_state_dict(state, discovered_dataset)
+
+    with loader.iter_prefetched(max_bytes, max_items=3) as entries:
+        assert [(entry.path, entry.data) for entry in entries] == [
+            (entry.path, entry.data) for entry in expected
+        ]
+
+    assert loader.state_dict() == state
+    with loader.iter_prefetched(max_bytes, max_items=1) as entries:
+        assert next(entries).path == next(loader).path
+    assert list(entries) == []
+
+
 class TestTarDataLoaderStateDict:
     """Test state dict functionality for resumable pipelines."""
 
