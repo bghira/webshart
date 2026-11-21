@@ -112,6 +112,58 @@ def test_native_nested_captions_pair_payloads_and_row_identity(tmp_path):
     assert entries[0].path == "task/part.parquet/000000000000"
 
 
+def test_parquet_prefetch_counts_secondary_payloads_and_preserves_rows(
+    tmp_path, monkeypatch
+):
+    write_source(tmp_path)
+    dataset = webshart.discover_parquet_dataset(str(tmp_path))
+    loader = webshart.ParquetDataLoader(dataset, image_columns=["source_image"])
+    expected = list(loader)
+    materialized = [threading.Event() for _ in expected]
+    read_sample = loader._sample
+
+    def observe_read(shard, row, *args):
+        sample = read_sample(shard, row, *args)
+        materialized[row].set()
+        return sample
+
+    monkeypatch.setattr(loader, "_sample", observe_read)
+    with loader.iter_prefetched(13) as entries:
+        assert materialized[0].wait(5)
+        assert not materialized[1].wait(0.2)
+        assert next(entries) == expected[0]
+        assert list(entries) == expected[1:]
+
+    for event in materialized:
+        event.clear()
+    with loader.iter_prefetched(14) as entries:
+        assert materialized[1].wait(5)
+        assert not materialized[2].wait(0.2)
+        assert next(entries) == expected[0]
+
+    with loader.iter_prefetched(1, shard_index=0, start=1, stop=3) as entries:
+        assert list(entries) == expected[1:]
+
+
+def test_parquet_prefetch_propagates_worker_error_in_order(tmp_path, monkeypatch):
+    write_source(tmp_path)
+    dataset = webshart.discover_parquet_dataset(str(tmp_path))
+    loader = webshart.ParquetDataLoader(dataset)
+    read_sample = loader._sample
+
+    def read_or_fail(shard, row, *args):
+        if row == 1:
+            raise OSError("test read failed")
+        return read_sample(shard, row, *args)
+
+    monkeypatch.setattr(loader, "_sample", read_or_fail)
+    with loader.iter_prefetched(100) as entries:
+        assert next(entries).data == b"first"
+        with pytest.raises(OSError, match="test read failed"):
+            next(entries)
+        assert list(entries) == []
+
+
 @pytest.mark.parametrize("kind", ["json", "parquet"])
 def test_custom_metadata_joins_by_row_not_id_or_order(tmp_path, kind):
     source = tmp_path / "source"

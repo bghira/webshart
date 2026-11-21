@@ -187,7 +187,10 @@ def test_capture_catalogue_is_published_once_and_reused_across_processes(tmp_pat
             s3_options=options,
             catalogue_cache_dir=cache,
         )
-        assert ParquetDataLoader(dataset).load_sample(0, 0).data == b"first"
+        with ParquetDataLoader(dataset).iter_prefetched(5) as entries:
+            assert [entry.data for entry in entries] == [
+                b"first", None, b"third", b"fourth"
+            ]
         assert "etag" in dataset.get_shard_info(0)
         other = ParquetDataset(
             "s3://test-bucket",
