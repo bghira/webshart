@@ -702,3 +702,61 @@ def test_prepared_etag_pin_survives_reopen_without_object_checksum(tmp_path):
         second.bind_source_revisions({0: revision}.get)
         with pytest.raises(ValueError, match="accepted dataset view"):
             second.read_metadata_rows(0, [0], fields=["width"])
+
+
+def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path):
+    import time
+    from contextlib import closing
+
+    objects = capture(tmp_path)
+    contents = objects["parts/part.parquet"]
+    manifest_key = "catalog/manifest.jsonl"
+    descriptor_key = "combined/dataset.json"
+    row = json.loads(objects[manifest_key])
+    records = []
+    for index in range(20):
+        key = f"parts/{index:02d}.parquet"
+        objects[key] = contents
+        records.append(json.dumps({**row, "key": key}))
+    objects[manifest_key] = ("\n".join(records) + "\n").encode()
+    descriptor = json.loads(objects[descriptor_key])
+    descriptor["manifest_sha256"] = hashlib.sha256(objects[manifest_key]).hexdigest()
+    objects[descriptor_key] = json.dumps(descriptor).encode()
+    cache = tmp_path / "shards"
+    with s3_server(objects) as (options, calls, _):
+        loader = _open_single_shard_cache(options, cache, 8 * len(contents))
+        with closing(loader.dataset.sequential_prefill(active_shards=4)) as cursor:
+            for first in (4, 8, 12):
+                cursor.advance(first)
+                deadline = time.monotonic() + 10
+                while cursor.ready_range != (first, first + 8):
+                    assert cursor.error is None and time.monotonic() < deadline
+                    time.sleep(0.01)
+                before = loader.dataset.io_stats()
+                batch = loader.load_samples(
+                    [(shard, 0) for shard in range(first, first + 8)],
+                    metadata_fields=(),
+                )
+                assert [sample.data for sample in batch] == [b"first"] * 8
+                assert loader.dataset.io_stats() == before
+                assert sum(
+                    file.stat().st_size for file in cache.glob("*.parquet")
+                ) == 8 * len(contents)
+            peer = loader.dataset.sequential_prefill(active_shards=4)
+            peer.advance(8)
+        with closing(peer):
+            deadline = time.monotonic() + 10
+            while peer.ready_range != (8, 16):
+                assert peer.error is None and time.monotonic() < deadline
+                time.sleep(0.01)
+        assert not any(key == "parts/00.parquet" for _, key, _ in calls)
+        loader.dataset.enable_shard_cache(str(cache), 2 * len(contents) / 1024**3)
+        before = loader.dataset.io_stats()
+        with closing(loader.dataset.sequential_prefill(active_shards=4)) as cursor:
+            cursor.advance(0)
+            deadline = time.monotonic() + 10
+            while cursor.ready_range is None:
+                assert cursor.error is None and time.monotonic() < deadline
+                time.sleep(0.01)
+            assert cursor.ready_range == (0, 0)
+            assert loader.dataset.io_stats() == before

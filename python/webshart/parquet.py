@@ -646,6 +646,30 @@ class ParquetDataset:
         self._shard_cache = _ParquetCache(
             str(location), cache_limit_gb, parallel_downloads
         )
+        self._prefill_settings = (
+            Path(location),
+            int(cache_limit_gb * 1024**3),
+            parallel_downloads,
+        )
+
+    def sequential_prefill(self, *, active_shards=1):
+        """Return a whole-shard read-ahead cursor for the configured remote cache."""
+        if self._shard_cache is None or self._source_repo.local:
+            return None
+        from .parquet_prefill import SequentialShardPrefill
+
+        directory, budget, parallelism = self._prefill_settings
+        return SequentialShardPrefill(
+            directory,
+            budget,
+            parallelism,
+            self.num_shards,
+            lambda index: self._shard(index)["size"],
+            lambda index: self._file(index, payload=True).cache_shard(
+                self._shard_cache
+            ),
+            _integer(active_shards, "active_shards", 1),
+        )
 
     def io_stats(self):
         """Logical S3 transport operations and transferred bytes. SDK retries are internal."""

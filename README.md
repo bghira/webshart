@@ -642,7 +642,12 @@ ETag. Reopen the dataset to verify the latest object revision.
 
 Metadata preparation coalesces selected column chunks into a bounded 64 MiB
 cache and leaves image columns unread. Whole-shard downloads begin on payload
-access. Network I/O and Parquet decoding release the GIL. Batch requests share
+access. Sequential consumers can call `cursor = dataset.sequential_prefill(active_shards=4)`
+after enabling the remote disk cache. At each window, call `cursor.advance(first_shard)`
+with its physical start, including the restored start on resume. One worker per
+shared cache downloads consecutive shards up to the configured byte limit,
+reserves in-flight bytes, and releases consumed read leases as the cursor advances.
+Close the cursor at epoch end. A local or uncached dataset returns `None`. Network I/O and Parquet decoding release the GIL. Batch requests share
 each selected row group, use bounded native concurrency, and preserve input
 order and duplicates.
 

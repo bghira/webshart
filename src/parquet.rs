@@ -186,6 +186,11 @@ struct LocalShard {
     _guard: ShardLockGuard,
 }
 
+#[pyclass(name = "_ParquetShardLease")]
+struct PyParquetShardLease {
+    _shard: Arc<LocalShard>,
+}
+
 struct CacheRead {
     cache: ShardCache,
     populate: bool,
@@ -722,6 +727,20 @@ impl PyParquetFile {
                 properties: Arc::new(ReaderProperties::builder().build()),
             };
             Ok(Self { reader, source, info_json, num_rows, row_group_starts })
+        })
+    }
+
+    fn cache_shard(&self, py: Python<'_>, cache: &PyParquetCache) -> PyResult<PyParquetShardLease> {
+        py.detach(|| {
+            let ranges = RangeSource::new(self.source.clone(), Some(cache.cache.clone()), true);
+            let shard = ranges
+                .cache
+                .as_ref()
+                .ok_or_else(|| PyValueError::new_err("Shard is not cacheable"))?
+                .open(&self.source)
+                .map_err(python_error)?
+                .ok_or_else(|| PyValueError::new_err("Shard has no cache identity"))?;
+            Ok(PyParquetShardLease { _shard: shard })
         })
     }
 
