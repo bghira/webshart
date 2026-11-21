@@ -159,6 +159,78 @@ def _open_shared_capture(options, cache):
     return dataset.fingerprint, dataset.physical_row_count
 
 
+def _open_single_shard_cache(options, cache, size):
+    dataset = ParquetDataset(
+        "s3://test-bucket",
+        manifest="combined/dataset.json",
+        s3_options=options,
+        metadata_cache_size=1,
+    )
+    dataset.enable_shard_cache(str(cache), size / 1024**3)
+    return ParquetDataLoader(dataset)
+
+
+def _read_cached_shard(options, cache, size, shard):
+    loader = _open_single_shard_cache(options, cache, size)
+    return loader.load_samples([(shard, 0)], metadata_fields=())[0].data
+
+
+def test_s3_cache_evicts_idle_readers_and_reopens_with_verified_etag(tmp_path):
+    objects = capture(tmp_path)
+    first = "parts/part.parquet"
+    second = "parts/other.parquet"
+    objects[second] = objects[first]
+    manifest_key = "catalog/manifest.jsonl"
+    descriptor_key = "combined/dataset.json"
+    record = json.loads(objects[manifest_key])
+    objects[manifest_key] += (json.dumps({**record, "key": second}) + "\n").encode()
+    descriptor = json.loads(objects[descriptor_key])
+    descriptor["manifest_sha256"] = hashlib.sha256(objects[manifest_key]).hexdigest()
+    objects[descriptor_key] = json.dumps(descriptor).encode()
+    cache = tmp_path / "shards"
+    size = len(objects[first])
+
+    with s3_server(objects) as (options, calls, etags):
+        loader = _open_single_shard_cache(options, cache, size)
+        assert loader.load_samples([(0, 0)], metadata_fields=())[0].data == b"first"
+        assert sum(method == "HEAD" and key == first for method, key, _ in calls) == 1
+        (first_file,) = cache.glob("*.parquet")
+        stream = loader.iter_shard(0)
+        assert next(stream).data == b"first"
+
+        # A separate rank evicts the shard while the first stream is still live.
+        with ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn")
+        ) as pool:
+            assert pool.submit(_read_cached_shard, options, cache, size, 1).result(
+                timeout=30
+            ) == b"first"
+        (second_file,) = cache.glob("*.parquet")
+        assert second_file != first_file
+        assert not first_file.exists()
+
+        assert [sample.data for sample in stream] == [None, b"third", b"fourth"]
+        assert list(cache.glob("*.parquet")) == [first_file]
+        assert sum(method == "HEAD" and key == first for method, key, _ in calls) == 1
+
+        assert loader.load_samples([(1, 0)], metadata_fields=())[0].data == b"first"
+        assert list(loader.dataset._files) == [1]
+        assert list(cache.glob("*.parquet")) == [second_file]
+        calls.clear()
+        assert loader.load_samples([(0, 3)], metadata_fields=())[0].data == b"fourth"
+        reads = [(method, headers) for method, key, headers in calls if key == first]
+        assert reads and all(
+            method == "GET" and headers.get("if-match") == etags[first]
+            for method, headers in reads
+        )
+        assert sum("range" not in headers for _, headers in reads) == 1
+
+        loader.load_samples([(1, 0)], metadata_fields=())
+        etags[first] = '"replacement"'
+        with pytest.raises(OSError, match="S3 object changed"):
+            loader.load_samples([(0, 0)], metadata_fields=())
+
+
 def test_capture_catalogue_is_published_once_and_reused_across_processes(tmp_path):
     objects = capture(tmp_path)
     cache = tmp_path / "shared"

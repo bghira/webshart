@@ -4,9 +4,10 @@ use parquet::basic::Type as PhysicalType;
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
 use parquet::data_type::DataType;
 use parquet::errors::{ParquetError, Result as ParquetResult};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::properties::{ReaderProperties, ReaderPropertiesPtr};
 use parquet::file::reader::{ChunkReader, FileReader, Length, RowGroupReader};
-use parquet::file::serialized_reader::SerializedFileReader;
+use parquet::file::serialized_reader::SerializedRowGroupReader;
 use parquet::record::reader::RowIter;
 use parquet::record::{Field, Row};
 use parquet::schema::types::Type;
@@ -17,6 +18,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
@@ -28,8 +30,8 @@ use crate::s3::{PyS3Store, Store};
 
 const RANGE_CHUNK: usize = 8 * 1024 * 1024;
 
-fn s3_cache_name(store: &Store, key: &str, etag: Option<&str>) -> String {
-    let identity = format!("{}:{key}:{etag:?}", store.identity);
+fn s3_cache_name(store: &Store, key: &str, etag: &str) -> String {
+    let identity = format!("{}:{key}:{:?}", store.identity, Some(etag));
     format!(
         "{}.parquet",
         crate::digest_to_hex(Sha256::digest(identity.as_bytes()))
@@ -90,60 +92,13 @@ struct Source {
     token: Option<String>,
     remote: bool,
     s3: Option<(Arc<Store>, String, Option<String>)>,
-    _cache_guard: Option<ShardLockGuard>,
-    bytes_read: Arc<AtomicU64>,
+    bytes_read: AtomicU64,
     max_page_bytes: usize,
     cache: Mutex<Option<Bytes>>,
     cached_ranges: Mutex<BTreeMap<u64, Bytes>>,
 }
 
 impl Source {
-    fn try_cached_s3_reader(
-        &self,
-        cache: &ShardCache,
-    ) -> PyResult<Option<Arc<SerializedFileReader<RangeSource>>>> {
-        let Some((store, key, Some(etag))) = &self.s3 else {
-            return Ok(None);
-        };
-        let name = s3_cache_name(store, key, Some(etag));
-        let guard = runtime().map_err(python_error)?.block_on(async {
-            if !cache.is_cached(&name).await {
-                return Ok(None);
-            }
-            match cache.lock_shard_for_reading(&name).await {
-                Ok(guard) => {
-                    cache.touch_shard(&name).await;
-                    Ok(Some(guard))
-                }
-                Err(WebshartError::CacheMiss(_)) => Ok(None),
-                Err(error) => Err(error),
-            }
-        })?;
-        let Some(guard) = guard else {
-            return Ok(None);
-        };
-        let path = cache.get_cached_shard_path(&name);
-        if std::fs::metadata(&path)?.len() != self.size {
-            return Err(PyOSError::new_err(
-                "Cached Parquet file size does not match its source",
-            ));
-        }
-        let source = Arc::new(Self {
-            path: path.to_string_lossy().into_owned(),
-            size: self.size,
-            token: None,
-            remote: false,
-            s3: None,
-            _cache_guard: Some(guard),
-            bytes_read: self.bytes_read.clone(),
-            max_page_bytes: self.max_page_bytes,
-            cache: Mutex::new(None),
-            cached_ranges: Mutex::new(BTreeMap::new()),
-        });
-        let reader = SerializedFileReader::new(RangeSource(source)).map_err(python_error)?;
-        Ok(Some(Arc::new(reader)))
-    }
-
     fn cached_range(&self, start: u64) -> ParquetResult<Option<Bytes>> {
         let ranges = self
             .cached_ranges
@@ -184,7 +139,12 @@ impl Source {
                 let count = RANGE_CHUNK.min(length - data.len());
                 let chunk = runtime()?
                     .block_on(store.range(key, start + data.len() as u64, count, etag.clone()))
-                    .map_err(|_| parquet_error("S3 Parquet range request failed"))?;
+                    .map_err(|error| match error {
+                        object_store::Error::Precondition { .. } => {
+                            parquet_error("S3 object changed during reading")
+                        }
+                        _ => parquet_error("S3 Parquet range request failed"),
+                    })?;
                 if chunk.len() != count {
                     return Err(parquet_error("S3 Parquet range length mismatch"));
                 }
@@ -221,18 +181,158 @@ impl Source {
     }
 }
 
+struct LocalShard {
+    path: PathBuf,
+    _guard: ShardLockGuard,
+}
+
+struct CacheRead {
+    cache: ShardCache,
+    populate: bool,
+    // Distinguish a cache miss already checked during this read from an unread source.
+    local: Mutex<Option<Option<Arc<LocalShard>>>>,
+}
+
+impl CacheRead {
+    fn open(&self, source: &Source) -> ParquetResult<Option<Arc<LocalShard>>> {
+        let mut local = self.local.lock().unwrap();
+        if let Some(shard) = local.as_ref() {
+            return Ok(shard.clone());
+        }
+        let shard = runtime()?
+            .block_on(self.acquire(source))
+            .map_err(parquet_error)?;
+        if let Some(shard) = &shard {
+            if std::fs::metadata(&shard.path)?.len() != source.size {
+                return Err(parquet_error(
+                    "Cached Parquet file size does not match its source",
+                ));
+            }
+        }
+        let shard = shard.map(Arc::new);
+        *local = Some(shard.clone());
+        Ok(shard)
+    }
+
+    async fn acquire(&self, source: &Source) -> crate::Result<Option<LocalShard>> {
+        let s3 = source.s3.as_ref();
+        let name = match s3 {
+            Some((store, key, Some(etag))) => s3_cache_name(store, key, etag),
+            None if source.remote => format!(
+                "{}.parquet",
+                crate::digest_to_hex(Sha256::digest(source.path.as_bytes()))
+            ),
+            _ => return Ok(None),
+        };
+        if self.cache.is_cached(&name).await {
+            match self.cache.lock_shard_for_reading(&name).await {
+                Ok(guard) => {
+                    self.cache.touch_shard(&name).await;
+                    return Ok(Some(LocalShard {
+                        path: self.cache.get_cached_shard_path(&name),
+                        _guard: guard,
+                    }));
+                }
+                Err(WebshartError::CacheMiss(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if !self.populate {
+            return Ok(None);
+        }
+        let (path, guard) = if let Some((store, key, etag)) = s3 {
+            let (path, guard) = self
+                .cache
+                .ensure_cached_with(&name, true, |target| async move {
+                    store
+                        .download(key, source.size, etag.as_deref(), &target)
+                        .await
+                })
+                .await?;
+            (path, guard.expect("read lock requested"))
+        } else {
+            self.cache
+                .cache_shard_for_reading(&name, &source.path, source.token.clone())
+                .await?
+        };
+        Ok(Some(LocalShard {
+            path,
+            _guard: guard,
+        }))
+    }
+}
+
+// A streaming decoder keeps its page state between calls. Its cached file must
+// be evictable while the caller is handling a row, including after an error.
+struct StreamRead(Option<Arc<CacheRead>>);
+
+impl Drop for StreamRead {
+    fn drop(&mut self) {
+        if let Some(cache) = &self.0 {
+            cache.local.lock().unwrap().take();
+        }
+    }
+}
+
 #[derive(Clone)]
-struct RangeSource(Arc<Source>);
+struct RangeSource {
+    source: Arc<Source>,
+    cache: Option<Arc<CacheRead>>,
+}
+
+impl RangeSource {
+    fn new(source: Arc<Source>, cache: Option<ShardCache>, populate: bool) -> Self {
+        let cacheable = source.remote
+            || source
+                .s3
+                .as_ref()
+                .is_some_and(|(_, _, etag)| etag.is_some());
+        let cache = cache.filter(|_| cacheable).map(|cache| {
+            Arc::new(CacheRead {
+                cache,
+                populate,
+                local: Mutex::new(None),
+            })
+        });
+        Self { source, cache }
+    }
+
+    fn read(&self, start: u64, length: usize) -> ParquetResult<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(cache) = &self.cache {
+            if let Some(shard) = cache.open(&self.source)? {
+                if start
+                    .checked_add(length as u64)
+                    .is_none_or(|end| end > self.source.size)
+                {
+                    return Err(parquet_error("Parquet range exceeds the source size"));
+                }
+                let mut file = File::open(&shard.path)?;
+                file.seek(SeekFrom::Start(start))?;
+                let mut data = vec![0; length];
+                file.read_exact(&mut data)?;
+                self.source
+                    .bytes_read
+                    .fetch_add(length as u64, Ordering::Relaxed);
+                return Ok(data);
+            }
+        }
+        self.source.read(start, length)
+    }
+}
 
 struct RangeStream {
-    source: Arc<Source>,
+    range: RangeSource,
     offset: u64,
 }
 
 impl Read for RangeStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let mut length = buffer.len().min((self.source.size - self.offset) as usize);
+        let mut length = buffer.len().min((self.range.len() - self.offset) as usize);
         if let Some(cached) = self
+            .range
             .source
             .cached_range(self.offset)
             .map_err(std::io::Error::other)?
@@ -240,7 +340,7 @@ impl Read for RangeStream {
             length = length.min(cached.len());
         }
         let data = self
-            .source
+            .range
             .read(self.offset, length)
             .map_err(std::io::Error::other)?;
         buffer[..length].copy_from_slice(&data);
@@ -251,7 +351,7 @@ impl Read for RangeStream {
 
 impl Length for RangeSource {
     fn len(&self) -> u64 {
-        self.0.size
+        self.source.size
     }
 }
 
@@ -259,23 +359,23 @@ impl ChunkReader for RangeSource {
     type T = BufReader<RangeStream>;
 
     fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
-        if start > self.0.size {
+        if start > self.source.size {
             return Err(parquet_error("Parquet stream offset exceeds source size"));
         }
         Ok(BufReader::with_capacity(
             1024,
             RangeStream {
-                source: self.0.clone(),
+                range: self.clone(),
                 offset: start,
             },
         ))
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        if length > self.0.max_page_bytes {
+        if length > self.source.max_page_bytes {
             return Err(parquet_error("Parquet page exceeds max_page_bytes"));
         }
-        Ok(self.0.read(start, length)?.into())
+        Ok(self.read(start, length)?.into())
     }
 }
 
@@ -447,8 +547,45 @@ impl PyParquetCache {
     }
 }
 
+#[derive(Clone)]
+struct ParquetReader {
+    ranges: Arc<RangeSource>,
+    metadata: Arc<ParquetMetaData>,
+    properties: ReaderPropertiesPtr,
+}
+
+impl ParquetReader {
+    fn with_cache(&self, cache: Option<ShardCache>, populate: bool) -> Self {
+        match cache {
+            Some(cache) => Self {
+                ranges: Arc::new(RangeSource::new(
+                    self.ranges.source.clone(),
+                    Some(cache),
+                    populate,
+                )),
+                metadata: self.metadata.clone(),
+                properties: self.properties.clone(),
+            },
+            None => self.clone(),
+        }
+    }
+
+    fn metadata(&self) -> &ParquetMetaData {
+        &self.metadata
+    }
+
+    fn get_row_group(&self, index: usize) -> ParquetResult<impl RowGroupReader + '_> {
+        SerializedRowGroupReader::new(
+            self.ranges.clone(),
+            self.metadata.row_group(index),
+            self.metadata.page_index_for_row_group(index),
+            self.properties.clone(),
+        )
+    }
+}
+
 struct RowGroupWindow {
-    reader: Arc<SerializedFileReader<RangeSource>>,
+    reader: ParquetReader,
     start: usize,
     stop: usize,
 }
@@ -463,7 +600,7 @@ impl FileReader for RowGroupWindow {
     }
 
     fn get_row_group(&self, index: usize) -> ParquetResult<Box<dyn RowGroupReader + '_>> {
-        self.reader.get_row_group(self.start + index)
+        Ok(Box::new(self.reader.get_row_group(self.start + index)?))
     }
 
     fn get_row_iter(&self, projection: Option<Type>) -> ParquetResult<RowIter<'_>> {
@@ -473,7 +610,7 @@ impl FileReader for RowGroupWindow {
 
 #[pyclass(name = "_ParquetFile")]
 pub struct PyParquetFile {
-    reader: Arc<SerializedFileReader<RangeSource>>,
+    reader: ParquetReader,
     source: Arc<Source>,
     info_json: String,
     num_rows: usize,
@@ -483,7 +620,7 @@ pub struct PyParquetFile {
 #[pymethods]
 impl PyParquetFile {
     #[new]
-    #[pyo3(signature = (path, size=None, hf_token=None, max_page_bytes=536870912, cache_bytes=0, s3=None, cache=None, expected_sha256=None))]
+    #[pyo3(signature = (path, size=None, hf_token=None, max_page_bytes=536870912, cache_bytes=0, s3=None, cache=None, expected_sha256=None, *, verified_s3_etag=None, cache_payload=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -495,6 +632,8 @@ impl PyParquetFile {
         s3: Option<PyRef<'_, PyS3Store>>,
         cache: Option<PyRef<'_, PyParquetCache>>,
         expected_sha256: Option<String>,
+        verified_s3_etag: Option<String>,
+        cache_payload: bool,
     ) -> PyResult<Self> {
         if max_page_bytes == 0 {
             return Err(PyValueError::new_err("max_page_bytes must be positive"));
@@ -502,53 +641,74 @@ impl PyParquetFile {
         let store = s3.map(|s| s.inner.clone());
         let cache = cache.map(|c| c.cache.clone());
         py.detach(move || {
-            let mut remote = path.starts_with("https://") || path.starts_with("http://");
-            let mut actual_path = path.clone();
+            let remote = path.starts_with("https://") || path.starts_with("http://");
             let mut s3_source = None;
-            let mut guard = None;
-            let mut etag = None;
             let size = if let Some(uri) = path.strip_prefix("s3://") {
-                let (bucket, key) = uri.split_once('/').ok_or_else(|| PyValueError::new_err("S3 Parquet URI requires an object key"))?;
-                let store = store.ok_or_else(|| PyValueError::new_err("S3 Parquet reads require an S3 store"))?;
-                if bucket != store.bucket { return Err(PyValueError::new_err("S3 store belongs to a different bucket")); }
-                let (meta, attributes) = runtime().map_err(python_error)?.block_on(store.head_with_attributes(key)).map_err(crate::s3::python_error)?;
-                let digest = attributes.get(&object_store::Attribute::Metadata("sha256".into()));
-                if let (Some(expected), Some(actual)) = (&expected_sha256, digest) {
-                    if expected != actual.as_ref() { return Err(PyValueError::new_err("S3 object SHA-256 metadata does not match its capture manifest")); }
+                let (bucket, key) = uri.split_once('/').ok_or_else(|| {
+                    PyValueError::new_err("S3 Parquet URI requires an object key")
+                })?;
+                let store = store.ok_or_else(|| {
+                    PyValueError::new_err("S3 Parquet reads require an S3 store")
+                })?;
+                if bucket != store.bucket {
+                    return Err(PyValueError::new_err("S3 store belongs to a different bucket"));
                 }
-                if size.is_some_and(|expected| expected != meta.size) { return Err(PyValueError::new_err("S3 object size does not match its manifest")); }
-                etag = meta.e_tag.clone();
-                if let Some(cache) = &cache {
-                    let name = s3_cache_name(&store, key, meta.e_tag.as_deref());
-                    let (cached, lock) = runtime().map_err(python_error)?.block_on(cache.ensure_cached_with(&name, true, |target| { let store = store.clone(); let meta = meta.clone(); async move { store.download(key, &meta, &target).await } })).map_err(PyErr::from)?;
-                    actual_path = cached.to_string_lossy().into_owned(); guard = lock;
-                } else { s3_source = Some((store, key.to_string(), meta.e_tag.clone())); }
-                meta.size
-            } else if remote {
-                let size = size.ok_or_else(|| PyValueError::new_err("Remote Parquet files require their exact size"))?;
-                if let Some(cache) = &cache {
-                    let name = format!("{}.parquet", crate::digest_to_hex(Sha256::digest(path.as_bytes())));
-                    let (cached, lock) = runtime().map_err(python_error)?.block_on(cache.cache_shard_for_reading(&name, &path, hf_token.clone())).map_err(PyErr::from)?;
-                    actual_path = cached.to_string_lossy().into_owned(); guard = Some(lock); remote = false;
-                }
+                let (size, etag) = if let (Some(size), Some(etag)) = (size, verified_s3_etag) {
+                    (size, Some(etag))
+                } else {
+                    let (meta, attributes) = runtime()
+                        .map_err(python_error)?
+                        .block_on(store.head_with_attributes(key))
+                        .map_err(crate::s3::python_error)?;
+                    let digest = attributes.get(&object_store::Attribute::Metadata("sha256".into()));
+                    if let (Some(expected), Some(actual)) = (&expected_sha256, digest) {
+                        if expected != actual.as_ref() {
+                            return Err(PyValueError::new_err(
+                                "S3 object SHA-256 metadata does not match its capture manifest",
+                            ));
+                        }
+                    }
+                    if size.is_some_and(|expected| expected != meta.size) {
+                        return Err(PyValueError::new_err("S3 object size does not match its manifest"));
+                    }
+                    (meta.size, meta.e_tag)
+                };
+                s3_source = Some((store, key.to_string(), etag));
                 size
+            } else if remote {
+                size.ok_or_else(|| PyValueError::new_err("Remote Parquet files require their exact size"))?
             } else {
                 let actual = std::fs::metadata(&path)?.len();
                 if size.is_some_and(|expected| expected != actual) { return Err(PyValueError::new_err("Parquet source size does not match its manifest")); }
                 actual
             };
-            let source = Arc::new(Source { path: actual_path, size, token: hf_token, remote, s3: s3_source, _cache_guard: guard, bytes_read: Arc::new(AtomicU64::new(0)), max_page_bytes, cache: Mutex::new(None), cached_ranges: Mutex::new(BTreeMap::new()) });
+            let source = Arc::new(Source {
+                path,
+                size,
+                token: hf_token,
+                remote,
+                s3: s3_source,
+                bytes_read: AtomicU64::new(0),
+                max_page_bytes,
+                cache: Mutex::new(None),
+                cached_ranges: Mutex::new(BTreeMap::new()),
+            });
+            let ranges = RangeSource::new(source.clone(), cache, cache_payload);
             if size <= cache_bytes as u64 {
-                let data = source.read(0, size as usize).map_err(python_error)?;
-                *source.cache.lock().map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))? = Some(data.into());
+                let data = ranges.read(0, size as usize).map_err(python_error)?;
+                *source
+                    .cache
+                    .lock()
+                    .map_err(|_| PyOSError::new_err("Parquet cache lock poisoned"))? = Some(data.into());
             }
-            let reader = SerializedFileReader::new(RangeSource(source.clone())).map_err(python_error)?;
-            let metadata = reader.metadata();
+            let metadata = ParquetMetaDataReader::new().parse_and_finish(&ranges).map_err(python_error)?;
+            drop(ranges);
             let fields = metadata.file_metadata().schema_descr().root_schema().get_fields();
             let columns: Vec<_> = fields.iter().map(|field| field.name()).collect();
             let binary_columns: Vec<_> = fields.iter().filter(|field| binary_field(field)).map(|field| field.name()).collect();
             let row_groups: Vec<_> = metadata.row_groups().iter().map(|group| group.num_rows()).collect();
             let num_rows = metadata.file_metadata().num_rows() as usize;
+            let etag = source.s3.as_ref().and_then(|(_, _, etag)| etag.as_deref());
             let info_json = serde_json::json!({"num_rows": num_rows, "columns": columns, "binary_columns": binary_columns, "row_groups": row_groups, "size": size, "etag": etag}).to_string();
             let row_group_starts = std::iter::once(0)
                 .chain(row_groups.iter().scan(0, |start, &length| {
@@ -556,7 +716,12 @@ impl PyParquetFile {
                     Some(*start)
                 }))
                 .collect();
-            Ok(Self { reader: Arc::new(reader), source, info_json, num_rows, row_group_starts })
+            let reader = ParquetReader {
+                ranges: Arc::new(RangeSource::new(source.clone(), None, false)),
+                metadata: Arc::new(metadata),
+                properties: Arc::new(ReaderProperties::builder().build()),
+            };
+            Ok(Self { reader, source, info_json, num_rows, row_group_starts })
         })
     }
 
@@ -753,7 +918,7 @@ impl PyParquetFile {
     }
 
     /// Read each selected row group once, preserving request order and duplicates.
-    #[pyo3(signature=(indices, columns=None, parallel_reads=4, shard_cache=None))]
+    #[pyo3(signature=(indices, columns=None, parallel_reads=4, shard_cache=None, *, cache_payload=false))]
     fn rows_at(
         &self,
         py: Python<'_>,
@@ -761,6 +926,7 @@ impl PyParquetFile {
         columns: Option<Vec<String>>,
         parallel_reads: usize,
         shard_cache: Option<PyRef<'_, PyParquetCache>>,
+        cache_payload: bool,
     ) -> PyResult<Vec<Py<PyAny>>> {
         if parallel_reads == 0 {
             return Err(PyValueError::new_err("parallel_reads must be positive"));
@@ -770,11 +936,7 @@ impl PyParquetFile {
         }
         let shard_cache = shard_cache.map(|cache| cache.cache.clone());
         let rows = py.detach(|| {
-            let cached = match &shard_cache {
-                Some(cache) => self.source.try_cached_s3_reader(cache)?,
-                None => None,
-            };
-            let reader = cached.as_ref().unwrap_or(&self.reader);
+            let reader = self.reader.with_cache(shard_cache, cache_payload);
             let projection = project_columns(
                 reader
                     .metadata()
@@ -792,6 +954,9 @@ impl PyParquetFile {
                     .or_default()
                     .push((index - starts[group], position));
             }
+            if let Some(cache) = reader.ranges.cache.as_ref().filter(|_| !groups.is_empty()) {
+                cache.open(&self.source).map_err(python_error)?;
+            }
             let output = runtime()
                 .map_err(python_error)?
                 .block_on(async {
@@ -804,7 +969,7 @@ impl PyParquetFile {
                                     selected.sort_unstable();
                                     let group_reader = reader.get_row_group(group)?;
                                     let mut rows =
-                                        RowIter::from_row_group(projection, group_reader.as_ref())?
+                                        RowIter::from_row_group(projection, &group_reader)?
                                             .with_batch_size(1);
                                     let mut current = 0;
                                     let mut output = Vec::new();
@@ -843,26 +1008,31 @@ impl PyParquetFile {
         rows.iter().map(|(_, row)| row_to_python(py, row)).collect()
     }
 
-    #[pyo3(signature = (columns=None, start=0, stop=None))]
+    #[pyo3(signature = (columns=None, start=0, stop=None, *, shard_cache=None))]
     fn rows(
         &self,
         py: Python<'_>,
         columns: Option<Vec<String>>,
         start: usize,
         stop: Option<usize>,
+        shard_cache: Option<PyRef<'_, PyParquetCache>>,
     ) -> PyResult<PyParquetRows> {
         let stop = stop.unwrap_or(self.num_rows);
         if start > stop || stop > self.num_rows {
             return Err(PyIndexError::new_err("Parquet row range is out of bounds"));
         }
+        let shard_cache = shard_cache.map(|cache| cache.cache.clone());
         py.detach(|| {
             let group_start = self
                 .row_group_starts
                 .partition_point(|&index| index <= start)
                 - 1;
             let group_stop = self.row_group_starts.partition_point(|&index| index < stop);
+            let reader = self.reader.with_cache(shard_cache, true);
+            let cache = reader.ranges.cache.clone();
+            let _read = StreamRead(cache.clone());
             let reader = RowGroupWindow {
-                reader: self.reader.clone(),
+                reader,
                 start: group_start,
                 stop: group_stop.max(group_start),
             };
@@ -879,6 +1049,7 @@ impl PyParquetFile {
             Ok(PyParquetRows {
                 state: Mutex::new(RowState {
                     rows,
+                    cache,
                     skip: start - self.row_group_starts[group_start],
                     remaining: stop - start,
                 }),
@@ -889,6 +1060,7 @@ impl PyParquetFile {
 
 struct RowState {
     rows: RowIter<'static>,
+    cache: Option<Arc<CacheRead>>,
     skip: usize,
     remaining: usize,
 }
@@ -913,6 +1085,7 @@ impl PyParquetRows {
             if state.remaining == 0 {
                 return Ok(None);
             }
+            let _read = StreamRead(state.cache.clone());
             let result = (|| {
                 while state.skip > 0 {
                     state
