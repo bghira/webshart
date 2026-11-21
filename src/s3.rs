@@ -126,7 +126,8 @@ impl Store {
     pub async fn download(
         &self,
         key: &str,
-        meta: &ObjectMeta,
+        size: u64,
+        etag: Option<&str>,
         target: &Path,
     ) -> crate::Result<u64> {
         let _permit = self
@@ -136,7 +137,7 @@ impl Store {
             .expect("S3 semaphore stays open");
         let error = || crate::WebshartError::Io(std::io::Error::other("S3 shard download failed"));
         let options = GetOptions {
-            if_match: meta.e_tag.clone(),
+            if_match: etag.map(str::to_owned),
             ..Default::default()
         };
         self.counts.downloads.fetch_add(1, Ordering::Relaxed);
@@ -144,7 +145,12 @@ impl Store {
             .store
             .get_opts(&path(key).map_err(|_| error())?, options)
             .await
-            .map_err(|_| error())?
+            .map_err(|source| match source {
+                object_store::Error::Precondition { .. } => crate::WebshartError::Io(
+                    std::io::Error::other("S3 object changed during reading"),
+                ),
+                _ => error(),
+            })?
             .into_stream();
         let mut file = tokio::fs::File::create(target).await?;
         let mut written = 0u64;
@@ -154,12 +160,12 @@ impl Store {
             self.counts
                 .download_bytes
                 .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            if written > meta.size {
+            if written > size {
                 return Err(error());
             }
             file.write_all(&chunk).await?;
         }
-        if written != meta.size {
+        if written != size {
             return Err(error());
         }
         file.flush().await?;
@@ -299,7 +305,7 @@ impl PyS3Store {
                         return Err(PyValueError::new_err("Manifest exceeds max_bytes"));
                     }
                     self.inner
-                        .download(&key, &meta, &destination)
+                        .download(&key, meta.size, meta.e_tag.as_deref(), &destination)
                         .await
                         .map_err(PyErr::from)?;
                     Ok(())

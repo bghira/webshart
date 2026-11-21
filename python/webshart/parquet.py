@@ -425,7 +425,7 @@ class ParquetDataset:
         )
         self._metadata_cache: OrderedDict[int, dict[int, dict]] = OrderedDict()
         self._files: OrderedDict[int, _ParquetFile] = OrderedDict()
-        self._payload_files: OrderedDict[int, _ParquetFile] = OrderedDict()
+        self._verified_s3_etags: dict[int, str] = {}
         self._metadata_repo = None
         self._shard_cache = None
         self._expected_source_revision = None
@@ -640,9 +640,6 @@ class ParquetDataset:
         self._shard_cache = _ParquetCache(
             str(location), cache_limit_gb, parallel_downloads
         )
-        self._payload_files.clear()
-        self._payload_budget = int(cache_limit_gb * 1024**3)
-        self._payload_sizes = {}
 
     def io_stats(self):
         """Logical S3 transport operations and transferred bytes. SDK retries are internal."""
@@ -706,9 +703,6 @@ class ParquetDataset:
         """Look up prepared content pins by shard index on subsequent reader opens."""
         self._expected_source_revision = lookup
         self._files.clear()
-        self._payload_files.clear()
-        if self._shard_cache is not None:
-            self._payload_sizes.clear()
         self._metadata_cache.clear()
         for db in self._overlays.values():
             db.close()
@@ -730,11 +724,14 @@ class ParquetDataset:
     def _file(self, index: int, *, payload: bool = False) -> _ParquetFile:
         with self._lock:
             shard = self._shard(index)
-            cache = self._shard_cache if payload else None
-            files = self._payload_files if cache is not None else self._files
-            if index in files:
-                files.move_to_end(index)
-                return files[index]
+            if index in self._files:
+                self._files.move_to_end(index)
+                return self._files[index]
+            verified_etag = (
+                shard.get("etag")
+                if isinstance(self._shards, _CaptureCatalogue)
+                else self._verified_s3_etags.get(index)
+            )
 
         reader = _ParquetFile(
             self._source_repo.location(shard["path"]),
@@ -742,8 +739,10 @@ class ParquetDataset:
             hf_token=self.hf_token,
             max_page_bytes=self.max_page_bytes,
             s3=self._source_repo.s3,
-            cache=cache,
+            cache=self._shard_cache,
             expected_sha256=shard.get("sha256"),
+            verified_s3_etag=verified_etag,
+            cache_payload=payload,
         )
         info = reader.info()
         with self._lock:
@@ -757,34 +756,29 @@ class ParquetDataset:
                     raise ValueError(
                         "Parquet object changed since the accepted dataset view was prepared."
                     )
-            if info.get("etag") is not None:
-                if "etag" in shard and shard["etag"] != info["etag"]:
+            etag = info.get("etag")
+            if etag is not None:
+                if "etag" in shard and shard["etag"] != etag:
                     raise OSError(
                         "S3 object changed since its first read; reopen the dataset"
                     )
-                if "etag" not in shard and isinstance(self._shards, _CaptureCatalogue):
-                    self._shards.set_etag(index, info["etag"])
-                shard["etag"] = info["etag"]
             count = info["num_rows"]
             if "num_rows" in shard and count != shard["num_rows"]:
                 raise ValueError("Source row count does not match metadata manifest")
             shard["num_rows"] = count
-            if index in files:
-                files.move_to_end(index)
-                return files[index]
-            if files is self._payload_files:
-                while files and (
-                    len(files) >= self.metadata_cache_size
-                    or sum(self._payload_sizes.values()) + shard["size"]
-                    > self._payload_budget
-                ):
-                    evicted = next(iter(files))
-                    del files[evicted], self._payload_sizes[evicted]
-            files[index] = reader
-            if files is self._payload_files:
-                self._payload_sizes[index] = shard["size"]
-            if len(files) > self.metadata_cache_size:
-                files.popitem(last=False)
+            if etag is not None:
+                if isinstance(self._shards, _CaptureCatalogue):
+                    if "etag" not in shard:
+                        self._shards.set_etag(index, etag)
+                else:
+                    self._verified_s3_etags[index] = etag
+                    shard["etag"] = etag
+            if index in self._files:
+                self._files.move_to_end(index)
+                return self._files[index]
+            self._files[index] = reader
+            if len(self._files) > self.metadata_cache_size:
+                self._files.popitem(last=False)
             return reader
 
     def get_shard_info(self, index: int) -> dict:
@@ -1309,7 +1303,10 @@ class ParquetDataLoader:
     def load_sample(self, shard_index: int, sample_index: int) -> ParquetSample:
         self.get_metadata(shard_index, sample_index)
         rows = self.dataset._file(shard_index, payload=True).rows(
-            columns=self.image_columns, start=sample_index, stop=sample_index + 1
+            columns=self.image_columns,
+            start=sample_index,
+            stop=sample_index + 1,
+            shard_cache=self.dataset._shard_cache,
         )
         return self._sample(shard_index, sample_index, next(rows))
 
@@ -1334,6 +1331,8 @@ class ParquetDataLoader:
                 indices,
                 columns=self.image_columns,
                 parallel_reads=parallel_reads,
+                shard_cache=self.dataset._shard_cache,
+                cache_payload=True,
             )
             for (position, row), payloads, sample_metadata in zip(
                 selected, rows, metadata, strict=True
@@ -1346,7 +1345,10 @@ class ParquetDataLoader:
     ) -> Iterator[ParquetSample]:
         self.dataset._metadata(shard_index)
         rows = self.dataset._file(shard_index, payload=True).rows(
-            columns=self.image_columns, start=start, stop=stop
+            columns=self.image_columns,
+            start=start,
+            stop=stop,
+            shard_cache=self.dataset._shard_cache,
         )
         for sample_index, payloads in enumerate(rows, start=start):
             yield self._sample(shard_index, sample_index, payloads)

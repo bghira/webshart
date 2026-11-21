@@ -628,7 +628,10 @@ def test_projected_rows_and_payloads_preserve_order_without_loading_shard_metada
         def info(self):
             return native.info()
 
-        def rows_at(self, indices, *, columns, parallel_reads, shard_cache=None):
+        def rows_at(
+            self, indices, *, columns, parallel_reads, shard_cache=None,
+            cache_payload=False,
+        ):
             assert shard_cache is None
             reads.append((list(indices), columns))
             return native.rows_at(

@@ -610,10 +610,17 @@ are not read by this transport.
 
 Without a shard cache, only selected Parquet ranges are fetched. The shard cache
 streams whole objects to disk and reuses webshart's download locks and eviction.
-Cache entries are scoped by endpoint, bucket, object key, and ETag. Metadata preparation coalesces selected column chunks into a bounded 64 MiB
+Cache entries are scoped by endpoint, bucket, object key, and ETag. A cached
+shard is locked while it is being read, so another process can evict it while a
+reader is idle. A dataset reuses the size and ETag it verified on first open.
+Reopening an evicted reader uses conditional S3 reads and downloads with that
+ETag. Reopen the dataset to verify the latest object revision.
+
+Metadata preparation coalesces selected column chunks into a bounded 64 MiB
 cache and leaves image columns unread. Whole-shard downloads begin on payload
-access. Network I/O and Parquet decoding release the GIL. Batch requests share each selected row
-group, use bounded native concurrency, and preserve input order and duplicates.
+access. Network I/O and Parquet decoding release the GIL. Batch requests share
+each selected row group, use bounded native concurrency, and preserve input
+order and duplicates.
 
 `loader.get_metadata(shard)` returns logical sample metadata;
 `loader.list_samples_in_shard(shard)` and
