@@ -1,7 +1,7 @@
 use crate::discovery::{DatasetDiscovery, DiscoveredDataset, PyDiscoveredDataset};
 use crate::error::{Result, WebshartError};
 use crate::metadata::{CaptionValue, ShardMetadata};
-use crate::prefetch::{PrefetchIterator, Sample};
+use crate::prefetch::{PrefetchIterator, Sample, ShardOrder};
 use crate::FileInfo;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
@@ -587,9 +587,23 @@ impl PyTarDataLoader {
         slf.next_entry()
     }
 
-    /// Read files on a background thread from a snapshot of the current cursor.
-    #[pyo3(signature = (max_bytes, *, max_items=128))]
-    fn iter_prefetched(&self, max_bytes: usize, max_items: usize) -> PyResult<PrefetchIterator> {
+    /// Read files on a background thread from the current cursor or a seeded shard order.
+    #[pyo3(signature = (max_bytes, *, max_items=128, shuffle_seed=None, start_shard_position=0))]
+    fn iter_prefetched(
+        &self,
+        py: Python<'_>,
+        max_bytes: usize,
+        max_items: usize,
+        shuffle_seed: Option<u64>,
+        start_shard_position: usize,
+    ) -> PyResult<PrefetchIterator> {
+        let num_shards = self.dataset.lock().unwrap().num_shards();
+        if start_shard_position > num_shards || (shuffle_seed.is_none() && start_shard_position != 0)
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "start_shard_position requires a shuffle seed and a position within the dataset",
+            ));
+        }
         let mut reader = Self {
             dataset: self.dataset.clone(),
             runtime: self.runtime.clone(),
@@ -603,8 +617,17 @@ impl PyTarDataLoader {
             ranges: self.ranges.clone(),
             current_range_idx: self.current_range_idx,
         };
+        let mut shard_order = shuffle_seed.map(|seed| {
+            py.detach(|| ShardOrder::shuffled(num_shards, seed))
+                .into_indices()
+        });
+        if let Some(order) = &mut shard_order {
+            reader.current_shard = order.nth(start_shard_position).unwrap_or(num_shards);
+            reader.next_file_to_load = 0;
+            reader.ranges = None;
+        }
         PrefetchIterator::start(max_bytes, max_items, move |bytes, items| {
-            let entry = reader.next_entry_with_limits(bytes as u64, items)?;
+            let entry = reader.next_entry_with_limits(bytes as u64, items, shard_order.as_mut())?;
             Ok(entry.map(|entry| {
                 let bytes = entry.data.len();
                 (Sample::Tar(entry), bytes)
@@ -2166,13 +2189,14 @@ impl PyTarDataLoader {
     }
 
     fn next_entry(&mut self) -> PyResult<Option<PyTarFileEntry>> {
-        self.next_entry_with_limits(u64::MAX, usize::MAX)
+        self.next_entry_with_limits(u64::MAX, usize::MAX, None)
     }
 
     fn next_entry_with_limits(
         &mut self,
         max_bytes: u64,
         max_entries: usize,
+        shard_order: Option<&mut std::vec::IntoIter<usize>>,
     ) -> PyResult<Option<PyTarFileEntry>> {
         if let Some(ranges) = &self.ranges {
             // Check if we're within current range
@@ -2201,7 +2225,7 @@ impl PyTarDataLoader {
             return Ok(self.take_buffered_entry());
         }
 
-        self.refill_buffer(max_bytes, max_entries)?;
+        self.refill_buffer(max_bytes, max_entries, shard_order)?;
 
         if self.buffer_position < self.entry_buffer.len() {
             Ok(self.take_buffered_entry())
@@ -2236,18 +2260,25 @@ impl PyTarDataLoader {
         Some(result)
     }
 
-    fn refill_buffer(&mut self, max_bytes: u64, max_entries: usize) -> PyResult<()> {
+    fn refill_buffer(
+        &mut self,
+        max_bytes: u64,
+        max_entries: usize,
+        mut shard_order: Option<&mut std::vec::IntoIter<usize>>,
+    ) -> PyResult<()> {
         self.entry_buffer.clear();
         self.buffer_position = 0;
+        let num_shards = self.dataset.lock().unwrap().num_shards();
 
-        while self.entry_buffer.is_empty()
-            && self.current_shard < self.dataset.lock().unwrap().num_shards()
-        {
+        while self.entry_buffer.is_empty() && self.current_shard < num_shards {
             let previous_next_file = self.next_file_to_load;
             self.load_entries_from_current_shard(max_bytes, max_entries)?;
 
             if self.entry_buffer.is_empty() && self.next_file_to_load == previous_next_file {
-                self.current_shard += 1;
+                self.current_shard = match &mut shard_order {
+                    Some(order) => order.next().unwrap_or(num_shards),
+                    None => self.current_shard + 1,
+                };
                 self.next_file_to_load = 0;
             }
         }

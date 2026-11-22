@@ -1,11 +1,46 @@
 use crate::dataloader::PyTarFileEntry;
-use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyIterator;
+use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+
+#[pyclass(name = "_ShardOrder", frozen)]
+pub(crate) struct ShardOrder(Vec<usize>);
+
+impl ShardOrder {
+    pub(crate) fn shuffled(count: usize, seed: u64) -> Self {
+        let mut indices: Vec<_> = (0..count).collect();
+        indices.shuffle(&mut StdRng::seed_from_u64(seed));
+        Self(indices)
+    }
+
+    pub(crate) fn into_indices(self) -> std::vec::IntoIter<usize> {
+        self.0.into_iter()
+    }
+}
+
+#[pymethods]
+impl ShardOrder {
+    fn __len__(&self) -> usize {
+        self.0.len()
+    }
+
+    fn __getitem__(&self, position: usize) -> PyResult<usize> {
+        self.0
+            .get(position)
+            .copied()
+            .ok_or_else(|| PyIndexError::new_err("Shard order position is out of bounds"))
+    }
+}
+
+#[pyfunction]
+pub(crate) fn _shuffled_shard_order(py: Python<'_>, count: usize, seed: u64) -> ShardOrder {
+    py.detach(|| ShardOrder::shuffled(count, seed))
+}
 
 pub(crate) enum Sample {
     Tar(PyTarFileEntry),
