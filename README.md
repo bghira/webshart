@@ -552,6 +552,33 @@ null statistics, the reader scans the selected image column in bounded batches.
 The count applies to embedded bytes, including the `bytes` field in an image
 struct.
 
+### Batched JPEG XL decoding
+
+Pass `decode_jxl=True` to decode JPEG XL during a batched Parquet read.
+
+```python
+from webshart import DecodedJxlImage, JxlDecodeError
+
+for sample in loader.load_samples([(0, 12), (0, 3)], decode_jxl=True):
+    decoded = sample.decoded_jxl
+    if isinstance(decoded, DecodedJxlImage):
+        print(sample.path, decoded.mode, decoded.width, decoded.height)
+    elif isinstance(decoded, JxlDecodeError):
+        print(sample.path, decoded.message)
+```
+
+Rust decodes embedded images before constructing Python samples and releases
+the cache read lock before decoding. `parallel_reads` bounds the number of
+concurrent decodes, and `jxl_max_pixels` bounds image size. URL images are decoded
+during fetch when `fetch_external_urls=True`.
+
+`decoded_jxl` is `None` for other formats and missing payloads. The batch retains
+its row order, duplicates, and encoded data. Decoded images expose the first
+display frame as a read-only `pixels` memoryview of interleaved 8-bit values,
+plus the `icc_profile` and optional `exif` metadata. Source builds use CMake and
+libclang for the native codecs. NASM enables the bundled JPEG decoder’s SIMD
+path on x86.
+
 ### Projected metadata reads
 
 Read selected physical rows and columns without materializing every row's

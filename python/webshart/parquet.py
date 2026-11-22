@@ -22,6 +22,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from filelock import FileLock
 
 from ._webshart import (
+    DecodedJxlImage,
+    JxlDecodeError,
     _ParquetFile,
     _ParquetCache,
     _PrefetchIterator,
@@ -1125,7 +1127,7 @@ class ParquetDataset:
 
 @dataclass
 class ParquetSample:
-    """Decoded bytes and native metadata for a physical Parquet row.
+    """Image payload, optional decoded pixels, and metadata for a physical Parquet row.
 
     ``data`` is None for missing images or disabled/failed URL reads. ``payloads`` retains every
     requested source value. URL fetching requires explicit loader opt-in.
@@ -1136,6 +1138,7 @@ class ParquetSample:
     metadata: dict[str, Any]
     payloads: dict[str, Any]
     error: str | None = None
+    decoded_jxl: DecodedJxlImage | JxlDecodeError | None = None
 
     @property
     def size(self) -> int:
@@ -1324,16 +1327,19 @@ class ParquetDataLoader:
         return output
 
     def _sample(
-        self, shard_index: int, sample_index: int, payloads: dict, metadata=None
+        self, shard_index: int, sample_index: int, payloads: dict, metadata=None,
+        *, decoded_jxl=None, url_jxl_max_pixels=None,
     ) -> ParquetSample:
         error = None
         if self.dataset.image_url_column:
             data = None
             if self.fetch_external_urls:
                 try:
-                    data = self._url_client.fetch(
-                        payloads[self.dataset.image_url_column]
-                    )
+                    url = payloads[self.dataset.image_url_column]
+                    if url_jxl_max_pixels is None:
+                        data = self._url_client.fetch(url)
+                    else:
+                        data, decoded_jxl = self._url_client._fetch_jxl(url, url_jxl_max_pixels)
                 except URLImageError as failure:
                     if self.on_url_error == "raise":
                         raise
@@ -1353,6 +1359,7 @@ class ParquetDataLoader:
             metadata=metadata,
             payloads=payloads,
             error=error,
+            decoded_jxl=decoded_jxl,
         )
 
     def load_sample(self, shard_index: int, sample_index: int) -> ParquetSample:
@@ -1371,8 +1378,22 @@ class ParquetDataLoader:
         *,
         parallel_reads: int = 4,
         metadata_fields=None,
+        decode_jxl: bool = False,
+        jxl_max_pixels: int = 40_000_000,
     ) -> list[ParquetSample]:
-        """Batch physical rows, sharing row-group reads and preserving duplicates/order."""
+        """Batch physical rows, sharing row-group reads and preserving duplicates/order.
+
+        With ``decode_jxl=True``, ``decoded_jxl`` holds 8-bit pixels or a
+        per-row decode error for JPEG XL payloads. Other rows have ``decoded_jxl=None``.
+        """
+        decode_columns = {}
+        url_jxl_max_pixels = None
+        if decode_jxl:
+            limit = _integer(jxl_max_pixels, "JPEG XL pixel limit", 1)
+            if self.dataset.image_url_column:
+                url_jxl_max_pixels = limit
+            else:
+                decode_columns["decode_jxl"] = (self.dataset.image_column, limit)
         groups = {}
         for position, (shard, row) in enumerate(requests):
             groups.setdefault(shard, []).append((position, row))
@@ -1388,11 +1409,16 @@ class ParquetDataLoader:
                 parallel_reads=parallel_reads,
                 shard_cache=self.dataset._shard_cache,
                 cache_payload=True,
+                **decode_columns,
             )
-            for (position, row), payloads, sample_metadata in zip(
+            for (position, row), result, sample_metadata in zip(
                 selected, rows, metadata, strict=True
             ):
-                output[position] = self._sample(shard, row, payloads, sample_metadata)
+                payloads, decoded_jxl = result if decode_columns else (result, None)
+                output[position] = self._sample(
+                    shard, row, payloads, sample_metadata,
+                    decoded_jxl=decoded_jxl, url_jxl_max_pixels=url_jxl_max_pixels,
+                )
         return output
 
     def iter_shard(

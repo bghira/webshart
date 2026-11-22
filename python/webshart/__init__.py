@@ -31,6 +31,8 @@ from webshart._webshart import (
     TarDataLoader,
     BucketDataLoader,
     TransformCache,
+    DecodedJxlImage,
+    JxlDecodeError,
 )
 from .optimize import DEFAULT_PAYLOAD_EXTENSIONS, optimize_dataset
 from .parquet import (
@@ -55,6 +57,8 @@ __all__ = [
     "TarDataLoader",
     "BucketDataLoader",
     "TransformCache",
+    "DecodedJxlImage",
+    "JxlDecodeError",
     "discover_dataset",
     "discover_paired_dataset",
     "PairedDataset",

@@ -1,4 +1,5 @@
 from collections import Counter
+from base64 import b64decode
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
@@ -46,6 +47,8 @@ def server():
             data = b"<html>not an image</html>" if self.path == "/html" else content
             if self.path == "/jpeg":
                 data = (Path(__file__).parent / "fixtures" / "recompression.jpg").read_bytes()
+            if self.path == "/jxl":
+                data = b64decode("/woIQBBQXAgIAAEAWABLEsWChSRSw8YBBIBA/gIBAAyJA6IG")
             self.send_response(200)
             if self.path != "/no-length":
                 self.send_header("Content-Length", str(len(data)))
@@ -110,6 +113,22 @@ def test_url_opt_in_and_metadata_never_fetch(tmp_path, server, monkeypatch):
     )
     with pytest.raises(webshart.URLImageError, match="HTTP 404"):
         webshart.ParquetDataLoader(dataset, fetch_external_urls=True).load_sample(0, 1)
+
+
+def test_load_samples_decodes_url_jxl_when_fetching_is_enabled(tmp_path, server):
+    base, _, hits, _ = server
+    pq.write_table(pa.table({"url": [base + "/jxl", base + "/missing"]}), tmp_path / "part.parquet")
+    dataset = webshart.discover_parquet_dataset(str(tmp_path), image_url_column="url")
+    inactive = webshart.ParquetDataLoader(dataset)
+    assert inactive.load_samples([(0, 0)], decode_jxl=True)[0].decoded_jxl is None
+    assert not hits
+
+    loader = webshart.ParquetDataLoader(dataset, fetch_external_urls=True, on_url_error="return")
+    valid, missing = loader.load_samples([(0, 0), (0, 1)], decode_jxl=True)
+    assert isinstance(valid.decoded_jxl, webshart.DecodedJxlImage)
+    assert (valid.decoded_jxl.width, valid.decoded_jxl.height) == (3, 2)
+    assert hits["/jxl"] == 1
+    assert missing.decoded_jxl is None and missing.error == "http_error (HTTP 404)"
 
 
 def test_http_bounds_retries_redirects_and_timeouts(server):

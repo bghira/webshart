@@ -1,3 +1,4 @@
+from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
@@ -873,3 +874,88 @@ def test_large_overlay_and_row_group_remain_bounded(tmp_path):
     finally:
         tracemalloc.stop()
         dataset.bind_source_revisions(None)
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_load_samples_decodes_jxl_in_retrieval(tmp_path, structured):
+    # A 3 × 2 lossless RGB codestream with six distinct colors.
+    payload = b64decode("/woIQBBQXAgIAAEAWABLEsWChSRSw8YBBIBA/gIBAAyJA6IG")
+    corrupt = payload[:4]
+    jpeg = b"\xff\xd8encoded jpeg"
+    values = (payload, corrupt, jpeg, None)
+    if structured:
+        values = tuple({"bytes": value, "path": None} for value in values)
+    write_source(tmp_path, [{"image": value} for value in values])
+    dataset = webshart.discover_dataset(str(tmp_path), format="parquet")
+    loader = webshart.ParquetDataLoader(dataset)
+    requests = [(0, index) for index in (2, 0, 3, 1, 0)]
+    normal = loader.load_samples(requests, metadata_fields=())
+    decoded = loader.load_samples(requests, metadata_fields=(), decode_jxl=True, parallel_reads=2)
+    assert all(sample.decoded_jxl is None for sample in normal)
+    assert [sample.path for sample in decoded] == [sample.path for sample in normal]
+    assert [sample.data for sample in decoded] == [
+        jpeg,
+        payload,
+        None,
+        corrupt,
+        payload,
+    ]
+    assert [sample.metadata for sample in decoded] == [
+        sample.metadata for sample in normal
+    ]
+    assert [sample.payloads for sample in decoded] == [sample.payloads for sample in normal]
+    image = decoded[1].decoded_jxl
+    assert isinstance(image, webshart.DecodedJxlImage)
+    assert (image.width, image.height, image.mode) == (3, 2, "RGB")
+    assert image.pixels == bytes(
+        (255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0, 0, 255, 255, 255, 0, 255)
+    )
+    assert decoded[4].decoded_jxl is image
+    pixels = image.pixels
+    assert pixels.readonly
+    assert pixels == image.pixels
+    with pytest.raises(TypeError):
+        pixels[0] = 0
+    assert decoded[0].decoded_jxl is None
+    assert decoded[2].decoded_jxl is None
+    assert isinstance(decoded[3].decoded_jxl, webshart.JxlDecodeError)
+    assert decoded[3].decoded_jxl.message
+    assert loader.load_samples([], decode_jxl=True) == []
+
+
+def test_load_samples_jxl_pixel_limit(tmp_path):
+    payload = b64decode("/woIQBBQXAgIAAEAWABLEsWChSRSw8YBBIBA/gIBAAyJA6IG")
+    write_source(tmp_path, [{"image": payload}])
+    loader = webshart.ParquetDataLoader(webshart.discover_parquet_dataset(str(tmp_path)))
+    with pytest.raises(ValueError, match="pixel limit"):
+        loader.load_samples([(0, 0)], decode_jxl=True, jxl_max_pixels=0)
+    sample, = loader.load_samples([(0, 0)], decode_jxl=True, jxl_max_pixels=5)
+    assert isinstance(sample.decoded_jxl, webshart.JxlDecodeError)
+    assert "pixel limit" in sample.decoded_jxl.message
+
+
+def test_load_samples_jxl_preserves_reconstructed_jpeg_pixels(tmp_path):
+    # A losslessly transcoded 3 × 2 JPEG and its reference libjpeg pixels.
+    payload = b64decode(
+        "AAAADEpYTCANCocKAAAAFGZ0eXBqeGwgAAAAAGp4bCAAAAASanhscAAAAAD/CghAEAkAAAHgamJy"
+        "ZMBtAwiCILQMCIBQo0DIVSUAACDkqGzBUJz/E0TGCGWcUwraj5AhzFIHGWagdIcarA8ZTj5mwCEH"
+        "FRY5aNiB7aOG/v2RZQ477kBD0f0vxjhjkks2+WSUU56Z5pptvhnnnIUemuiijT4a6aSlnprqqq2+"
+        "GuusxR6b7LLNPhvttOWem+667b4b77wFH5zwwg0/HPHEI5d8csort/xyzDMPXfTRSS/d9NNRTz12"
+        "2WenvXbbb8c99+CFH5744o0/Hvnko5d+euqrt/567LMHP3zxxye/fPPPRz99+OOXf37667f/fvzz"
+        "/1cwVVUCACDkqGzBUJz/F0RCKaOsU4rEeEDIZtQgw6Q60FA92HDuIccMKMgHDTnosAMbiyxz1O/2"
+        "YccNreiPPDP4JMP7X4xxxiWbfDLKKdNcs80345yz0EMTXbTRRyOdtNRTU1211VdjnbXYY5Ndttln"
+        "o5223HPTXbfdd+Odd+CCD0544YYfjnjikUs+OeWVW3455pmHLvropJdu+umopx677LPTXrvtt+Oe"
+        "e/DCD0988cYfj3zy0Us/PfXVW3899tmHL/745Jdv/vnopx+//PPTX7/99+Of/7/ADwBUFgALCIDg"
+        "ABBKRklGAAEBAAABAAEAAAMAAAEManhscIAAAAHgWwAQAOQDDGQMZAxk/v8OgOgDAIXGxm4AAAAF"
+        "AADwAwAAAAAAAAAQsCRRZBw7Ic0dBiCkQDoKNvocGRUVo2KMF4PFkQEVICYoAIEKD/iMVmN3AohZ"
+        "dCcA+F6nvfRyhBdrDd172L89pciAZKMBP99hfo82OO9G965YVActEohawoV0tio+Y86bA9X+t/GE"
+        "nAYAAAAAAFBIgWwArmU2SjGyUlTFRsaoyJ83n2O3+xf26hJVhxlt5/3K+XPM+4p2YIB6ezeQ9dC3"
+        "/ogLt9fyeot7Q3rHBtl5arqaEzjLrSru91h3Xm75XpYQUhkY9yIZNsRcudHspqdrn3BnNWiFgWcC"
+    )
+    write_source(tmp_path, [{"image": payload}])
+    loader = webshart.ParquetDataLoader(webshart.discover_parquet_dataset(str(tmp_path)))
+    sample, = loader.load_samples([(0, 0)], decode_jxl=True)
+    image = sample.decoded_jxl
+    assert isinstance(image, webshart.DecodedJxlImage)
+    assert (image.width, image.height, image.mode) == (3, 2, "RGB")
+    assert image.pixels == bytes((255, 3, 5, 0, 255, 0, 8, 0, 242, 255, 248, 0, 5, 255, 255, 237, 4, 243))

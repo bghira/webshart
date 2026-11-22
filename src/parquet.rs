@@ -2,7 +2,7 @@ use bytes::Bytes;
 use futures::{stream, StreamExt, TryStreamExt};
 use parquet::basic::Type as PhysicalType;
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
-use parquet::data_type::DataType;
+use parquet::data_type::{ByteArray, DataType};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::{ReaderProperties, ReaderPropertiesPtr};
@@ -13,7 +13,7 @@ use parquet::record::{Field, Row};
 use parquet::schema::types::Type;
 use pyo3::exceptions::{PyIndexError, PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -26,6 +26,8 @@ use tokio::runtime::Runtime;
 use crate::dataloader::file_loading::read_remote_range;
 use crate::dataloader::shard_cache::{ShardCache, ShardLockGuard};
 use crate::error::WebshartError;
+use crate::jxl::{decoded_to_python, is_jxl, JxlOptions};
+use crate::jxl_codec::Pixels;
 use crate::s3::{PyS3Store, Store};
 
 const RANGE_CHUNK: usize = 8 * 1024 * 1024;
@@ -402,6 +404,52 @@ fn row_to_python(py: Python<'_>, row: &Row) -> PyResult<Py<PyAny>> {
         output.set_item(name, field_to_python(py, field)?)?;
     }
     Ok(output.into_any().unbind())
+}
+
+fn row_field<'a>(row: &'a Row, name: &str) -> Option<&'a Field> {
+    row.get_column_iter()
+        .find_map(|(column, field)| (column == name).then_some(field))
+}
+
+fn image_field<'a>(row: &'a Row, column: &str) -> Option<&'a ByteArray> {
+    let field = match row_field(row, column)? {
+        Field::Group(image) => row_field(image, "bytes")?,
+        field => field,
+    };
+    match field {
+        Field::Bytes(payload) => Some(payload),
+        _ => None,
+    }
+}
+
+fn decode_jxl_rows(
+    rows: &[(usize, Row)],
+    indices: &[usize],
+    column: &str,
+    options: JxlOptions,
+    parallel_reads: usize,
+) -> PyResult<BTreeMap<usize, Result<Pixels, String>>> {
+    let mut payloads = BTreeMap::new();
+    for (position, row) in rows {
+        if let Some(payload) = image_field(row, column).filter(|payload| is_jxl(payload.data())) {
+            payloads
+                .entry(indices[*position])
+                .or_insert_with(|| payload.clone());
+        }
+    }
+    runtime()
+        .map_err(python_error)?
+        .block_on(async {
+            stream::iter(payloads.into_iter().map(|(index, payload)| async move {
+                tokio::task::spawn_blocking(move || (index, options.decode(payload.data())))
+                    .await
+                    .map_err(|_| parquet_error("JPEG XL decode worker failed"))
+            }))
+            .buffer_unordered(parallel_reads)
+            .try_collect()
+            .await
+        })
+        .map_err(python_error)
 }
 
 fn field_to_python(py: Python<'_>, field: &Field) -> PyResult<Py<PyAny>> {
@@ -937,7 +985,8 @@ impl PyParquetFile {
     }
 
     /// Read each selected row group once, preserving request order and duplicates.
-    #[pyo3(signature=(indices, columns=None, parallel_reads=4, shard_cache=None, *, cache_payload=false))]
+    #[pyo3(signature=(indices, columns=None, parallel_reads=4, shard_cache=None, *, cache_payload=false, decode_jxl=None))]
+    #[allow(clippy::too_many_arguments)]
     fn rows_at(
         &self,
         py: Python<'_>,
@@ -946,6 +995,7 @@ impl PyParquetFile {
         parallel_reads: usize,
         shard_cache: Option<PyRef<'_, PyParquetCache>>,
         cache_payload: bool,
+        decode_jxl: Option<(String, usize)>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         if parallel_reads == 0 {
             return Err(PyValueError::new_err("parallel_reads must be positive"));
@@ -954,7 +1004,10 @@ impl PyParquetFile {
             return Err(PyIndexError::new_err("Parquet row index out of bounds"));
         }
         let shard_cache = shard_cache.map(|cache| cache.cache.clone());
-        let rows = py.detach(|| {
+        let jxl = decode_jxl
+            .map(|(column, max_pixels)| Ok::<_, PyErr>((column, JxlOptions::new(max_pixels)?)))
+            .transpose()?;
+        let (rows, decoded) = py.detach(|| {
             let reader = self.reader.with_cache(shard_cache, cache_payload);
             let projection = project_columns(
                 reader
@@ -1020,11 +1073,34 @@ impl PyParquetFile {
                     .await
                 })
                 .map_err(python_error)?;
+            // The row data is owned. Release the shard before CPU-only image decoding.
+            drop(reader);
             let mut rows: Vec<_> = output.into_iter().flatten().collect();
             rows.sort_unstable_by_key(|(position, _)| *position);
-            Ok::<_, PyErr>(rows)
+            let decoded = jxl
+                .map(|(column, options)| {
+                    decode_jxl_rows(&rows, &indices, &column, options, parallel_reads)
+                })
+                .transpose()?;
+            Ok::<_, PyErr>((rows, decoded))
         })?;
-        rows.iter().map(|(_, row)| row_to_python(py, row)).collect()
+        let Some(decoded) = decoded else {
+            return rows.iter().map(|(_, row)| row_to_python(py, row)).collect();
+        };
+        let decoded = decoded
+            .into_iter()
+            .map(|(index, result)| Ok((index, decoded_to_python(py, result)?)))
+            .collect::<PyResult<BTreeMap<_, _>>>()?;
+        rows.iter()
+            .map(|(position, row)| {
+                let image = decoded
+                    .get(&indices[*position])
+                    .map_or_else(|| py.None(), |image| image.clone_ref(py));
+                Ok(PyTuple::new(py, [row_to_python(py, row)?, image])?
+                    .into_any()
+                    .unbind())
+            })
+            .collect()
     }
 
     #[pyo3(signature = (columns=None, start=0, stop=None, *, shard_cache=None))]
