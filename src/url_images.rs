@@ -11,6 +11,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
+use crate::jxl::{decoded_to_python, is_jxl, JxlOptions};
+
 fn runtime() -> PyResult<&'static Runtime> {
     static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
     RUNTIME
@@ -30,6 +32,15 @@ struct Failure {
     code: &'static str,
     status: Option<u16>,
     retry: bool,
+}
+
+type Download = (Option<Py<PyBytes>>, Option<String>, Option<u16>);
+
+fn download_to_python(py: Python<'_>, result: Result<Vec<u8>, Failure>) -> Download {
+    match result {
+        Ok(data) => (Some(PyBytes::new(py, &data).unbind()), None, None),
+        Err(error) => (None, Some(error.code.to_string()), error.status),
+    }
 }
 
 fn failure(code: &'static str) -> Failure {
@@ -221,17 +232,32 @@ impl PyURLImageClient {
         py.detach(|| Self::create(timeout, retries, max_bytes).map_err(PyValueError::new_err))
     }
 
-    fn fetch(
+    fn fetch(&self, py: Python<'_>, url: Option<String>) -> PyResult<Download> {
+        let result =
+            py.detach(|| Ok::<_, PyErr>(runtime()?.block_on(self.download(url.as_deref()))))?;
+        Ok(download_to_python(py, result))
+    }
+
+    fn fetch_jxl(
         &self,
         py: Python<'_>,
         url: Option<String>,
-    ) -> PyResult<(Option<Py<PyBytes>>, Option<String>, Option<u16>)> {
-        let result =
-            py.detach(|| Ok::<_, PyErr>(runtime()?.block_on(self.download(url.as_deref()))))?;
-        Ok(match result {
-            Ok(data) => (Some(PyBytes::new(py, &data).unbind()), None, None),
-            Err(error) => (None, Some(error.code.to_string()), error.status),
-        })
+        max_pixels: usize,
+    ) -> PyResult<(Download, Option<Py<PyAny>>)> {
+        let options = JxlOptions::new(max_pixels)?;
+        let (result, image) = py.detach(|| {
+            let result = runtime()?.block_on(self.download(url.as_deref()));
+            let image = result
+                .as_deref()
+                .ok()
+                .filter(|data| is_jxl(data))
+                .map(|data| options.decode(data));
+            Ok::<_, PyErr>((result, image))
+        })?;
+        let image = image
+            .map(|image| decoded_to_python(py, image))
+            .transpose()?;
+        Ok((download_to_python(py, result), image))
     }
 
     #[pyo3(signature = (urls, workers=32, max_pixels=64000000, capture_directory=None, recompress_images=false, recompress_workers=2))]

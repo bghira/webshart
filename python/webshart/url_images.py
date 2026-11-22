@@ -52,6 +52,15 @@ class URLImageClient:
             raise URLImageError(code, status)
         return data
 
+    def _fetch_jxl(self, url: str, max_pixels: int):
+        result, image = self._native.fetch_jxl(
+            url if isinstance(url, str) else None, max_pixels
+        )
+        data, code, status = result
+        if code is not None:
+            raise URLImageError(code, status)
+        return data, image
+
     def scan(self, urls, *, workers=32, max_pixels=64_000_000, capture_directory=None, recompress_images=False, recompress_workers=2):
         return self._native.scan(
             [url if isinstance(url, str) else None for url in urls], workers, max_pixels,

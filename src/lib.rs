@@ -5,6 +5,8 @@ mod discovery;
 mod error;
 mod extract;
 mod field_rename;
+mod jxl;
+mod jxl_codec;
 mod metadata;
 mod metadata_resolver;
 mod parquet;
@@ -46,6 +48,8 @@ fn _webshart(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBucketDataLoader>()?;
     m.add_class::<s3::PyS3Store>()?;
     m.add_class::<parquet::PyParquetCache>()?;
+    m.add_class::<jxl::DecodedJxlImage>()?;
+    m.add_class::<jxl::JxlDecodeError>()?;
     m.add_function(wrap_pyfunction!(parquet::_parquet_bucket_keys, m)?)?;
     m.add_class::<parquet::PyParquetFile>()?;
     m.add_class::<parquet::PyParquetRows>()?;
