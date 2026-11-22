@@ -112,6 +112,12 @@ default. Pass `shard_index`, `start`, and `stop` to stream a physical row range
 within one shard. The context manager closes the iterator on early exit and
 waits for any in-flight read. Create the iterator in the process that consumes it.
 
+Pass `shuffle_seed=42` to either loader's `iter_prefetched()` to build a shuffled
+shard order in Rust. The worker follows that order and reads each shard
+sequentially. The same seed and dataset shard order reproduce the permutation in
+the same Webshart version. Set `start_shard_position` to resume at a shard
+boundary in that permutation.
+
 ## Native transform cache
 
 `TransformCache` stores caller-computed transform values in local SQLite files
@@ -643,13 +649,18 @@ ETag. Reopen the dataset to verify the latest object revision.
 Metadata preparation coalesces selected column chunks into a bounded 64 MiB
 cache and leaves image columns unread. Whole-shard downloads begin on payload
 access. Sequential consumers can call `cursor = dataset.sequential_prefill(active_shards=4)`
-after enabling the remote disk cache. At each window, call `cursor.advance(first_shard)`
-with its physical start, including the restored start on resume. One worker per
-shared cache downloads consecutive shards up to the configured byte limit,
-reserves in-flight bytes, and releases consumed read leases as the cursor advances.
-Close the cursor at epoch end. A local or uncached dataset returns `None`. Network I/O and Parquet decoding release the GIL. Batch requests share
-each selected row group, use bounded native concurrency, and preserve input
-order and duplicates.
+after enabling the remote disk cache. At each window, call `cursor.advance(first_position)`
+with the start position in the read order. Pass the same `shuffle_seed` to
+`sequential_prefill()` and `iter_prefetched()` to use the same order. The
+cursor's `ready_range` reports positions, and `cursor.shard_at(position)`
+returns the corresponding physical shard ID.
+
+One worker per shared cache downloads upcoming shards up to the configured byte
+limit, reserves in-flight bytes, and releases consumed read leases as the cursor
+advances. Close the cursor at epoch end. A local or uncached dataset returns
+`None`. Network I/O and Parquet decoding release the GIL. Batch requests share
+each selected row group, use bounded native concurrency, and preserve input order
+and duplicates.
 
 `loader.get_metadata(shard)` returns logical sample metadata;
 `loader.list_samples_in_shard(shard)` and

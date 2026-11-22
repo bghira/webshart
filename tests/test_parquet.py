@@ -145,6 +145,27 @@ def test_parquet_prefetch_counts_secondary_payloads_and_preserves_rows(
         assert list(entries) == expected[1:]
 
 
+def test_parquet_prefetch_shuffles_shards_and_resumes(tmp_path):
+    from webshart._webshart import _shuffled_shard_order
+
+    path = write_source(tmp_path)
+    for i in range(4):
+        path.with_name(f"part-{i}.parquet").write_bytes(path.read_bytes())
+    dataset = webshart.discover_parquet_dataset(str(tmp_path))
+    loader = webshart.ParquetDataLoader(dataset)
+    order = _shuffled_shard_order(dataset.num_shards, 42)
+    indices = list(order)
+    assert indices != sorted(indices)
+    expected = [sample for shard in indices for sample in loader.iter_shard(shard)]
+
+    with loader.iter_prefetched(10, shuffle_seed=42) as entries:
+        assert list(entries) == expected
+    with loader.iter_prefetched(10, shuffle_seed=42, start_shard_position=2) as entries:
+        assert list(entries) == expected[6:]
+    with pytest.raises(ValueError, match="single-shard range"):
+        loader.iter_prefetched(10, shuffle_seed=42, shard_index=0)
+
+
 def test_parquet_prefetch_propagates_worker_error_in_order(tmp_path, monkeypatch):
     write_source(tmp_path)
     dataset = webshart.discover_parquet_dataset(str(tmp_path))

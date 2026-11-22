@@ -27,6 +27,7 @@ from ._webshart import (
     _PrefetchIterator,
     _S3Store,
     _parquet_bucket_keys,
+    _shuffled_shard_order,
 )
 from .url_images import URLImageError, URLImageOptions, URLImageClient
 
@@ -652,18 +653,23 @@ class ParquetDataset:
             parallel_downloads,
         )
 
-    def sequential_prefill(self, *, active_shards=1):
-        """Return a whole-shard read-ahead cursor for the configured remote cache."""
+    def sequential_prefill(self, *, active_shards=1, shuffle_seed=None):
+        """Read whole shards into the remote cache in physical or seeded order."""
         if self._shard_cache is None or self._source_repo.local:
             return None
         from .parquet_prefill import SequentialShardPrefill
 
         directory, budget, parallelism = self._prefill_settings
+        order = (
+            range(self.num_shards)
+            if shuffle_seed is None
+            else _shuffled_shard_order(self.num_shards, shuffle_seed)
+        )
         return SequentialShardPrefill(
             directory,
             budget,
             parallelism,
-            self.num_shards,
+            order,
             lambda index: self._shard(index)["size"],
             lambda index: self._file(index, payload=True).cache_shard(
                 self._shard_cache
@@ -1406,6 +1412,10 @@ class ParquetDataLoader:
         for shard_index in range(self.dataset.num_shards):
             yield from self.iter_shard(shard_index)
 
+    def _iter_shard_order(self, order, start_shard_position):
+        for position in range(start_shard_position, len(order)):
+            yield from self.iter_shard(order[position])
+
     def iter_prefetched(
         self,
         max_bytes: int,
@@ -1414,9 +1424,22 @@ class ParquetDataLoader:
         shard_index: int | None = None,
         start: int = 0,
         stop: int | None = None,
+        shuffle_seed: int | None = None,
+        start_shard_position: int = 0,
     ) -> _PrefetchIterator:
-        """Read ahead in order on one background thread, optionally within a shard."""
-        if shard_index is None:
+        """Read ahead in source or seeded shard order on one background thread."""
+        start_shard_position = _integer(start_shard_position, "start_shard_position")
+        if shuffle_seed is not None:
+            if shard_index is not None or start != 0 or stop is not None:
+                raise ValueError("shuffle_seed cannot be combined with a single-shard range")
+            count = self.dataset.num_shards
+            if start_shard_position > count:
+                raise ValueError("start_shard_position is outside the dataset")
+            order = _shuffled_shard_order(count, shuffle_seed)
+            source = self._iter_shard_order(order, start_shard_position)
+        elif start_shard_position != 0:
+            raise ValueError("start_shard_position requires a shuffle seed")
+        elif shard_index is None:
             if start != 0 or stop is not None:
                 raise ValueError("start and stop require shard_index")
             source = iter(self)

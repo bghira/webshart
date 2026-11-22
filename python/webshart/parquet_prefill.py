@@ -3,6 +3,7 @@
 import logging
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from operator import index
 from threading import Condition, Thread
 
 from filelock import FileLock, Timeout
@@ -10,13 +11,14 @@ from filelock import FileLock, Timeout
 
 class SequentialShardPrefill:
     def __init__(
-        self, directory, budget, parallelism, count, shard_size, acquire, active_shards
+        self, directory, budget, parallelism, order, shard_size, acquire, active_shards
     ):
         self.directory = directory
         self.budget = budget
         self.parallelism = parallelism
         self.active_shards = active_shards
-        self.count = count
+        self._order = order
+        self.count = len(order)
         self.shard_size = shard_size
         self.acquire = acquire
         self.condition = Condition()
@@ -26,8 +28,17 @@ class SequentialShardPrefill:
         self.thread = None
         self.ready_range = None
 
+    def shard_at(self, position):
+        """Return the physical shard ID at a read-ahead position."""
+        if not 0 <= position < self.count:
+            raise IndexError("Shard order position is out of bounds")
+        return self._order[position]
+
     def advance(self, first):
-        """Retire earlier shards and refill from this physical shard onward."""
+        """Retire earlier shards and refill from this position in the order."""
+        first = index(first)
+        if not 0 <= first <= self.count:
+            raise IndexError("Shard order position is out of bounds")
         with self.condition:
             if self.error is not None:
                 raise self.error
@@ -86,7 +97,10 @@ class SequentialShardPrefill:
                 if first != checked_first:
                     active_end = min(self.count, first + self.active_shards)
                     fits = (
-                        sum(self.shard_size(i) for i in range(first, active_end))
+                        sum(
+                            self.shard_size(self._order[position])
+                            for position in range(first, active_end)
+                        )
                         <= self.budget
                     )
                     checked_first = first
@@ -98,11 +112,12 @@ class SequentialShardPrefill:
                 while (
                     fits and next_shard < self.count and len(running) < self.parallelism
                 ):
-                    size = self.shard_size(next_shard)
+                    shard = self._order[next_shard]
+                    size = self.shard_size(shard)
                     if used + size > self.budget:
                         break
                     # The future owns the read lease until the consumer moves past it.
-                    future = pool.submit(self.acquire, next_shard)
+                    future = pool.submit(self.acquire, shard)
                     running.add(future)
                     resident.append((next_shard, size, future))
                     used += size

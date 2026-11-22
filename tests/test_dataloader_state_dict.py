@@ -83,6 +83,28 @@ def test_tar_prefetch_starts_at_cursor_without_advancing_loader(discovered_datas
     assert list(entries) == []
 
 
+def test_tar_prefetch_shuffles_whole_shards_and_resumes(discovered_dataset):
+    loader = webshart.TarDataLoader(discovered_dataset, buffer_size=5)
+    next(loader)
+    state = loader.state_dict()
+
+    def run(position=0):
+        with loader.iter_prefetched(
+            4000, max_items=2, shuffle_seed=42, start_shard_position=position
+        ) as entries:
+            return [entry.path for entry in entries]
+
+    paths = run()
+    assert paths == run()
+    assert len(set(paths)) == 30
+    shards = [name[:10] for name in paths[::10]]
+    assert shards != sorted(shards)
+    assert paths == sorted(paths, key=lambda name: (shards.index(name[:10]), name))
+    assert run(1) == paths[10:]
+    assert run(3) == []
+    assert loader.state_dict() == state
+
+
 class TestTarDataLoaderStateDict:
     """Test state dict functionality for resumable pipelines."""
 

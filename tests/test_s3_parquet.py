@@ -704,7 +704,8 @@ def test_prepared_etag_pin_survives_reopen_without_object_checksum(tmp_path):
             second.read_metadata_rows(0, [0], fields=["width"])
 
 
-def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path):
+@pytest.mark.parametrize("shuffle_seed", [None, 42])
+def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path, shuffle_seed):
     import time
     from contextlib import closing
 
@@ -725,7 +726,11 @@ def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path):
     cache = tmp_path / "shards"
     with s3_server(objects) as (options, calls, _):
         loader = _open_single_shard_cache(options, cache, 8 * len(contents))
-        with closing(loader.dataset.sequential_prefill(active_shards=4)) as cursor:
+        with closing(loader.dataset.sequential_prefill(
+            active_shards=4, shuffle_seed=shuffle_seed
+        )) as cursor:
+            if shuffle_seed is not None:
+                assert [cursor.shard_at(i) for i in range(20)] != list(range(20))
             for first in (4, 8, 12):
                 cursor.advance(first)
                 deadline = time.monotonic() + 10
@@ -734,7 +739,7 @@ def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path):
                     time.sleep(0.01)
                 before = loader.dataset.io_stats()
                 batch = loader.load_samples(
-                    [(shard, 0) for shard in range(first, first + 8)],
+                    [(cursor.shard_at(i), 0) for i in range(first, first + 8)],
                     metadata_fields=(),
                 )
                 assert [sample.data for sample in batch] == [b"first"] * 8
@@ -742,17 +747,20 @@ def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path):
                 assert sum(
                     file.stat().st_size for file in cache.glob("*.parquet")
                 ) == 8 * len(contents)
-            peer = loader.dataset.sequential_prefill(active_shards=4)
+            peer = loader.dataset.sequential_prefill(active_shards=4, shuffle_seed=shuffle_seed)
             peer.advance(8)
         with closing(peer):
             deadline = time.monotonic() + 10
             while peer.ready_range != (8, 16):
                 assert peer.error is None and time.monotonic() < deadline
                 time.sleep(0.01)
-        assert not any(key == "parts/00.parquet" for _, key, _ in calls)
+        skipped = {f"parts/{peer.shard_at(position):02d}.parquet" for position in range(4)}
+        assert all(key not in skipped for _, key, _ in calls)
         loader.dataset.enable_shard_cache(str(cache), 2 * len(contents) / 1024**3)
         before = loader.dataset.io_stats()
-        with closing(loader.dataset.sequential_prefill(active_shards=4)) as cursor:
+        with closing(loader.dataset.sequential_prefill(
+            active_shards=4, shuffle_seed=shuffle_seed
+        )) as cursor:
             cursor.advance(0)
             deadline = time.monotonic() + 10
             while cursor.ready_range is None:

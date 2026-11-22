@@ -50,6 +50,7 @@ fn _webshart(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<parquet::PyParquetFile>()?;
     m.add_class::<parquet::PyParquetRows>()?;
     m.add_class::<prefetch::PrefetchIterator>()?;
+    m.add_function(wrap_pyfunction!(prefetch::_shuffled_shard_order, m)?)?;
     m.add_class::<transform_cache::TransformCache>()?;
     m.add_class::<url_images::PyURLImageClient>()?;
     m.add_function(wrap_pyfunction!(scale_dimensions, m)?)?;
