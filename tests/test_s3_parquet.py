@@ -1,7 +1,7 @@
 """Authenticated S3 transport and captured-Parquet training reads."""
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -733,10 +733,35 @@ def test_prepared_etag_pin_survives_reopen_without_object_checksum(tmp_path):
             second.read_metadata_rows(0, [0], fields=["width"])
 
 
-@pytest.mark.parametrize("shuffle_seed", [None, 42])
-def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path, shuffle_seed):
+def test_grouped_prefill_validates_window_bounds(tmp_path):
+    objects = capture(tmp_path)
+    with s3_server(objects) as (options, _, _):
+        loader = _open_single_shard_cache(options, tmp_path / "shards", len(objects["parts/part.parquet"]))
+        prefill = loader.dataset.sequential_prefill
+        for options, error in [
+            ({"group_size": 0}, "group_size"),
+            ({"group_size": True}, "group_size"),
+            ({"prefix_groups": -1}, "prefix_groups"),
+            ({"group_size": 4, "prefix_groups": 2}, "prefix_groups"),
+        ]:
+            with pytest.raises(ValueError, match=error):
+                prefill(shuffle_seed=42, **options)
+        with pytest.raises(ValueError, match="shuffle seed"):
+            prefill(group_size=4)
+        # The sole, partial group can be included in the fixed prefix.
+        with closing(prefill(shuffle_seed=42, group_size=4, prefix_groups=1)) as cursor:
+            assert cursor.shard_at(0) == 0
+            with pytest.raises(IndexError):
+                cursor.shard_at(1)
+
+
+@pytest.mark.parametrize("order_options", [
+    {},
+    {"shuffle_seed": 42},
+    {"shuffle_seed": 42, "group_size": 3, "prefix_groups": 1},
+])
+def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path, order_options):
     import time
-    from contextlib import closing
 
     objects = capture(tmp_path)
     contents = objects["parts/part.parquet"]
@@ -756,9 +781,13 @@ def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path, shuffle_se
     with s3_server(objects) as (options, calls, _):
         loader = _open_single_shard_cache(options, cache, 8 * len(contents))
         with closing(loader.dataset.sequential_prefill(
-            active_shards=4, shuffle_seed=shuffle_seed
+            active_shards=4, **order_options
         )) as cursor:
-            if shuffle_seed is not None:
+            if "group_size" in order_options:
+                assert [cursor.shard_at(i) for i in range(20)] == [
+                    0, 1, 2, 15, 16, 17, 3, 4, 5, 12, 13, 14, 9, 10, 11, 6, 7, 8, 18, 19
+                ]
+            elif "shuffle_seed" in order_options:
                 assert [cursor.shard_at(i) for i in range(20)] != list(range(20))
             for first in (4, 8, 12):
                 cursor.advance(first)
@@ -776,7 +805,7 @@ def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path, shuffle_se
                 assert sum(
                     file.stat().st_size for file in cache.glob("*.parquet")
                 ) == 8 * len(contents)
-            peer = loader.dataset.sequential_prefill(active_shards=4, shuffle_seed=shuffle_seed)
+            peer = loader.dataset.sequential_prefill(active_shards=4, **order_options)
             peer.advance(8)
         with closing(peer):
             deadline = time.monotonic() + 10
@@ -788,7 +817,7 @@ def test_sequential_prefill_refills_byte_budget_from_resume(tmp_path, shuffle_se
         loader.dataset.enable_shard_cache(str(cache), 2 * len(contents) / 1024**3)
         before = loader.dataset.io_stats()
         with closing(loader.dataset.sequential_prefill(
-            active_shards=4, shuffle_seed=shuffle_seed
+            active_shards=4, **order_options
         )) as cursor:
             cursor.advance(0)
             deadline = time.monotonic() + 10
