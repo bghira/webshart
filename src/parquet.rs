@@ -898,7 +898,8 @@ impl PyParquetFile {
     }
 
     /// Coalesce only selected column chunks into a bounded metadata cache.
-    #[pyo3(signature=(columns, max_bytes=67108864, parallel_reads=4, start_group=0, stop_group=None))]
+    #[pyo3(signature=(columns, max_bytes=67108864, parallel_reads=4, start_group=0, stop_group=None, *, shard_cache=None))]
+    #[allow(clippy::too_many_arguments)]
     fn prefetch_columns(
         &self,
         py: Python<'_>,
@@ -907,10 +908,12 @@ impl PyParquetFile {
         parallel_reads: usize,
         start_group: usize,
         stop_group: Option<usize>,
+        shard_cache: Option<PyRef<'_, PyParquetCache>>,
     ) -> PyResult<bool> {
         if parallel_reads == 0 {
             return Err(PyValueError::new_err("parallel_reads must be positive"));
         }
+        let shard_cache = shard_cache.map(|cache| cache.cache.clone());
         py.detach(|| {
             project_columns(
                 self.reader
@@ -955,11 +958,12 @@ impl PyParquetFile {
             if total > max_bytes as u64 {
                 return Ok(false);
             }
+            let ranges_source = self.reader.with_cache(shard_cache, false).ranges;
             let data = runtime()
                 .map_err(python_error)?
                 .block_on(async {
                     stream::iter(ranges.into_iter().map(|span| {
-                        let source = self.source.clone();
+                        let source = ranges_source.clone();
                         async move {
                             tokio::task::spawn_blocking(move || {
                                 source
@@ -1103,7 +1107,7 @@ impl PyParquetFile {
             .collect()
     }
 
-    #[pyo3(signature = (columns=None, start=0, stop=None, *, shard_cache=None))]
+    #[pyo3(signature = (columns=None, start=0, stop=None, *, shard_cache=None, cache_payload=true))]
     fn rows(
         &self,
         py: Python<'_>,
@@ -1111,6 +1115,7 @@ impl PyParquetFile {
         start: usize,
         stop: Option<usize>,
         shard_cache: Option<PyRef<'_, PyParquetCache>>,
+        cache_payload: bool,
     ) -> PyResult<PyParquetRows> {
         let stop = stop.unwrap_or(self.num_rows);
         if start > stop || stop > self.num_rows {
@@ -1123,7 +1128,7 @@ impl PyParquetFile {
                 .partition_point(|&index| index <= start)
                 - 1;
             let group_stop = self.row_group_starts.partition_point(|&index| index < stop);
-            let reader = self.reader.with_cache(shard_cache, true);
+            let reader = self.reader.with_cache(shard_cache, cache_payload);
             let cache = reader.ranges.cache.clone();
             let _read = StreamRead(cache.clone());
             let reader = RowGroupWindow {

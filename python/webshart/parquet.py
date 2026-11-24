@@ -891,7 +891,9 @@ class ParquetDataset:
         ]
         records = {}
         if self.metadata_mode == "overlay" and columns:
-            reader.prefetch_columns(columns, parallel_reads=self.parallel_reads)
+            cached = reader.prefetch_columns(
+                columns, parallel_reads=self.parallel_reads, shard_cache=self._shard_cache
+            )
             records = {
                 row_index: self._decode(row)
                 for row_index, row in enumerate(
@@ -899,6 +901,7 @@ class ParquetDataset:
                         list(range(info["num_rows"])),
                         columns=columns,
                         parallel_reads=self.parallel_reads,
+                        shard_cache=None if cached else self._shard_cache,
                     )
                 )
             }
@@ -1099,10 +1102,15 @@ class ParquetDataset:
                 parallel_reads=self.parallel_reads,
                 start_group=start,
                 stop_group=stop,
+                shard_cache=self._shard_cache,
             )
             if cached or stop - start <= 1:
                 yield from reader.rows(
-                    columns=columns, start=starts[start], stop=starts[stop]
+                    columns=columns,
+                    start=starts[start],
+                    stop=starts[stop],
+                    shard_cache=None if cached else self._shard_cache,
+                    cache_payload=False,
                 )
             else:
                 mid = (start + stop) // 2
