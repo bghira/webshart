@@ -591,6 +591,35 @@ def test_projected_scan_coalesces_remote_metadata_ranges(tmp_path):
         assert all(headers.get("range") for headers in gets)
 
 
+@pytest.mark.parametrize("budget", [0, 64 * 1024 * 1024])
+def test_projected_scan_reuses_cached_shard_without_populating_on_miss(
+    tmp_path, monkeypatch, budget
+):
+    monkeypatch.setattr("webshart.parquet.PROJECTED_SCAN_CACHE_BYTES", budget)
+    objects = capture(tmp_path)
+    cache = tmp_path / "shards"
+    key = "parts/part.parquet"
+    with s3_server(objects) as (options, calls, _):
+        loader = _open_single_shard_cache(options, cache, len(objects[key]))
+
+        def captions(loader):
+            return [
+                row["captions"]
+                for row in loader.iter_samples_in_shard(0, metadata_fields=["captions"])
+            ]
+
+        assert captions(loader) == ["one", "three", "four"]
+        assert not list(cache.glob("*.parquet"))
+        assert loader.load_samples([(0, 0)], metadata_fields=())[0].data == b"first"
+
+        # A new reader has no column ranges left over from the cold scan.
+        loader = _open_single_shard_cache(options, cache, len(objects[key]))
+        loader.dataset.get_shard_info(0)
+        calls.clear()
+        assert captions(loader) == ["one", "three", "four"]
+        assert not any(method == "GET" and path == key for method, path, _ in calls)
+
+
 def test_projected_scan_prefetches_windows_when_a_shard_exceeds_budget(
     tmp_path, monkeypatch
 ):
