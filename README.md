@@ -682,6 +682,13 @@ with the start position in the read order. Pass the same `shuffle_seed` to
 cursor's `ready_range` reports positions, and `cursor.shard_at(position)`
 returns the corresponding physical shard ID.
 
+For consumers that read windows of consecutive shards, use
+`dataset.sequential_prefill(shuffle_seed=42, group_size=4, prefix_groups=2)`.
+This keeps the first two groups (eight shards) in physical order, shuffles the
+remaining complete groups, and leaves a partial final group at the end. Read
+each shard using `cursor.shard_at(position)`. On resume, use the same seed,
+group size and prefix count, then advance to the saved shard position.
+
 One worker per shared cache downloads upcoming shards up to the configured byte
 limit, reserves in-flight bytes, and releases consumed read leases as the cursor
 advances. Close the cursor at epoch end. A local or uncached dataset returns

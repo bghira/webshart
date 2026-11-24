@@ -8,6 +8,33 @@ from threading import Condition, Thread
 
 from filelock import FileLock, Timeout
 
+from ._webshart import _shuffled_shard_order
+
+
+class GroupedShardOrder:
+    """Shuffle complete groups after a fixed prefix, keeping the partial tail in place."""
+
+    def __init__(self, count, group_size, prefix_groups, seed):
+        full_groups, tail = divmod(count, group_size)
+        if prefix_groups > full_groups + bool(tail):
+            raise ValueError("prefix_groups exceeds the number of shard groups")
+        self.count = count
+        self.group_size = group_size
+        self.prefix_groups = prefix_groups
+        self.suffix = _shuffled_shard_order(max(0, full_groups - prefix_groups), seed)
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, position):
+        if not 0 <= position < self.count:
+            raise IndexError("Shard order position is out of bounds")
+        group, offset = divmod(position, self.group_size)
+        index = group - self.prefix_groups
+        if 0 <= index < len(self.suffix):
+            return (self.prefix_groups + self.suffix[index]) * self.group_size + offset
+        return position
+
 
 class SequentialShardPrefill:
     def __init__(
