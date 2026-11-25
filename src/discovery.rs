@@ -7,13 +7,23 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+
+const RESIDENT_SHARD_METADATA_LIMIT: usize = 8;
+
+/// Shard statistics retained after eviction for listing and seeking.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShardSummary {
+    pub num_files: usize,
+    num_samples: usize,
+    size: u64,
+}
 
 /// Represents a discovered shard pair (tar + json)
 #[derive(Debug, Clone)]
@@ -25,7 +35,9 @@ pub struct ShardPair {
     /// Path/URL to the json file
     pub json_path: String,
     /// Loaded metadata (lazy loaded)
-    pub metadata: Option<ShardMetadata>,
+    pub metadata: Option<Arc<ShardMetadata>>,
+    pub(crate) metadata_summary: Option<ShardSummary>,
+    exported_metadata_path: Option<PathBuf>,
 }
 
 /// Represents a discovered dataset with all its shards
@@ -42,6 +54,7 @@ pub struct DiscoveredDataset {
     runtime: Arc<Runtime>,
     /// Optional cache directory for metadata
     cache_dir: Option<PathBuf>,
+    metadata_recency: VecDeque<usize>,
     /// Track if we've hit rate limits
     rate_limit_delay: Option<Duration>,
     pub shard_cache: Option<Arc<ShardCache>>,
@@ -148,7 +161,10 @@ impl DiscoveredDataset {
                 .map_err(|error| error.error)?;
             let shard = &mut self.shards[shard_index];
             shard.metadata = None;
+            shard.metadata_summary = None;
+            shard.exported_metadata_path = None;
             shard.json_path = output_path.to_string_lossy().into_owned();
+            self.metadata_recency.retain(|&index| index != shard_index);
         }
         if let Some(destination) = destination {
             self.metadata_source = Some(destination.to_string_lossy().into_owned());
@@ -175,24 +191,34 @@ impl DiscoveredDataset {
         &mut self,
         shard_index: usize,
         metadata: ShardMetadata,
-        persist_to_cache: bool,
+        exported_metadata_path: Option<PathBuf>,
     ) -> Result<()> {
-        let shard_name = self
-            .shards
-            .get(shard_index)
-            .ok_or_else(|| {
-                WebshartError::InvalidShardFormat(format!(
-                    "Shard index {} out of range",
-                    shard_index
-                ))
-            })?
-            .name
-            .clone();
-        if persist_to_cache {
-            self.save_metadata_to_cache(&shard_name, &metadata)?;
+        if exported_metadata_path.is_none() {
+            self.save_metadata_to_cache(&self.shards[shard_index].name, &metadata)?;
         }
-        self.shards[shard_index].metadata = Some(metadata);
+        self.shards[shard_index].exported_metadata_path = exported_metadata_path;
+        self.cache_shard_metadata(shard_index, metadata);
         Ok(())
+    }
+
+    fn cache_shard_metadata(&mut self, shard_index: usize, metadata: ShardMetadata) {
+        let shard = &mut self.shards[shard_index];
+        shard.metadata_summary = Some(ShardSummary {
+            num_files: metadata.num_files(),
+            num_samples: metadata.num_samples(),
+            size: metadata.filesize,
+        });
+        shard.metadata = Some(Arc::new(metadata));
+        self.touch_shard_metadata(shard_index);
+    }
+
+    fn touch_shard_metadata(&mut self, shard_index: usize) {
+        self.metadata_recency.retain(|&index| index != shard_index);
+        if self.metadata_recency.len() == RESIDENT_SHARD_METADATA_LIMIT {
+            let evicted = self.metadata_recency.pop_front().unwrap();
+            self.shards[evicted].metadata = None;
+        }
+        self.metadata_recency.push_back(shard_index);
     }
 
     pub async fn enable_shard_cache(
@@ -334,24 +360,28 @@ impl DiscoveredDataset {
 
     /// Get total number of files (requires loading all metadata)
     pub fn total_files(&mut self) -> Result<usize> {
-        self.ensure_all_metadata_loaded()?;
-        Ok(self
-            .shards
-            .iter()
-            .filter_map(|s| s.metadata.as_ref())
-            .map(|m| m.num_files())
-            .sum())
+        (0..self.num_shards()).try_fold(0, |total, index| {
+            Ok(total + self.shard_metadata_summary(index)?.num_files)
+        })
     }
 
     /// Get total size (requires loading all metadata)
     pub fn total_size(&mut self) -> Result<u64> {
-        self.ensure_all_metadata_loaded()?;
-        Ok(self
+        (0..self.num_shards()).try_fold(0, |total, index| {
+            Ok(total + self.shard_metadata_summary(index)?.size)
+        })
+    }
+
+    fn shard_metadata_summary(&mut self, shard_index: usize) -> Result<ShardSummary> {
+        if let Some(summary) = self
             .shards
-            .iter()
-            .filter_map(|s| s.metadata.as_ref())
-            .map(|m| m.filesize)
-            .sum())
+            .get(shard_index)
+            .and_then(|shard| shard.metadata_summary)
+        {
+            return Ok(summary);
+        }
+        self.ensure_shard_metadata(shard_index)?;
+        Ok(self.shards[shard_index].metadata_summary.unwrap())
     }
 
     /// Get quick stats from cached values (instant, no metadata loading)
@@ -361,29 +391,25 @@ impl DiscoveredDataset {
 
     /// Ensure metadata is loaded for a specific shard
     pub fn ensure_shard_metadata(&mut self, shard_index: usize) -> Result<()> {
-        // Scope the first borrow to check if metadata is already loaded
-        if let Some(shard) = self.shards.get(shard_index) {
-            if shard.metadata.is_some() {
-                return Ok(());
-            }
-        } else {
-            return Err(WebshartError::InvalidShardFormat(format!(
+        let shard = self.shards.get(shard_index).ok_or_else(|| {
+            WebshartError::InvalidShardFormat(format!(
                 "File index {} out of range for shard {}",
                 shard_index, self.name
-            )));
+            ))
+        })?;
+        if shard.metadata.is_some() {
+            self.touch_shard_metadata(shard_index);
+            return Ok(());
         }
 
-        // Clone shard info to release the borrow on `self`
-        let (shard_name, json_path) = {
-            let shard = &self.shards[shard_index];
-            (shard.name.clone(), shard.json_path.clone())
-        };
+        if let Some(path) = &shard.exported_metadata_path {
+            let metadata = crate::metadata::parse_index_json(&fs::read_to_string(path)?)?;
+            self.cache_shard_metadata(shard_index, metadata);
+            return Ok(());
+        }
 
-        // First, check cache
-        if let Some(cached) = self.load_cached_metadata(&shard_name) {
-            if let Some(shard) = self.shards.get_mut(shard_index) {
-                shard.metadata = Some(cached);
-            }
+        if let Some(cached) = self.load_cached_metadata(&shard.name) {
+            self.cache_shard_metadata(shard_index, cached);
             return Ok(());
         }
 
@@ -400,23 +426,20 @@ impl DiscoveredDataset {
 
         // Use block_in_place to avoid blocking the async runtime
         let result = tokio::task::block_in_place(|| {
-            if json_path.starts_with("http") {
+            if shard.json_path.starts_with("http") {
                 self.runtime
-                    .block_on(discovery.load_remote_metadata(&json_path))
+                    .block_on(discovery.load_remote_metadata(&shard.json_path))
             } else {
                 self.runtime
-                    .block_on(discovery.load_local_metadata(&json_path))
+                    .block_on(discovery.load_local_metadata(&shard.json_path))
             }
         });
 
         match result {
             Ok(metadata) => {
                 // Save to cache if caching is enabled
-                let _ = self.save_metadata_to_cache(&shard_name, &metadata);
-                // Re-borrow to update the shard
-                if let Some(shard) = self.shards.get_mut(shard_index) {
-                    shard.metadata = Some(metadata);
-                }
+                let _ = self.save_metadata_to_cache(&shard.name, &metadata);
+                self.cache_shard_metadata(shard_index, metadata);
                 Ok(())
             }
             Err(e) => {
@@ -468,31 +491,16 @@ impl DiscoveredDataset {
         }
     }
 
-    /// Ensure all metadata is loaded
-    fn ensure_all_metadata_loaded(&mut self) -> Result<()> {
-        // Use index-based loop to avoid borrow checker issues
-        let num_shards = self.shards.len();
-        for i in 0..num_shards {
-            self.ensure_shard_metadata(i)?;
-        }
-        Ok(())
-    }
-
     /// Find which shard contains a file by global index (loads metadata as needed)
     pub fn find_shard_for_file(&mut self, file_index: usize) -> Result<Option<(usize, usize)>> {
         let mut current_offset = 0;
 
-        // Use index-based loop to avoid borrow checker issues
         for shard_idx in 0..self.shards.len() {
-            self.ensure_shard_metadata(shard_idx)?;
-
-            if let Some(metadata) = &self.shards[shard_idx].metadata {
-                let num_files = metadata.num_files();
-                if file_index < current_offset + num_files {
-                    return Ok(Some((shard_idx, file_index - current_offset)));
-                }
-                current_offset += num_files;
+            let num_files = self.shard_metadata_summary(shard_idx)?.num_files;
+            if file_index < current_offset + num_files {
+                return Ok(Some((shard_idx, file_index - current_offset)));
             }
+            current_offset += num_files;
         }
 
         Ok(None)
@@ -535,7 +543,7 @@ pub struct ShardReader {
     is_remote: bool,
 
     /// Shard metadata
-    metadata: ShardMetadata,
+    metadata: Arc<ShardMetadata>,
 
     /// Optional HuggingFace token for remote access
     hf_token: Option<String>,
@@ -549,7 +557,7 @@ impl ShardReader {
     pub fn new(
         tar_location: &str,
         is_remote: bool,
-        metadata: ShardMetadata,
+        metadata: Arc<ShardMetadata>,
         hf_token: Option<String>,
         runtime: Arc<Runtime>,
     ) -> Result<Self> {
@@ -834,6 +842,8 @@ impl DatasetDiscovery {
                         tar_path,
                         json_path,
                         metadata: None,
+                        metadata_summary: None,
+                        exported_metadata_path: None,
                     });
                 }
             }
@@ -851,6 +861,7 @@ impl DatasetDiscovery {
             name: path.to_string_lossy().to_string(),
             subfolder: None,
             cache_dir: None,
+            metadata_recency: VecDeque::new(),
             rate_limit_delay: None,
             is_remote: false,
             shards,
@@ -1025,6 +1036,7 @@ impl DatasetDiscovery {
             name: repo_id.to_string(),
             subfolder: subfolder.map(|s| s.to_string()),
             cache_dir: None,
+            metadata_recency: VecDeque::new(),
             rate_limit_delay: None,
             is_remote: true,
             shards: all_shards,
@@ -1189,6 +1201,8 @@ impl DatasetDiscovery {
                     tar_path: full_tar_path,
                     json_path,
                     metadata: None,
+                    metadata_summary: None,
+                    exported_metadata_path: None,
                 });
             } else {
                 // Fallback to co-located metadata if custom location doesn't have it
@@ -1200,6 +1214,8 @@ impl DatasetDiscovery {
                         tar_path: full_tar_path,
                         json_path: default_json_path,
                         metadata: None,
+                        metadata_summary: None,
+                        exported_metadata_path: None,
                     });
                 }
             }
@@ -1288,6 +1304,8 @@ impl DatasetDiscovery {
                 tar_path: full_tar_path,
                 json_path,
                 metadata: None,
+                metadata_summary: None,
+                exported_metadata_path: None,
             });
         }
 
@@ -1473,29 +1491,18 @@ impl PyDiscoveredDataset {
     }
 
     fn get_shard_info(&mut self, index: usize) -> PyResult<Py<PyDict>> {
-        // Ensure metadata is loaded for this shard
-        self.inner.ensure_shard_metadata(index)?;
+        let summary = self.inner.shard_metadata_summary(index)?;
+        let shard = &self.inner.shards[index];
 
         Python::attach(|py| {
-            if let Some(shard) = self.inner.shards.get(index) {
-                let dict = PyDict::new(py);
-                dict.set_item("name", &shard.name)?;
-                dict.set_item("tar_path", &shard.tar_path)?;
-                dict.set_item("json_path", &shard.json_path)?;
-
-                if let Some(metadata) = &shard.metadata {
-                    dict.set_item("num_files", metadata.num_files())?;
-                    dict.set_item("num_samples", metadata.num_samples())?;
-                    dict.set_item("size", metadata.filesize)?;
-                }
-
-                Ok(dict.into())
-            } else {
-                Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "Shard index {} out of range",
-                    index
-                )))
-            }
+            let dict = PyDict::new(py);
+            dict.set_item("name", &shard.name)?;
+            dict.set_item("tar_path", &shard.tar_path)?;
+            dict.set_item("json_path", &shard.json_path)?;
+            dict.set_item("num_files", summary.num_files)?;
+            dict.set_item("num_samples", summary.num_samples)?;
+            dict.set_item("size", summary.size)?;
+            Ok(dict.into())
         })
     }
 
@@ -1677,21 +1684,7 @@ impl PyDiscoveredDataset {
                 self.inner.shards.len()
             )));
         }
-        self.inner.ensure_shard_metadata(shard_index)?;
-        if let Some(shard) = self.inner.shards.get(shard_index) {
-            if let Some(metadata) = &shard.metadata {
-                Ok(metadata.num_files())
-            } else {
-                Err(pyo3::exceptions::PyValueError::new_err(
-                    "Failed to load shard metadata",
-                ))
-            }
-        } else {
-            Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "Shard index {} out of range",
-                shard_index
-            )))
-        }
+        Ok(self.inner.shard_metadata_summary(shard_index)?.num_files)
     }
 
     fn get_shard_sample_count(&mut self, shard_index: usize) -> PyResult<usize> {
@@ -1702,21 +1695,7 @@ impl PyDiscoveredDataset {
                 self.inner.shards.len()
             )));
         }
-        self.inner.ensure_shard_metadata(shard_index)?;
-        if let Some(shard) = self.inner.shards.get(shard_index) {
-            if let Some(metadata) = &shard.metadata {
-                Ok(metadata.num_samples())
-            } else {
-                Err(pyo3::exceptions::PyValueError::new_err(
-                    "Failed to load shard metadata",
-                ))
-            }
-        } else {
-            Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "Shard index {} out of range",
-                shard_index
-            )))
-        }
+        Ok(self.inner.shard_metadata_summary(shard_index)?.num_samples)
     }
 
     fn get_stats(&mut self) -> PyResult<Py<PyDict>> {
@@ -1745,13 +1724,11 @@ impl PyDiscoveredDataset {
                 let shard_dict = PyDict::new(py);
                 shard_dict.set_item("index", i)?;
                 shard_dict.set_item("name", &shard.name)?;
-                if let Some(metadata) = &shard.metadata {
-                    shard_dict.set_item("num_files", metadata.num_files())?;
-                    shard_dict.set_item("size", metadata.filesize)?;
-                    shard_dict.set_item("metadata_loaded", true)?;
-                } else {
-                    shard_dict.set_item("metadata_loaded", false)?;
+                if let Some(summary) = shard.metadata_summary {
+                    shard_dict.set_item("num_files", summary.num_files)?;
+                    shard_dict.set_item("size", summary.size)?;
                 }
+                shard_dict.set_item("metadata_loaded", shard.metadata.is_some())?;
                 shard_details.append(shard_dict)?;
             }
             dict.set_item("shard_details", shard_details)?;
@@ -1761,8 +1738,6 @@ impl PyDiscoveredDataset {
     }
 
     fn get_detailed_stats(&mut self) -> PyResult<Py<PyDict>> {
-        self.inner.ensure_all_metadata_loaded()?;
-
         Python::attach(|py| {
             let dict = PyDict::new(py);
             let mut total_files = 0usize;
@@ -1770,25 +1745,23 @@ impl PyDiscoveredDataset {
             let mut min_files = usize::MAX;
             let mut max_files = 0usize;
             let shard_details = PyList::empty(py);
-            for (i, shard) in self.inner.shards.iter().enumerate() {
-                if let Some(metadata) = &shard.metadata {
-                    let num_files = metadata.num_files();
-                    let size = metadata.filesize;
-                    total_files += num_files;
-                    total_size += size;
-                    min_files = min_files.min(num_files);
-                    max_files = max_files.max(num_files);
-                    // Create detailed shard info
-                    let shard_dict = PyDict::new(py);
-                    shard_dict.set_item("index", i)?;
-                    shard_dict.set_item("name", &shard.name)?;
-                    shard_dict.set_item("num_files", num_files)?;
-                    shard_dict.set_item("size", size)?;
-                    shard_dict.set_item("size_mb", size as f64 / (1024.0_f64).powi(2))?;
-                    shard_details.append(shard_dict)?;
-                }
-            }
             let num_shards = self.inner.num_shards();
+            for i in 0..num_shards {
+                let ShardSummary {
+                    num_files, size, ..
+                } = self.inner.shard_metadata_summary(i)?;
+                total_files += num_files;
+                total_size += size;
+                min_files = min_files.min(num_files);
+                max_files = max_files.max(num_files);
+                let shard_dict = PyDict::new(py);
+                shard_dict.set_item("index", i)?;
+                shard_dict.set_item("name", &self.inner.shards[i].name)?;
+                shard_dict.set_item("num_files", num_files)?;
+                shard_dict.set_item("size", size)?;
+                shard_dict.set_item("size_mb", size as f64 / (1024.0_f64).powi(2))?;
+                shard_details.append(shard_dict)?;
+            }
             let avg_files = if num_shards > 0 {
                 total_files as f64 / num_shards as f64
             } else {
