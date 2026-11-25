@@ -1,5 +1,5 @@
 use crate::error::{Result, WebshartError};
-use crate::metadata::ShardMetadata;
+use crate::metadata::{parse_index_json, ShardMetadata};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -156,7 +156,7 @@ impl MetadataResolver {
 
     fn load_local_metadata(&self, path: &str) -> Result<ShardMetadata> {
         let content = fs::read_to_string(path)?;
-        let metadata: ShardMetadata = serde_json::from_str(&content)?;
+        let metadata: ShardMetadata = parse_index_json(&content)?;
         Ok(metadata)
     }
 
@@ -166,12 +166,12 @@ impl MetadataResolver {
         } else {
             fs::read_to_string(path)?
         };
-        Ok(serde_json::from_str(&content)?)
+        Ok(parse_index_json(&content)?)
     }
 
     async fn load_remote_metadata(&self, url: &str) -> Result<ShardMetadata> {
         let response_text = self.load_remote_content(url).await?;
-        serde_json::from_str::<ShardMetadata>(&response_text).map_err(|e| {
+        parse_index_json::<ShardMetadata>(&response_text).map_err(|e| {
             WebshartError::MetadataNotFound(format!("Invalid JSON in metadata file: {}", e))
         })
     }

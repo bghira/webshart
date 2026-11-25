@@ -290,7 +290,7 @@ impl DiscoveredDataset {
         if cache_path.exists() {
             match fs::read_to_string(&cache_path) {
                 Ok(content) => {
-                    match serde_json::from_str(&content) {
+                    match crate::metadata::parse_index_json(&content) {
                         Ok(metadata) => {
                             println!("[webshart] Loaded metadata for {} from cache", shard_name);
                             Some(metadata)
