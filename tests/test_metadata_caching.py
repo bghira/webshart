@@ -7,8 +7,49 @@ from pathlib import Path
 import time
 from unittest.mock import Mock, patch, MagicMock
 
-# These would be the actual Python imports from webshart
-# from webshart import DatasetDiscovery, DiscoveredDataset
+
+def test_large_tar_catalogue_keeps_only_recent_metadata(tmp_path):
+    from webshart import BatchOperations, DatasetDiscovery, TarDataLoader
+
+    source = tmp_path / "source"
+    source.mkdir()
+    payloads = [bytes([index]) for index in range(12)]
+    for index, payload in enumerate(payloads):
+        shard = source / f"shard-{index:04d}"
+        shard.with_suffix(".tar").write_bytes(payload)
+        shard.with_suffix(".json").write_text(json.dumps({
+            "filesize": len(payload),
+            "files": {"image.jpg": {"offset": 0, "length": len(payload)}},
+        }))
+
+    dataset = DatasetDiscovery().discover_local(str(source))
+    dataset.enable_metadata_cache(str(tmp_path / "cache"), init_shard_count=0)
+    for index in range(8):
+        assert dataset.list_samples_in_shard(index) == ["image.jpg"]
+
+    assert dataset.list_samples_in_shard(0) == ["image.jpg"]
+    assert dataset.list_samples_in_shard(8) == ["image.jpg"]
+    assert dataset.get_shard_info(1)["num_samples"] == dataset.get_shard_sample_count(1) == 1
+    resident = [row["index"] for row in dataset.get_stats()["shard_details"] if row["metadata_loaded"]]
+    assert resident == [0, *range(2, 9)]
+
+    details = dataset.get_detailed_stats()
+    assert details["total_files"] == details["total_size"] == len(payloads)
+    assert len(details["shard_details"]) == len(payloads)
+    assert dataset.total_files == dataset.total_size == len(payloads)
+    assert dataset.find_file_location(10) == (10, 0)
+    assert dataset.get_cache_stats()["cached_shards"] == len(payloads)
+
+    batch = BatchOperations().read_files_batch(
+        [dataset], [(0, index, 0) for index in range(len(payloads))]
+    )
+    assert batch == payloads
+    assert sum(row["metadata_loaded"] for row in dataset.get_stats()["shard_details"]) == 8
+
+    loader = TarDataLoader(dataset)
+    loader.skip(10)
+    assert bytes(next(loader).data) == payloads[10]
+    assert bytes(loader.load_sample(0, 0).data) == payloads[0]
 
 
 class TestMetadataCachingPythonAPI:

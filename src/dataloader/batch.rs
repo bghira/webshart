@@ -113,64 +113,44 @@ impl BatchOperations {
     ) -> Vec<BatchResult<Vec<u8>>> {
         let runtime = self.runtime.clone();
 
-        // First ensure all required metadata is loaded
-        for req in &requests {
-            if let Some(dataset) = datasets.get_mut(req.dataset_idx) {
-                let _ = dataset.ensure_shard_metadata(req.shard_idx);
-            }
-        }
-
-        // Prepare readers and file info
-        let mut read_tasks = Vec::new();
+        // Capture offsets before a subsequent request can evict this shard's metadata.
+        let mut read_tasks = Vec::with_capacity(requests.len());
         for req in requests {
-            if let Some(dataset) = datasets.get(req.dataset_idx) {
-                if let Some(shard) = dataset.shards.get(req.shard_idx) {
-                    if let Some(metadata) = &shard.metadata {
-                        if let Some((filename, file_info)) =
-                            metadata.get_file_by_index(req.file_idx)
-                        {
-                            read_tasks.push((
-                                shard.tar_path.clone(),
-                                dataset.is_remote,
-                                dataset.get_hf_token(),
-                                filename,
-                                file_info.offset,
-                                file_info.length,
-                            ));
-                        } else {
-                            read_tasks.push((String::new(), false, None, String::new(), 0, 0));
-                        }
-                    } else {
-                        read_tasks.push((String::new(), false, None, String::new(), 0, 0));
-                    }
-                } else {
-                    read_tasks.push((String::new(), false, None, String::new(), 0, 0));
-                }
-            } else {
-                read_tasks.push((String::new(), false, None, String::new(), 0, 0));
-            }
+            let task = datasets.get_mut(req.dataset_idx).and_then(|dataset| {
+                dataset.ensure_shard_metadata(req.shard_idx).ok()?;
+                let shard = &dataset.shards[req.shard_idx];
+                let (filename, file_info) =
+                    shard.metadata.as_ref()?.get_file_by_index(req.file_idx)?;
+                Some((
+                    shard.tar_path.clone(),
+                    dataset.is_remote,
+                    dataset.get_hf_token(),
+                    filename,
+                    file_info.offset,
+                    file_info.length,
+                ))
+            });
+            read_tasks.push(task);
         }
 
         // Execute reads in parallel
         runtime.block_on(async {
-            let futures = read_tasks.into_iter().map(
-                |(tar_path, is_remote, token, filename, offset, length)| async move {
-                    if tar_path.is_empty() {
-                        return BatchResult::Err("Invalid request".to_string());
-                    }
+            let futures = read_tasks.into_iter().map(|task| async move {
+                let Some((tar_path, is_remote, token, filename, offset, length)) = task else {
+                    return BatchResult::Err("Invalid request".to_string());
+                };
 
-                    let result = if is_remote {
-                        read_file_remote(&tar_path, token.as_deref(), offset, length).await
-                    } else {
-                        read_file_local(&tar_path, &filename, offset, length)
-                    };
+                let result = if is_remote {
+                    read_file_remote(&tar_path, token.as_deref(), offset, length).await
+                } else {
+                    read_file_local(&tar_path, &filename, offset, length)
+                };
 
-                    match result {
-                        Ok(data) => BatchResult::Ok(data),
-                        Err(e) => BatchResult::Err(e.to_string()),
-                    }
-                },
-            );
+                match result {
+                    Ok(data) => BatchResult::Ok(data),
+                    Err(e) => BatchResult::Err(e.to_string()),
+                }
+            });
 
             join_all(futures).await
         })

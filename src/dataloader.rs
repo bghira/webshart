@@ -1326,7 +1326,7 @@ impl PyTarDataLoader {
                         shard_idx
                     ))
                 })?;
-                let metadata = shard.metadata.clone().ok_or_else(|| {
+                let metadata = shard.metadata.as_deref().cloned().ok_or_else(|| {
                     WebshartError::MetadataNotFound("Metadata not loaded".to_string())
                 })?;
                 (
@@ -1361,18 +1361,14 @@ impl PyTarDataLoader {
             }
 
             let output_path = Self::metadata_output_path(&destination, &shard_name)?;
-            if persist_to_cache {
-                self.dataset
-                    .lock()
-                    .unwrap()
-                    .replace_shard_metadata(shard_idx, metadata, true)?;
-            } else {
+            if !persist_to_cache {
                 Self::write_metadata_file(&output_path, &metadata)?;
-                self.dataset
-                    .lock()
-                    .unwrap()
-                    .replace_shard_metadata(shard_idx, metadata, false)?;
             }
+            self.dataset.lock().unwrap().replace_shard_metadata(
+                shard_idx,
+                metadata,
+                (!persist_to_cache).then(|| output_path.clone()),
+            )?;
             output_paths.push(output_path.to_string_lossy().to_string());
         }
 
@@ -1841,12 +1837,7 @@ impl PyTarDataLoader {
     ) -> PyResult<usize> {
         let mut files_processed = 0;
         for i in 0..self.current_shard {
-            ensure_shard_metadata_with_retry(dataset, i)?;
-            if let Some(shard) = dataset.shards.get(i) {
-                if let Some(metadata) = &shard.metadata {
-                    files_processed += metadata.num_files();
-                }
-            }
+            files_processed += Self::shard_file_count(dataset, i)?;
         }
         files_processed += current_file_index_in_shard;
         Ok(files_processed)
@@ -1858,29 +1849,29 @@ impl PyTarDataLoader {
         self.calculate_files_processed(&mut dataset, current_file_index_in_shard)
     }
 
+    fn shard_file_count(dataset: &mut DiscoveredDataset, index: usize) -> Result<usize> {
+        if let Some(summary) = dataset
+            .shards
+            .get(index)
+            .and_then(|shard| shard.metadata_summary)
+        {
+            return Ok(summary.num_files);
+        }
+        ensure_shard_metadata_with_retry(dataset, index)?;
+        Ok(dataset.shards[index].metadata_summary.unwrap().num_files)
+    }
+
     fn find_shard_for_index(&self, idx: usize) -> PyResult<(usize, usize)> {
         let mut remaining = idx;
         let mut dataset = self.dataset.lock().unwrap();
         let num_shards = dataset.num_shards();
 
         for shard_idx in 0..num_shards {
-            if dataset.shards[shard_idx].metadata.is_none() {
-                ensure_shard_metadata_with_retry(&mut dataset, shard_idx)?;
+            let num_files = Self::shard_file_count(&mut dataset, shard_idx)?;
+            if remaining < num_files {
+                return Ok((shard_idx, remaining));
             }
-
-            if let Some(metadata) = &dataset.shards[shard_idx].metadata {
-                let num_files = metadata.num_files();
-                if remaining < num_files {
-                    return Ok((shard_idx, remaining));
-                }
-                remaining -= num_files;
-            } else {
-                return Err(WebshartError::MetadataNotFound(format!(
-                    "Metadata for shard {} could not be loaded",
-                    shard_idx
-                ))
-                .into());
-            }
+            remaining -= num_files;
         }
 
         Ok((num_shards.saturating_sub(1), remaining))

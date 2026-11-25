@@ -89,6 +89,20 @@ def test_json_text_sidecar_loading_and_coalescing(tmp_path, captions):
     )
 
 
+def test_coalesced_caption_metadata_survives_eviction(tmp_path):
+    source = tmp_path / "source"
+    for index in range(10):
+        write_tar(source / str(index), {"sample.txt": f"caption {index}".encode()})
+
+    dataset = webshart.discover_dataset(str(source))
+    dataset.enable_metadata_cache(str(tmp_path / "cache"))
+    loader = webshart.TarDataLoader(dataset, load_file_data=False)
+    assert loader.coalesce_caption_metadata(destination=str(tmp_path / "export"))["shards"] == 10
+    assert loader.get_metadata(0)["sample.jpg"]["captions"] == "caption 0"
+    assert loader.load_caption(0, 0) == "caption 0"
+    assert loader.get_metadata(9)["sample.jpg"]["captions"] == "caption 9"
+
+
 @pytest.mark.parametrize("captions", CAPTION_VALUES)
 @pytest.mark.parametrize("suffix", [".txt", ".json"])
 def test_optimize_dataset_preserves_native_captions(tmp_path, captions, suffix):
