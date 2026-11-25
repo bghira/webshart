@@ -5,6 +5,70 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+/// Shard indexes can contain text emitted by JSON writers that accept lone UTF-16 surrogates.
+pub(crate) fn parse_index_json<T: serde::de::DeserializeOwned>(
+    input: &str,
+) -> serde_json::Result<T> {
+    match serde_json::from_str(input) {
+        Err(err) if err.is_syntax() => match repair_surrogate_values(input.as_bytes()) {
+            Some(bytes) => serde_json::from_slice(&bytes),
+            None => Err(err),
+        },
+        result => result,
+    }
+}
+
+fn surrogate(bytes: &[u8]) -> Option<u16> {
+    let digits = bytes.strip_prefix(br"\u")?.get(..4)?;
+    if !matches!(digits[0], b'd' | b'D') || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u16::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+}
+
+fn repair_surrogate_values(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut repaired = None;
+    let mut unpaired = Vec::new();
+    let mut in_string = false;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'"' => {
+                if in_string && !unpaired.is_empty() {
+                    // Rewriting object keys could merge distinct tar members or metadata fields.
+                    let next = bytes[pos + 1..].iter().find(|b| !b.is_ascii_whitespace());
+                    if next != Some(&b':') {
+                        let output = repaired.get_or_insert_with(|| bytes.to_vec());
+                        for &offset in &unpaired {
+                            output[offset..offset + 6].copy_from_slice(br"\uFFFD");
+                        }
+                    }
+                    unpaired.clear();
+                }
+                in_string = !in_string;
+            }
+            b'\\' if in_string => {
+                match surrogate(&bytes[pos..]) {
+                    Some(0xd800..=0xdbff)
+                        if matches!(surrogate(&bytes[pos + 6..]), Some(0xdc00..=0xdfff)) =>
+                    {
+                        pos += 12;
+                    }
+                    Some(0xd800..=0xdfff) => {
+                        unpaired.push(pos);
+                        pos += 6;
+                    }
+                    _ => pos += 2,
+                }
+                continue;
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    repaired
+}
+
 /// Caption metadata extracted from paired JSON sidecars.
 ///
 /// Python callers receive strings, JSON objects, or lists containing either.
@@ -679,6 +743,32 @@ pub fn ensure_shard_metadata_with_retry(
                     return Err(e);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod index_json_tests {
+    use super::parse_index_json;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn repairs_only_unpaired_escapes_in_values() {
+        let value: Value =
+            parse_index_json(r#"{"text":["\uD800\uDbff\udfff\uDC00","\\uD800","é\"\uDfff"]}"#)
+                .unwrap();
+        assert_eq!(value, json!({"text": ["�\u{10ffff}�", r"\uD800", "é\"�"]}));
+    }
+
+    #[test]
+    fn rejects_invalid_keys_and_malformed_json() {
+        for input in [
+            r#"{"\uD800":"x"}"#,
+            r#"{"text":"\ud800\u12X4"}"#,
+            r#"["\ud800" 2]"#,
+            r#""\ud800"#,
+        ] {
+            assert!(parse_index_json::<Value>(input).is_err());
         }
     }
 }

@@ -122,3 +122,20 @@ def test_non_caption_json_and_plain_text_remain_strings(tmp_path, caption):
     write_tar(tmp_path, {"sample.txt": caption.encode()})
     dataset = webshart.discover_dataset(str(tmp_path))
     assert webshart.TarDataLoader(dataset).load_sample(0, 0).captions == caption
+
+
+def test_unpaired_surrogates_in_index_text_do_not_discard_the_shard(tmp_path):
+    write_tar(tmp_path)
+    path = tmp_path / "shard.json"
+    index = json.loads(path.read_bytes())
+    label = {
+        "text": "\ud800\ud800\udc00\udfff",
+        "nested": ["emoji 😀", r"literal \uD800", 'quote " and slash \\', "é"],
+    }
+    index["files"]["sample.jpg"]["json_label"] = label
+    path.write_text(json.dumps(index), encoding="utf-8")
+    dataset = webshart.discover_dataset(str(tmp_path))
+    loader = webshart.TarDataLoader(dataset)
+    actual = loader.get_metadata(0)["sample.jpg"]["json_label"]
+    assert actual == {**label, "text": "�𐀀�"}
+    assert bytes(loader.load_sample(0, 0).data) == b"image bytes"
