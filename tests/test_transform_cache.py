@@ -46,6 +46,30 @@ def test_transform_cache_reads_in_order_and_keeps_namespaces_separate(tmp_path):
         reopened.close()
 
 
+def test_read_recovers_interrupted_shard_transaction(tmp_path):
+    with closing(TransformCache(tmp_path, "recipe")) as cache:
+        cache.enqueue("shard", [(row, bytes(8192)) for row in range(64)])
+        cache.flush()
+
+    (path,) = tmp_path.rglob("*.sqlite3")
+    writer = """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("PRAGMA cache_size=4")
+db.execute("BEGIN IMMEDIATE")
+db.execute("UPDATE transforms SET value=randomblob(8192)")
+os._exit(0)
+"""
+    subprocess.run([sys.executable, "-c", writer, str(path)], check=True, timeout=20)
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as reader:
+        with pytest.raises(sqlite3.OperationalError) as error:
+            reader.execute("SELECT value FROM transforms LIMIT 1")
+        assert error.value.sqlite_errorname == "SQLITE_READONLY_ROLLBACK"
+
+    with closing(TransformCache(tmp_path, "recipe")) as cache:
+        assert cache.read_batch([("shard", 0), ("shard", 63)]) == [bytes(8192)] * 2
+
+
 def test_transform_cache_reports_worker_failure_on_flush(tmp_path):
     directory = tmp_path / "cache"
     cache = TransformCache(directory, "recipe")
