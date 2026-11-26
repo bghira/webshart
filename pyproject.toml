@@ -31,7 +31,7 @@ dependencies = [
 
 [project.optional-dependencies]
 hub = ["huggingface-hub>=1.0.0,<2.0.0"]
-scan = ["huggingface-hub>=1.0.0,<2.0.0", "pyarrow>=18"]
+scan = ["huggingface-hub>=1.0.0,<2.0.0", "pyarrow>=18", "Pillow>=11.3"]
 
 [project.scripts]
 webshart = "webshart:main"
