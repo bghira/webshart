@@ -68,7 +68,8 @@ impl Location {
             if !path.try_exists()? {
                 continue;
             }
-            let mut db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            // SQLite may need to roll back an interrupted writer before the first SELECT.
+            let mut db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
             db.busy_timeout(Duration::from_secs(5))?;
             let transaction = db.transaction()?;
             // The file can be visible before its first writer has installed the schema.
