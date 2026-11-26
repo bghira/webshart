@@ -795,6 +795,26 @@ def main():
     queue_parser.add_argument("--num-threads", type=int, default=4)
     queue_parser.add_argument("--flush", action="store_true")
 
+    whitespace_parser = subparsers.add_parser("whitespace-crop", help="Measure whitespace and annotate indexed TAR images")
+    whitespace_parser.add_argument("--source", required=True, help="Local directory or Hub dataset")
+    whitespace_parser.add_argument("--metadata", help="Separate index directory or Hub dataset")
+    whitespace_parser.add_argument("--destination", required=True, help="Directory for enriched JSON indexes")
+    whitespace_parser.add_argument("--subfolder", default="", help="Source shard subfolder")
+    whitespace_parser.add_argument("--source-revision", default="main")
+    whitespace_parser.add_argument("--metadata-revision")
+    whitespace_parser.add_argument("--range", help="Half-open shard range: start,end")
+    whitespace_parser.add_argument("--workers", type=int, default=4)
+    whitespace_parser.add_argument("--tight", action="store_true", help="Trim all contiguous near-white edge pixels")
+    whitespace_parser.add_argument("--white-threshold", type=int, default=242)
+    whitespace_parser.add_argument("--black-threshold", type=int, default=13)
+    whitespace_parser.add_argument("--max-pixels", type=int, default=64_000_000)
+    whitespace_parser.add_argument("--max-bytes", type=int, default=50_000_000)
+    whitespace_parser.add_argument("--cache-dir", help="Persistent Hugging Face download cache")
+    whitespace_parser.add_argument("--hf-token")
+    whitespace_parser.add_argument("--push-to-hub", metavar="REPO_ID", help="Upload enriched indexes to a Hub dataset")
+    whitespace_parser.add_argument("--path-in-repo", default="")
+    whitespace_parser.add_argument("--revision", default="main", help="Upload branch")
+
     # extract-metadata subcommand
     extract_parser = subparsers.add_parser(
         "extract-metadata", help="Extract metadata from unindexed webdataset shards"
@@ -955,6 +975,13 @@ def main():
         except Exception as exc:
             print(f"Error uploading capture queue: {exc}", file=sys.stderr)
             sys.exit(1)
+    elif args.command == "whitespace-crop":
+        try:
+            from .whitespace import scan_whitespace
+
+            print(json.dumps(scan_whitespace(args)))
+        except Exception as exc:
+            parser.exit(1, f"Error scanning whitespace: {exc}\n")
     elif args.command == "extract-metadata":
         extract_metadata(args)
     elif args.command == "optimize-captions":

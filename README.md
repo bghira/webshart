@@ -488,6 +488,46 @@ Hub reads accept `hf_token=` and also honor `HF_TOKEN`. This includes gated
 datasets and separately hosted metadata. Local discovery recursively pairs tar
 and JSON indexes, preserving their relative subdirectories.
 
+### Scanning whitespace in indexed TAR images
+
+Install `webshart[scan]`. The scanner accepts local directories and Hugging Face
+datasets, including separate structured-caption indexes. This command scans the
+first shard into a local directory.
+
+```bash
+webshart whitespace-crop \
+  --source laion/conceptual-captions-12m-webdataset \
+  --metadata webshart/cc12m-structured-captions \
+  --destination cc12m-whitespace --workers 4 --range 0,1
+```
+
+Each readable image gets `white_fraction` and `black_fraction` between 0 and
+1, measured over the entire original image. White requires **all three** RGB
+channels to be at least 242. Black requires all three to be at most 13.
+Use `--white-threshold` and `--black-threshold` to adjust those cutoffs.
+For example, `row["white_fraction"] >= 0.98` selects images that are at
+least 98% near-white, including white-background product photos.
+
+`whitespace_crop`, when present, is a Pillow-style pixel rectangle
+`[left, top, right, bottom]` with exclusive right and bottom coordinates.
+Apply it **after EXIF orientation**. Only contiguous near-white strips on the
+outside can be removed. By default the detector keeps a margin of 4% of the
+shorter edge (at least two pixels), caps removal at 15% per side, and requires
+at least one side to lose 2% of its dimension. Use `--tight` for the bounding
+rectangle of *all* nonwhite pixels. A solid white image has `white_fraction: 1`
+and no crop. Black borders contribute to `black_fraction`. Transparent pixels
+are composited on white. Animated images use the first frame. JPEG XL requires
+a Pillow JPEG XL decoder such as `pillow-jxl-plugin`.
+
+The scanner pins Hub inputs to revisions, stages one TAR at a time, and bounds
+in-flight images by `--workers`. Use `--cache-dir` to retain Hub downloads
+between runs. Output indexes preserve captions, annotations, and original
+geometry. Consumers applying a crop must also transform spatial annotations.
+Unreadable or oversized images are logged and counted with no measurements.
+Each completed index is replaced atomically. Use a half-open `--range START,END`
+to scan or repeat specific shards. Add `--push-to-hub REPO_ID` to upload the
+selected indexes to an existing dataset repository after the scan succeeds.
+
 ### Aspect Bucketing Samples
 
 `list_shard_aspect_buckets()` is file-oriented and buckets any indexed file that has `width` and `height`.
