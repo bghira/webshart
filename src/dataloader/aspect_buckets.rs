@@ -121,26 +121,6 @@ impl BucketKeyType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BucketSamplingStrategy {
-    Sequential,
-    RandomWithinBuckets,
-    FullyRandom,
-}
-
-impl BucketSamplingStrategy {
-    pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "sequential" => Ok(Self::Sequential),
-            "random_within_buckets" => Ok(Self::RandomWithinBuckets),
-            "fully_random" => Ok(Self::FullyRandom),
-            _ => Err(WebshartError::InvalidShardFormat(
-                "sampling_strategy must be 'sequential', 'random_within_buckets', or 'fully_random'".to_string()
-            )),
-        }
-    }
-}
-
 pub fn calculate_bucket_key(
     key_type: &BucketKeyType,
     width: u32,

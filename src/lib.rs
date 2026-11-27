@@ -17,7 +17,7 @@ mod transform_cache;
 mod url_images;
 mod xet;
 // Re-export main types
-use dataloader::{scale_dimensions, PyBucketDataLoader, PyTarDataLoader, PyTarFileEntry};
+use dataloader::{scale_dimensions, PyTarDataLoader, PyTarFileEntry};
 pub use dataloader::{AspectBucketIterator, BatchOperations, BatchResult, FileReadRequest};
 pub use discovery::{DatasetDiscovery, DiscoveredDataset};
 pub use error::{Result, WebshartError};
@@ -45,7 +45,6 @@ fn _webshart(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<extract::PyMetadataExtractor>()?;
     m.add_class::<PyTarDataLoader>()?;
     m.add_class::<PyTarFileEntry>()?;
-    m.add_class::<PyBucketDataLoader>()?;
     m.add_class::<s3::PyS3Store>()?;
     m.add_class::<parquet::PyParquetCache>()?;
     m.add_class::<jxl::DecodedJxlImage>()?;

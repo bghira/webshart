@@ -29,11 +29,11 @@ from webshart._webshart import (
     BatchOperations,
     MetadataExtractor,
     TarDataLoader,
-    BucketDataLoader,
     TransformCache,
     DecodedJxlImage,
     JxlDecodeError,
 )
+from .buckets import BucketDataLoader
 from .optimize import DEFAULT_PAYLOAD_EXTENSIONS, optimize_dataset
 from .parquet import (
     ParquetDataset,

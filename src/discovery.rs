@@ -1435,6 +1435,11 @@ pub struct PyDiscoveredDataset {
     pub inner: DiscoveredDataset,
 }
 
+#[pyclass]
+struct TarShardLease {
+    _guard: crate::dataloader::shard_cache::ShardLockGuard,
+}
+
 #[pymethods]
 impl PyDiscoveredDataset {
     /// Permanently rename a top-level field in every file entry in the shard indexes.
@@ -1626,6 +1631,90 @@ impl PyDiscoveredDataset {
     fn open_shard(&mut self, shard_index: usize) -> PyResult<PyShardReader> {
         let reader = self.inner.open_shard(shard_index)?;
         Ok(PyShardReader { inner: reader })
+    }
+
+    /// Ordered source and metadata locations without opening any shard.
+    fn shard_locations(&self) -> Vec<(&str, &str)> {
+        self.inner
+            .shards
+            .iter()
+            .map(|shard| (shard.tar_path.as_str(), shard.json_path.as_str()))
+            .collect()
+    }
+
+    fn _prefill_size(&mut self, py: Python, index: usize) -> PyResult<u64> {
+        Ok(py.detach(|| self.inner.shard_metadata_summary(index))?.size)
+    }
+
+    fn _prefill_acquire(&self, py: Python, index: usize) -> PyResult<TarShardLease> {
+        let cache =
+            self.inner.shard_cache.as_ref().ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("Enable a shard cache first")
+            })?;
+        let shard = self
+            .inner
+            .shards
+            .get(index)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("Invalid shard index"))?;
+        let path = &shard.tar_path;
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let (_, guard) = py.detach(|| {
+            self.inner.runtime.block_on(cache.cache_shard_for_reading(
+                name,
+                path,
+                self.inner.get_hf_token(),
+            ))
+        })?;
+        Ok(TarShardLease { _guard: guard })
+    }
+
+    #[pyo3(signature = (*, active_shards=1, shuffle_seed=None, group_size=1, prefix_groups=0))]
+    fn sequential_prefill(
+        &self,
+        py: Python,
+        active_shards: usize,
+        shuffle_seed: Option<u64>,
+        group_size: usize,
+        prefix_groups: usize,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let Some(cache) = &self.inner.shard_cache else {
+            return Ok(None);
+        };
+        if !self.inner.is_remote {
+            return Ok(None);
+        }
+        // Sizing loads metadata mutably; downloads can run concurrently on another handle.
+        let sizes = Py::new(
+            py,
+            Self {
+                inner: self.inner.clone(),
+            },
+        )?;
+        let reads = Py::new(
+            py,
+            Self {
+                inner: self.inner.clone(),
+            },
+        )?;
+        let create = py
+            .import("webshart.parquet_prefill")?
+            .getattr("tar_shard_prefill")?;
+        Ok(Some(
+            create
+                .call1((
+                    self.inner.num_shards(),
+                    &cache.cache_dir,
+                    cache.cache_limit_bytes,
+                    cache.parallel_downloads,
+                    sizes.getattr(py, "_prefill_size")?,
+                    reads.getattr(py, "_prefill_acquire")?,
+                    active_shards,
+                    shuffle_seed,
+                    group_size,
+                    prefix_groups,
+                ))?
+                .unbind(),
+        ))
     }
 
     #[pyo3(signature = (location, cache_limit_gb=25.0, parallel_downloads=4))]
