@@ -173,13 +173,6 @@ impl PyTarFileEntry {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct BucketEntry {
-    pub shard_idx: usize,
-    pub filename: String,
-    pub file_info: crate::metadata::FileInfo,
-}
-
 pub fn create_tar_entry(
     path: String,
     file_info: &FileInfo,

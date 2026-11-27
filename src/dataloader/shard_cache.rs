@@ -54,8 +54,9 @@ struct CachedShard {
 
 #[derive(Debug, Clone)]
 pub struct ShardCache {
-    cache_dir: PathBuf,
-    cache_limit_bytes: u64,
+    pub(crate) cache_dir: PathBuf,
+    pub(crate) cache_limit_bytes: u64,
+    pub(crate) parallel_downloads: usize,
     current_size_bytes: Arc<Mutex<u64>>,
     lru_queue: Arc<Mutex<VecDeque<String>>>,
     shard_sizes: Arc<Mutex<HashMap<String, u64>>>,
@@ -67,6 +68,7 @@ impl ShardCache {
     pub fn new(cache_dir: PathBuf, cache_limit_gb: f64, parallel_downloads: usize) -> Self {
         Self {
             cache_dir,
+            parallel_downloads,
             cache_limit_bytes: (cache_limit_gb * 1024.0 * 1024.0 * 1024.0) as u64,
             current_size_bytes: Arc::new(Mutex::new(0)),
             lru_queue: Arc::new(Mutex::new(VecDeque::new())),

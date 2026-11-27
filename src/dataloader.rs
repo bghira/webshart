@@ -5,7 +5,6 @@ use crate::prefetch::{PrefetchIterator, Sample, ShardOrder};
 use crate::FileInfo;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
-use rand::{rng, seq::SliceRandom};
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs;
@@ -265,13 +264,13 @@ pub(crate) mod file_loading;
 pub mod shard_cache;
 use crate::impl_batch_iterator;
 use crate::metadata::ensure_shard_metadata_with_retry;
-use aspect_buckets::{calculate_bucket_key, BucketKeyType, BucketSamplingStrategy};
+use aspect_buckets::{calculate_bucket_key, BucketKeyType};
 pub use aspect_buckets::{
     scale_dimensions_with_multiple, AspectBucketEntry, AspectBucketIterator, AspectBuckets,
 };
 pub use batch::{BatchIterable, BatchOperations, BatchResult, FileReadRequest, PyBatchOperations};
 use config::DataLoaderConfig;
-pub use entry_types::{create_tar_entry, BucketEntry, PyTarFileEntry};
+pub use entry_types::{create_tar_entry, PyTarFileEntry};
 use file_loading::{create_file_loader, file_http_client};
 
 // Generate batch iterators using the macro
@@ -279,13 +278,6 @@ impl_batch_iterator!(
     PyBatchIterator,
     "PyBatchIterator",
     PyTarDataLoader,
-    PyTarFileEntry
-);
-
-impl_batch_iterator!(
-    PyBucketBatchIterator,
-    "PyBucketBatchIterator",
-    PyBucketDataLoader,
     PyTarFileEntry
 );
 
@@ -598,7 +590,8 @@ impl PyTarDataLoader {
         start_shard_position: usize,
     ) -> PyResult<PrefetchIterator> {
         let num_shards = self.dataset.lock().unwrap().num_shards();
-        if start_shard_position > num_shards || (shuffle_seed.is_none() && start_shard_position != 0)
+        if start_shard_position > num_shards
+            || (shuffle_seed.is_none() && start_shard_position != 0)
         {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "start_shard_position requires a shuffle seed and a position within the dataset",
@@ -1166,11 +1159,13 @@ impl PyTarDataLoader {
     }
 
     /// Load a logical sample, or return None when it exceeds max_file_size.
+    #[pyo3(signature = (shard_idx, sample_idx, *, load_sidecars=true))]
     fn load_sample(
         &self,
         py: Python,
         shard_idx: usize,
         sample_idx: usize,
+        load_sidecars: bool,
     ) -> PyResult<Option<PyTarFileEntry>> {
         py.detach(|| {
             let mut dataset = self.dataset.lock().unwrap();
@@ -1221,6 +1216,9 @@ impl PyTarDataLoader {
                 Some(shard_idx),
                 Some(sample_idx),
             );
+            if !load_sidecars {
+                return Ok(Some(entry));
+            }
             entry.json_data =
                 self.load_json_sidecar_bytes(&tar_path, &file_info, is_remote, token.clone())?;
             entry.captions = self.load_caption_value(
@@ -1386,7 +1384,7 @@ impl PyTarDataLoader {
         shard_idx: usize,
         sample_idx: usize,
     ) -> PyResult<Option<Py<PyBytes>>> {
-        let Some(entry) = self.load_sample(py, shard_idx, sample_idx)? else {
+        let Some(entry) = self.load_sample(py, shard_idx, sample_idx, true)? else {
             return Ok(None);
         };
         Ok(entry
@@ -1648,46 +1646,6 @@ impl PyTarDataLoader {
             .and_then(|data| serde_json::from_slice(data).ok())
             .as_ref()
             .and_then(ShardMetadata::extract_caption_value))
-    }
-
-    pub(crate) fn load_file_by_info(
-        &self,
-        shard_idx: usize,
-        file_path: &str,
-        file_info: &FileInfo,
-    ) -> PyResult<Option<PyTarFileEntry>> {
-        let dataset = self.dataset.lock().unwrap();
-        let shard = dataset.shards.get(shard_idx).ok_or_else(|| {
-            WebshartError::InvalidShardFormat("Shard index out of range".to_string())
-        })?;
-
-        let tar_path = shard.tar_path.clone();
-        let is_remote = dataset.is_remote;
-        let token = if is_remote {
-            dataset.get_hf_token()
-        } else {
-            None
-        };
-
-        drop(dataset);
-
-        if file_info.length > self.config.max_file_size {
-            return Ok(None);
-        }
-
-        let data = if self.config.load_file_data {
-            self.load_single_file_data(&tar_path, file_info, is_remote, token)?
-        } else {
-            Vec::new()
-        };
-
-        Ok(Some(create_tar_entry(
-            file_path.to_string(),
-            file_info,
-            data,
-            Some(shard_idx),
-            None,
-        )))
     }
 
     pub(crate) fn get_shard_aspect_buckets_internal(
@@ -2569,467 +2527,6 @@ impl PyTarDataLoader {
                 Ok(())
             }
         }
-    }
-}
-
-#[pyclass(name = "BucketDataLoader")]
-pub struct PyBucketDataLoader {
-    tar_loader: Py<PyTarDataLoader>,
-    buckets: BTreeMap<String, Vec<BucketEntry>>,
-    bucket_keys: Vec<String>,
-    processed_shards: Vec<bool>,
-    next_shard_to_process: usize,
-    current_bucket_idx: usize,
-    current_entry_idx: usize,
-    sampling_strategy: BucketSamplingStrategy,
-    randomized_entries: Option<Vec<(String, usize)>>,
-    random_position: usize,
-    key_type: String,
-    target_pixel_area: Option<u32>,
-    target_resolution_multiple: u32,
-    round_to: Option<usize>,
-    lazy_load: bool,
-    shard_batch_size: usize,
-    batch_size: Option<usize>,
-}
-
-impl BatchIterable<PyTarFileEntry> for PyBucketDataLoader {
-    fn next_item(&mut self) -> PyResult<Option<PyTarFileEntry>> {
-        Python::attach(|py| self.next_entry(py))
-    }
-
-    fn get_batch_size(&self) -> Option<usize> {
-        self.batch_size
-    }
-}
-
-#[pymethods]
-impl PyBucketDataLoader {
-    #[allow(clippy::too_many_arguments)] // Preserve the Python constructor signature.
-    #[new]
-    #[pyo3(signature = (
-        dataset_or_path,
-        key="aspect",
-        target_pixel_area=None,
-        target_resolution_multiple=64,
-        round_to=Some(2),
-        sampling_strategy="sequential",
-        load_file_data=true,
-        max_file_size=50_000_000,
-        hf_token=None,
-        chunk_size_mb=10,
-        lazy_load=true,
-        shard_batch_size=10,
-        batch_size=None
-    ))]
-    fn new(
-        py: Python,
-        dataset_or_path: &Bound<'_, PyAny>,
-        key: &str,
-        target_pixel_area: Option<u32>,
-        target_resolution_multiple: u32,
-        round_to: Option<usize>,
-        sampling_strategy: &str,
-        load_file_data: bool,
-        max_file_size: u64,
-        hf_token: Option<String>,
-        chunk_size_mb: usize,
-        lazy_load: bool,
-        shard_batch_size: usize,
-        batch_size: Option<usize>,
-    ) -> PyResult<Self> {
-        let sampling = BucketSamplingStrategy::parse(sampling_strategy)?;
-
-        let tar_loader = PyTarDataLoader::new(
-            dataset_or_path,
-            load_file_data,
-            max_file_size,
-            100, // Default buffer size
-            hf_token.clone(),
-            chunk_size_mb,
-            batch_size,
-        )?;
-
-        let num_shards = tar_loader.num_shards();
-        let tar_loader_py = Py::new(py, tar_loader)?;
-
-        let mut loader = Self {
-            tar_loader: tar_loader_py,
-            buckets: BTreeMap::new(),
-            bucket_keys: Vec::new(),
-            processed_shards: vec![false; num_shards],
-            next_shard_to_process: 0,
-            current_bucket_idx: 0,
-            current_entry_idx: 0,
-            sampling_strategy: sampling,
-            randomized_entries: None,
-            random_position: 0,
-            key_type: key.to_string(),
-            target_pixel_area,
-            target_resolution_multiple,
-            round_to,
-            lazy_load,
-            shard_batch_size: shard_batch_size.max(1),
-            batch_size,
-        };
-
-        if !lazy_load || sampling == BucketSamplingStrategy::FullyRandom {
-            println!("[webshart] Building all buckets upfront");
-            loader.build_all_buckets(py)?;
-        } else {
-            println!("[webshart] Lazy mode enabled: buckets will be built on demand");
-            loader.ensure_buckets_available(py)?;
-        }
-
-        Ok(loader)
-    }
-
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyTarFileEntry>> {
-        Python::attach(|py| slf.next_entry(py))
-    }
-
-    fn next_batch(&mut self) -> PyResult<Option<Vec<PyTarFileEntry>>> {
-        Python::attach(|_py| <Self as BatchIterable<PyTarFileEntry>>::next_batch(self))
-    }
-
-    fn iter_batches(slf: PyRef<'_, Self>) -> PyResult<PyBucketBatchIterator> {
-        if slf.batch_size.is_none() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "batch_size must be set to use iter_batches()",
-            ));
-        }
-        Ok(PyBucketBatchIterator { loader: slf.into() })
-    }
-
-    fn reset(&mut self, py: Python) -> PyResult<()> {
-        self.current_bucket_idx = 0;
-        self.current_entry_idx = 0;
-        self.random_position = 0;
-        self.next_shard_to_process = 0;
-
-        self.processed_shards.fill(false);
-        self.buckets.clear();
-        self.bucket_keys.clear();
-        self.randomized_entries = None;
-
-        self.tar_loader.borrow_mut(py).reset()?;
-
-        if !self.lazy_load || self.sampling_strategy == BucketSamplingStrategy::FullyRandom {
-            self.build_all_buckets(py)?;
-        } else {
-            self.ensure_buckets_available(py)?;
-        }
-
-        Ok(())
-    }
-
-    fn get_bucket_stats(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-
-        dict.set_item("num_buckets", self.buckets.len())?;
-        dict.set_item("sampling_strategy", format!("{:?}", self.sampling_strategy))?;
-        dict.set_item("lazy_load", self.lazy_load)?;
-        dict.set_item(
-            "shards_processed",
-            self.processed_shards.iter().filter(|&&x| x).count(),
-        )?;
-        dict.set_item("total_shards", self.processed_shards.len())?;
-        dict.set_item("batch_size", self.batch_size)?;
-
-        let mut total_files = 0;
-        let mut min_files = usize::MAX;
-        let mut max_files = 0;
-
-        let bucket_details = PyDict::new(py);
-        for (key, entries) in &self.buckets {
-            let count = entries.len();
-            total_files += count;
-            min_files = min_files.min(count);
-            max_files = max_files.max(count);
-
-            bucket_details.set_item(key, count)?;
-        }
-
-        dict.set_item("total_files_loaded", total_files)?;
-        dict.set_item(
-            "min_files_per_bucket",
-            if min_files == usize::MAX {
-                0
-            } else {
-                min_files
-            },
-        )?;
-        dict.set_item("max_files_per_bucket", max_files)?;
-        dict.set_item(
-            "avg_files_per_bucket",
-            if self.buckets.is_empty() {
-                0.0
-            } else {
-                total_files as f64 / self.buckets.len() as f64
-            },
-        )?;
-        dict.set_item("bucket_details", bucket_details)?;
-
-        Ok(dict.into_any().unbind())
-    }
-
-    fn get_current_bucket(&self) -> Option<String> {
-        if self.current_bucket_idx < self.bucket_keys.len() {
-            Some(self.bucket_keys[self.current_bucket_idx].clone())
-        } else {
-            None
-        }
-    }
-
-    #[getter]
-    fn batch_size(&self) -> Option<usize> {
-        self.batch_size
-    }
-
-    #[setter]
-    fn set_batch_size(&mut self, batch_size: Option<usize>) {
-        self.batch_size = batch_size;
-    }
-
-    fn skip_to_bucket(&mut self, py: Python, bucket_key: &str) -> PyResult<()> {
-        if self.lazy_load && !self.buckets.contains_key(bucket_key) {
-            while self.next_shard_to_process < self.processed_shards.len() {
-                self.process_shard_batch(py)?;
-                if self.buckets.contains_key(bucket_key) {
-                    break;
-                }
-            }
-        }
-
-        if let Some(idx) = self.bucket_keys.iter().position(|k| k == bucket_key) {
-            self.current_bucket_idx = idx;
-            self.current_entry_idx = 0;
-            Ok(())
-        } else {
-            Err(
-                WebshartError::InvalidShardFormat(format!("Bucket '{}' not found", bucket_key))
-                    .into(),
-            )
-        }
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "BucketDataLoader(buckets={}, strategy={:?}, current_bucket={}, lazy={}, shards_processed={}/{}, batch_size={:?})",
-            self.buckets.len(),
-            self.sampling_strategy,
-            self.current_bucket_idx,
-            self.lazy_load,
-            self.processed_shards.iter().filter(|&&x| x).count(),
-            self.processed_shards.len(),
-            self.batch_size
-        )
-    }
-}
-
-impl PyBucketDataLoader {
-    fn build_all_buckets(&mut self, py: Python) -> PyResult<()> {
-        let num_shards = self.tar_loader.borrow(py).num_shards();
-
-        self.buckets.clear();
-
-        for shard_idx in 0..num_shards {
-            println!(
-                "[webshart] Processing shard {}/{}",
-                shard_idx + 1,
-                num_shards
-            );
-            self.add_shard_to_buckets(py, shard_idx)?;
-        }
-
-        self.processed_shards.fill(true);
-        self.next_shard_to_process = num_shards;
-        self.finalize_buckets()?;
-
-        Ok(())
-    }
-
-    fn ensure_buckets_available(&mut self, py: Python) -> PyResult<()> {
-        if self.current_bucket_idx >= self.bucket_keys.len()
-            && self.next_shard_to_process < self.processed_shards.len()
-        {
-            self.process_shard_batch(py)?;
-        }
-        Ok(())
-    }
-
-    fn process_shard_batch(&mut self, py: Python) -> PyResult<()> {
-        let start = self.next_shard_to_process;
-        let end = (start + self.shard_batch_size).min(self.processed_shards.len());
-
-        if start >= end {
-            return Ok(());
-        }
-
-        println!(
-            "[webshart] Processing shards {}-{} (lazy loading)",
-            start + 1,
-            end
-        );
-
-        for shard_idx in start..end {
-            if !self.processed_shards[shard_idx] {
-                self.add_shard_to_buckets(py, shard_idx)?;
-            }
-        }
-
-        self.next_shard_to_process = end;
-        self.update_bucket_keys();
-
-        Ok(())
-    }
-
-    fn add_shard_to_buckets(&mut self, py: Python, shard_idx: usize) -> PyResult<()> {
-        let tar_loader = self.tar_loader.borrow(py);
-        let shard_buckets = tar_loader.get_shard_aspect_buckets_internal(
-            shard_idx,
-            &self.key_type,
-            self.target_pixel_area,
-            Some(self.target_resolution_multiple),
-            self.round_to,
-        )?;
-
-        for (bucket_key, entries) in shard_buckets.buckets {
-            for bucket_entry in entries {
-                let entry = BucketEntry {
-                    shard_idx,
-                    filename: bucket_entry.filename,
-                    file_info: bucket_entry.file_info,
-                };
-
-                self.buckets
-                    .entry(bucket_key.clone())
-                    .or_default()
-                    .push(entry);
-            }
-        }
-
-        self.processed_shards[shard_idx] = true;
-        Ok(())
-    }
-
-    fn update_bucket_keys(&mut self) {
-        let mut new_keys: Vec<String> = self
-            .buckets
-            .keys()
-            .filter(|k| !self.bucket_keys.contains(k))
-            .cloned()
-            .collect();
-
-        new_keys.sort();
-        self.bucket_keys.extend(new_keys);
-
-        if self.sampling_strategy == BucketSamplingStrategy::RandomWithinBuckets {
-            let mut rng = rng();
-            for entries in self.buckets.values_mut() {
-                entries.shuffle(&mut rng);
-            }
-        }
-    }
-
-    fn finalize_buckets(&mut self) -> PyResult<()> {
-        self.bucket_keys = self.buckets.keys().cloned().collect();
-
-        match self.sampling_strategy {
-            BucketSamplingStrategy::RandomWithinBuckets => {
-                let mut rng = rng();
-                for entries in self.buckets.values_mut() {
-                    entries.shuffle(&mut rng);
-                }
-            }
-            BucketSamplingStrategy::FullyRandom => {
-                let mut all_entries = Vec::new();
-                for (bucket_key, entries) in &self.buckets {
-                    for (idx, _) in entries.iter().enumerate() {
-                        all_entries.push((bucket_key.clone(), idx));
-                    }
-                }
-
-                let mut rng = rng();
-                all_entries.shuffle(&mut rng);
-                self.randomized_entries = Some(all_entries);
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    fn next_entry(&mut self, py: Python) -> PyResult<Option<PyTarFileEntry>> {
-        if self.lazy_load {
-            self.ensure_buckets_available(py)?;
-        }
-
-        match self.sampling_strategy {
-            BucketSamplingStrategy::Sequential => self.next_sequential(py),
-            BucketSamplingStrategy::RandomWithinBuckets => self.next_random_within_buckets(py),
-            BucketSamplingStrategy::FullyRandom => self.next_fully_random(py),
-        }
-    }
-
-    fn next_sequential(&mut self, py: Python) -> PyResult<Option<PyTarFileEntry>> {
-        loop {
-            if self.current_bucket_idx >= self.bucket_keys.len() {
-                if self.lazy_load && self.next_shard_to_process < self.processed_shards.len() {
-                    self.process_shard_batch(py)?;
-                    continue;
-                }
-                return Ok(None);
-            }
-
-            let bucket_key = &self.bucket_keys[self.current_bucket_idx];
-            if let Some(entries) = self.buckets.get(bucket_key) {
-                if self.current_entry_idx >= entries.len() {
-                    self.current_bucket_idx += 1;
-                    self.current_entry_idx = 0;
-                    continue;
-                }
-
-                let entry = &entries[self.current_entry_idx];
-                self.current_entry_idx += 1;
-
-                return self.load_entry(py, entry);
-            } else {
-                self.current_bucket_idx += 1;
-                self.current_entry_idx = 0;
-            }
-        }
-    }
-
-    fn next_random_within_buckets(&mut self, py: Python) -> PyResult<Option<PyTarFileEntry>> {
-        self.next_sequential(py)
-    }
-
-    fn next_fully_random(&mut self, py: Python) -> PyResult<Option<PyTarFileEntry>> {
-        if let Some(randomized) = &self.randomized_entries {
-            if self.random_position >= randomized.len() {
-                return Ok(None);
-            }
-
-            let (bucket_key, entry_idx) = &randomized[self.random_position];
-            self.random_position += 1;
-
-            let entries = self.buckets.get(bucket_key).unwrap();
-            let entry = &entries[*entry_idx];
-
-            self.load_entry(py, entry)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn load_entry(&self, py: Python, entry: &BucketEntry) -> PyResult<Option<PyTarFileEntry>> {
-        let tar_loader = self.tar_loader.borrow(py);
-        tar_loader.load_file_by_info(entry.shard_idx, &entry.filename, &entry.file_info)
     }
 }
 

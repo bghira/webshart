@@ -557,9 +557,8 @@ This uses logical samples from `metadata.sample_range()` / `get_sample_by_index(
 
 ## Parquet Payloads With Custom Metadata
 
-The Parquet API is available starting with webshart 0.7.0. Existing tar APIs
-keep their behavior. Use `ParquetDataLoader`, not
-`TarDataLoader` or `BucketDataLoader`, for Parquet sources:
+For direct Parquet row access use `ParquetDataLoader`. For aspect batches use
+`BucketDataLoader` with a discovered TAR or Parquet dataset:
 
 ```python
 dataset = webshart.discover_dataset(
@@ -725,6 +724,25 @@ it reads resident shards locally. Sparse requests for flat binary image columns
 fetch Parquet ranges on a cache miss and skip intervening data pages. Other
 projections and requests for every row of a shard still populate the cache.
 Transfer size depends on the page layout and any required dictionary pages.
+For aspect-homogeneous batches, pass either a discovered TAR dataset or a
+discovered Parquet dataset to the same loader:
+
+```python
+with webshart.BucketDataLoader(dataset, batch_size=8, shard_batch_size=4,
+                               shuffle_seed=42, sampling_strategy="random_within_buckets") as loader:
+    for batch in loader.iter_batches():
+        train(batch)
+        checkpoint = loader.state_dict()
+```
+
+The seed determines the physical shard order. Lazy iteration holds one shard
+group plus unfinished aspect batches. A bucket can fill from later groups.
+At epoch end each remaining aspect emits its own partial batch. The
+`fully_random` strategy builds all bucket locations up front. To resume,
+construct a loader with the same dataset and options and call
+`load_state_dict(checkpoint)`. Samples retain their format-specific payload
+types. Metadata-only iteration skips payload reads.
+
 Sequential consumers can call `cursor = dataset.sequential_prefill(active_shards=4)`
 after enabling the remote disk cache. At each window, call `cursor.advance(first_position)`
 with the start position in the read order. Pass the same `shuffle_seed` to

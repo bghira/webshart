@@ -661,19 +661,10 @@ class ParquetDataset:
         """Read whole shards into the remote cache in physical or seeded order."""
         if self._shard_cache is None or self._source_repo.local:
             return None
-        from .parquet_prefill import GroupedShardOrder, SequentialShardPrefill
+        from .parquet_prefill import SequentialShardPrefill, shard_order
 
         directory, budget, parallelism = self._prefill_settings
-        group_size = _integer(group_size, "group_size", 1)
-        prefix_groups = _integer(prefix_groups, "prefix_groups")
-        if group_size != 1 or prefix_groups:
-            if shuffle_seed is None:
-                raise ValueError("group_size and prefix_groups require a shuffle seed")
-            order = GroupedShardOrder(self.num_shards, group_size, prefix_groups, shuffle_seed)
-        elif shuffle_seed is None:
-            order = range(self.num_shards)
-        else:
-            order = _shuffled_shard_order(self.num_shards, shuffle_seed)
+        order = shard_order(self.num_shards, shuffle_seed, group_size, prefix_groups)
         return SequentialShardPrefill(
             directory,
             budget,

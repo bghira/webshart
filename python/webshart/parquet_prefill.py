@@ -1,6 +1,7 @@
 """Byte-bounded whole-shard read-ahead for a sequential Parquet consumer."""
 
 import logging
+from pathlib import Path
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from operator import index
@@ -36,11 +37,33 @@ class GroupedShardOrder:
         return position
 
 
+def shard_order(count, shuffle_seed, group_size, prefix_groups):
+    from .parquet import _integer
+
+    group_size = _integer(group_size, "group_size", 1)
+    prefix_groups = _integer(prefix_groups, "prefix_groups")
+    if group_size != 1 or prefix_groups:
+        if shuffle_seed is None:
+            raise ValueError("group_size and prefix_groups require a shuffle seed")
+        return GroupedShardOrder(count, group_size, prefix_groups, shuffle_seed)
+    return range(count) if shuffle_seed is None else _shuffled_shard_order(count, shuffle_seed)
+
+
+def tar_shard_prefill(count, directory, budget, parallelism, shard_size, acquire,
+                      active_shards, shuffle_seed, group_size, prefix_groups):
+    from .parquet import _integer
+
+    return SequentialShardPrefill(
+        directory, budget, parallelism, shard_order(count, shuffle_seed, group_size, prefix_groups),
+        shard_size, acquire, _integer(active_shards, "active_shards", 1),
+    )
+
+
 class SequentialShardPrefill:
     def __init__(
         self, directory, budget, parallelism, order, shard_size, acquire, active_shards
     ):
-        self.directory = directory
+        self.directory = Path(directory)
         self.budget = budget
         self.parallelism = parallelism
         self.active_shards = active_shards
