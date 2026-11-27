@@ -677,6 +677,36 @@ manifest I/O. Per-shard `sha256` fields in a capture manifest are compared with
 S3's `sha256` object metadata when that metadata is present; range reads retain
 their ETag checks.
 
+### Prepare Parquet image pages for sparse training reads
+
+Use `webshart repack-parquet` from the `scan` extra to rewrite a local shard.
+Point it at the flat binary columns containing the image bytes:
+
+```bash
+webshart repack-parquet --source original/part.parquet --destination prepared/part.parquet --image-columns source_image edited_image
+```
+
+The writer targets 1 MiB data pages and disables dictionaries for the selected
+image columns. A large individual image can exceed that target. Each row group
+contains up to 128 rows. Before publishing the new file, the command reopens
+it and checks the schema, row order and values against the source. Use a fresh
+destination for each shard. A repacked file has a new physical size and digest.
+
+For repeated access to a Hub dataset, call the following after enabling its
+source shard cache. Install the `scan` extra for PyArrow.
+
+```python
+dataset.enable_repacked_cache("cache/repacked", cache_limit_gb=256)
+```
+
+Single-shard batches and sequential prefill build verified copies on demand.
+Multi-shard batches use resident copies or read from the original source.
+The cache key includes the pinned Hub URL and selected columns. Both views of
+a paired dataset can share the directory. By default all flat binary columns
+use the small-page layout. Pass `image_columns` to restrict it. Use a separate
+directory from the source cache. Allow additional disk space for a shard being
+written and for read leases held by other processes during eviction.
+
 ### Captured images on S3
 
 Native S3 access and batched row-group reads require webshart 0.8.0 or later.

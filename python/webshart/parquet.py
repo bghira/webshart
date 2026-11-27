@@ -436,6 +436,7 @@ class ParquetDataset:
         self._files: OrderedDict[int, _ParquetFile] = OrderedDict()
         self._verified_s3_etags: dict[int, str] = {}
         self._metadata_repo = None
+        self._repacked_cache = None
         self._shard_cache = None
         self._expected_source_revision = None
         self._local_digests = OrderedDict()
@@ -655,6 +656,35 @@ class ParquetDataset:
             parallel_downloads,
         )
 
+    def enable_repacked_cache(self, location, cache_limit_gb, image_columns=None):
+        """Keep verified, small-page copies of pinned Hub shards for batched image reads."""
+        if self._shard_cache is None or self._source_repo.local or self._source_repo.s3 is not None:
+            raise ValueError("Repacked caching requires a Hub dataset with a source shard cache")
+        if image_columns is not None and (not image_columns or isinstance(image_columns, str)):
+            raise ValueError("Provide a sequence of image column names")
+        if Path(location).resolve() == self._prefill_settings[0].resolve():
+            raise ValueError("Use separate directories for source and repacked shards")
+        self._repack_columns = None if image_columns is None else tuple(sorted(set(image_columns)))
+        self._repacked_cache = _ParquetCache(str(location), cache_limit_gb, 1)
+
+    def _repack_key(self, index):
+        url = self._source_repo.location(self._shard(index)["path"])
+        return json.dumps(["parquet-pages-v1", url, self._repack_columns], separators=(",", ":"))
+
+    def _prefill_shard(self, index):
+        if self._repacked_cache is None:
+            return self._file(index, payload=True).cache_shard(self._shard_cache)
+        key = self._repack_key(index)
+        ready = self._repacked_cache.repacked_shard(key)
+        if ready is not None:
+            return ready
+        from .repack import _write_verified_shard
+
+        original = self._file(index, payload=True).cache_shard(self._shard_cache)
+        return self._repacked_cache.repacked_shard(
+            key, lambda destination: _write_verified_shard(original.path, destination, self._repack_columns)
+        )
+
     def sequential_prefill(
         self, *, active_shards=1, shuffle_seed=None, group_size=1, prefix_groups=0
     ):
@@ -671,9 +701,7 @@ class ParquetDataset:
             parallelism,
             order,
             lambda index: self._shard(index)["size"],
-            lambda index: self._file(index, payload=True).cache_shard(
-                self._shard_cache
-            ),
+            self._prefill_shard,
             _integer(active_shards, "active_shards", 1),
         )
 
@@ -1412,7 +1440,18 @@ class ParquetDataLoader:
             metadata = self.dataset.read_metadata_rows(
                 shard, indices, fields=metadata_fields, parallel_reads=parallel_reads
             )
-            reader = self.dataset._file(shard, payload=single_shard)
+            lease = None
+            if self.dataset._repacked_cache is not None:
+                lease = (
+                    self.dataset._prefill_shard(shard) if single_shard
+                    else self.dataset._repacked_cache.repacked_shard(self.dataset._repack_key(shard))
+                )
+            if lease is None:
+                reader = self.dataset._file(shard, payload=single_shard)
+            else:
+                if self.dataset._expected_source_revision is not None:
+                    self.dataset._file(shard)
+                reader = _ParquetFile(str(lease.path), max_page_bytes=self.dataset.max_page_bytes)
             rows = reader.rows_at(
                 indices,
                 columns=self.image_columns,
@@ -1421,6 +1460,7 @@ class ParquetDataLoader:
                 cache_payload=True if single_shard else None,
                 **decode_columns,
             )
+            del lease
             for (position, row), result, sample_metadata in zip(
                 selected, rows, metadata, strict=True
             ):
