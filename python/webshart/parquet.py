@@ -1413,17 +1413,21 @@ class ParquetDataLoader:
         for position, (shard, row) in enumerate(requests):
             groups.setdefault(shard, []).append((position, row))
         output = [None] * len(requests)
+        # A scattered batch can revisit evicted shards behind the prefill cursor.
+        # Use resident shards, but leave the cache budget available for read-ahead.
+        single_shard = len(groups) == 1
         for shard, selected in groups.items():
             indices = [row for _, row in selected]
             metadata = self.dataset.read_metadata_rows(
                 shard, indices, fields=metadata_fields, parallel_reads=parallel_reads
             )
-            rows = self.dataset._file(shard, payload=True).rows_at(
+            reader = self.dataset._file(shard, payload=single_shard)
+            rows = reader.rows_at(
                 indices,
                 columns=self.image_columns,
                 parallel_reads=parallel_reads,
                 shard_cache=self.dataset._shard_cache,
-                cache_payload=True,
+                cache_payload=True if single_shard else None,
                 **decode_columns,
             )
             for (position, row), result, sample_metadata in zip(

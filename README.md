@@ -715,7 +715,12 @@ ETag. Reopen the dataset to verify the latest object revision.
 
 Metadata preparation coalesces selected column chunks into a bounded 64 MiB
 cache and leaves image columns unread. Whole-shard downloads begin on payload
-access. Sequential consumers can call `cursor = dataset.sequential_prefill(active_shards=4)`
+access for single-shard batches and scans. When `load_samples` spans shards,
+it reads resident shards locally. Sparse requests for flat binary image columns
+fetch Parquet ranges on a cache miss and skip intervening data pages. Other
+projections and requests for every row of a shard still populate the cache.
+Transfer size depends on the page layout and any required dictionary pages.
+Sequential consumers can call `cursor = dataset.sequential_prefill(active_shards=4)`
 after enabling the remote disk cache. At each window, call `cursor.advance(first_position)`
 with the start position in the read order. Pass the same `shuffle_seed` to
 `sequential_prefill()` and `iter_prefetched()` to use the same order. The
