@@ -175,6 +175,60 @@ def _read_cached_shard(options, cache, size, shard):
     return loader.load_samples([(shard, 0)], metadata_fields=())[0].data
 
 
+def test_sparse_paired_batch_uses_cached_shard_and_only_requested_pages(tmp_path):
+    objects = capture(tmp_path)
+    keys = ["parts/first.parquet", "parts/second.parquet"]
+    row_count = 64
+    values = []
+    for shard, key in enumerate(keys):
+        rows = [
+            {
+                "image": bytes([row, shard]) * 32768,
+                "source_image": bytes([shard, row]) * 32768 if row % 5 else None,
+            }
+            for row in range(row_count)
+        ]
+        path = tmp_path / key.split("/")[-1]
+        pq.write_table(
+            pa.Table.from_pylist(rows), path, row_group_size=row_count,
+            compression="none", use_dictionary=False, write_batch_size=1, data_page_size=1024,
+        )
+        objects[key] = path.read_bytes()
+        values.append(rows)
+    objects["catalog/manifest.jsonl"] = "".join(
+        json.dumps(dict(key=key, size_bytes=len(objects[key]), num_rows=row_count)) + "\n"
+        for key in keys
+    ).encode()
+    descriptor = json.loads(objects["combined/dataset.json"])
+    descriptor["manifest_sha256"] = hashlib.sha256(objects["catalog/manifest.jsonl"]).hexdigest()
+    objects["combined/dataset.json"] = json.dumps(descriptor).encode()
+    cache = tmp_path / "shards"
+    with s3_server(objects) as (options, calls, etags):
+        dataset = _open_single_shard_cache(options, cache, len(objects[keys[0]])).dataset
+        loader = ParquetDataLoader(dataset, image_columns=["source_image"])
+        loader.load_samples([(0, 0)], metadata_fields=())
+        (resident,) = cache.glob("*.parquet")
+        calls.clear()
+        refs = [(1, 63), (0, 2), (1, 5), (1, 63)]
+        result = loader.load_samples(refs, metadata_fields=())
+        assert [sample.payloads for sample in result] == [values[s][r] for s, r in refs]
+        assert list(cache.glob("*.parquet")) == [resident]
+        assert not any(key == keys[0] for _, key, _ in calls)
+        reads = [headers for method, key, headers in calls if method == "GET" and key == keys[1]]
+        assert reads and all(h.get("if-match") == etags[keys[1]] and "range" in h for h in reads)
+        spans = [h["range"][6:].split("-") for h in reads]
+        assert sum(int(b) - int(a) + 1 for a, b in spans) < len(objects[keys[1]]) // 8
+        original = etags[keys[1]]
+        etags[keys[1]] = '"replacement"'
+        with pytest.raises(OSError, match="S3 object changed"):
+            loader.load_samples(refs, metadata_fields=())
+        etags[keys[1]] = original
+        calls.clear()
+        complete = [(0, 0)] + [(1, row) for row in range(row_count)]
+        loader.load_samples(complete, metadata_fields=())
+        assert any(key == keys[1] and method == "GET" and "range" not in h for method, key, h in calls)
+
+
 def test_s3_cache_evicts_idle_readers_and_reopens_with_verified_etag(tmp_path):
     objects = capture(tmp_path)
     first = "parts/part.parquet"

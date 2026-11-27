@@ -10,12 +10,12 @@ use parquet::file::reader::{ChunkReader, FileReader, Length, RowGroupReader};
 use parquet::file::serialized_reader::SerializedRowGroupReader;
 use parquet::record::reader::RowIter;
 use parquet::record::{Field, Row};
-use parquet::schema::types::Type;
+use parquet::schema::types::{SchemaDescriptor, Type};
 use pyo3::exceptions::{PyIndexError, PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -396,6 +396,72 @@ fn binary_field(field: &Type) -> bool {
         ) && field.get_basic_info().logical_type_ref().is_none()
             && field.get_basic_info().converted_type() == parquet::basic::ConvertedType::NONE
     }
+}
+
+fn sparse_binary_columns(
+    schema: &SchemaDescriptor,
+    projection: &Type,
+) -> Option<Vec<(usize, String)>> {
+    projection
+        .get_fields()
+        .iter()
+        .map(|field| {
+            if field.is_group()
+                || !binary_field(field)
+                || field.get_physical_type() != PhysicalType::BYTE_ARRAY
+            {
+                return None;
+            }
+            let index = schema.columns().iter().position(|col| {
+                col.path().parts().len() == 1
+                    && col.name() == field.name()
+                    && col.max_rep_level() == 0
+            })?;
+            Some((index, field.name().to_owned()))
+        })
+        .collect()
+}
+
+// Flat binary image columns can skip whole pages and discard unrequested
+// records without constructing image values for intervening rows.
+fn sparse_binary_rows(
+    group: &impl RowGroupReader,
+    columns: &[(usize, String)],
+    selected: &[(usize, usize)],
+) -> ParquetResult<Vec<(usize, Row)>> {
+    let mut rows = vec![Vec::new(); selected.len()];
+    for (index, name) in columns {
+        let ColumnReader::ByteArrayColumnReader(mut column) = group.get_column_reader(*index)?
+        else {
+            return Err(parquet_error("Expected a binary image column"));
+        };
+        let mut cursor = 0;
+        let mut values = Vec::with_capacity(1);
+        let mut defs = Vec::with_capacity(1);
+        let mut output = rows.iter_mut();
+        for occurrences in selected.chunk_by(|a, b| a.0 == b.0) {
+            let wanted = occurrences[0].0;
+            if column.skip_records(wanted - cursor)? != wanted - cursor {
+                return Err(parquet_error("Parquet ended before requested row"));
+            }
+            values.clear();
+            defs.clear();
+            let (records, _, _) = column.read_records(1, Some(&mut defs), None, &mut values)?;
+            if records != 1 {
+                return Err(parquet_error("Parquet ended before requested row"));
+            }
+            let value = values.pop().map_or(Field::Null, Field::Bytes);
+            for fields in output.by_ref().take(occurrences.len()) {
+                fields.push((name.clone(), value.clone()));
+            }
+            cursor = wanted + 1;
+        }
+    }
+    Ok(selected
+        .iter()
+        .zip(rows)
+        .map(|(&(_, position), fields)| (position, Row::new(fields)))
+        .collect())
 }
 
 fn row_to_python(py: Python<'_>, row: &Row) -> PyResult<Py<PyAny>> {
@@ -989,7 +1055,7 @@ impl PyParquetFile {
     }
 
     /// Read each selected row group once, preserving request order and duplicates.
-    #[pyo3(signature=(indices, columns=None, parallel_reads=4, shard_cache=None, *, cache_payload=false, decode_jxl=None))]
+    #[pyo3(signature=(indices, columns=None, parallel_reads=4, shard_cache=None, *, cache_payload=Some(false), decode_jxl=None))]
     #[allow(clippy::too_many_arguments)]
     fn rows_at(
         &self,
@@ -998,7 +1064,7 @@ impl PyParquetFile {
         columns: Option<Vec<String>>,
         parallel_reads: usize,
         shard_cache: Option<PyRef<'_, PyParquetCache>>,
-        cache_payload: bool,
+        cache_payload: Option<bool>,
         decode_jxl: Option<(String, usize)>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         if parallel_reads == 0 {
@@ -1012,15 +1078,17 @@ impl PyParquetFile {
             .map(|(column, max_pixels)| Ok::<_, PyErr>((column, JxlOptions::new(max_pixels)?)))
             .transpose()?;
         let (rows, decoded) = py.detach(|| {
-            let reader = self.reader.with_cache(shard_cache, cache_payload);
-            let projection = project_columns(
-                reader
-                    .metadata()
-                    .file_metadata()
-                    .schema_descr()
-                    .root_schema(),
-                columns,
-            )?;
+            let schema = self.reader.metadata().file_metadata().schema_descr();
+            let projection = project_columns(schema.root_schema(), columns)?;
+            let sparse_columns = projection
+                .as_ref()
+                .and_then(|fields| sparse_binary_columns(schema, fields));
+            let populate = cache_payload.unwrap_or_else(|| {
+                sparse_columns.is_none()
+                    || (indices.len() >= self.num_rows
+                        && indices.iter().collect::<HashSet<_>>().len() == self.num_rows)
+            });
+            let reader = self.reader.with_cache(shard_cache, populate);
             let starts = &self.row_group_starts;
             let mut groups: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
             for (position, index) in indices.iter().copied().enumerate() {
@@ -1039,11 +1107,19 @@ impl PyParquetFile {
                     stream::iter(groups.into_iter().map(|(group, mut selected)| {
                         let reader = reader.clone();
                         let projection = projection.clone();
+                        let sparse_columns = sparse_columns.clone();
                         async move {
                             tokio::task::spawn_blocking(
                                 move || -> ParquetResult<Vec<(usize, Row)>> {
                                     selected.sort_unstable();
                                     let group_reader = reader.get_row_group(group)?;
+                                    if let Some(columns) = sparse_columns {
+                                        return sparse_binary_rows(
+                                            &group_reader,
+                                            &columns,
+                                            &selected,
+                                        );
+                                    }
                                     let mut rows =
                                         RowIter::from_row_group(projection, &group_reader)?
                                             .with_batch_size(1);

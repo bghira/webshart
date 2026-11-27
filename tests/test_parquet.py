@@ -16,6 +16,19 @@ import webshart
 from webshart._webshart import _ParquetFile
 
 
+@pytest.mark.parametrize("nullable", [False, True])
+@pytest.mark.parametrize("dictionary", [False, True])
+def test_sparse_binary_rows_preserve_nulls_order_and_duplicates(tmp_path, nullable, dictionary):
+    values = [None if nullable and i % 11 == 0 else bytes([i % 31]) * 300 for i in range(10000)]
+    schema = arrow.schema([arrow.field("image", arrow.binary(), nullable=nullable)])
+    table = arrow.Table.from_arrays([arrow.array(values, type=arrow.binary())], schema=schema)
+    path = tmp_path / "images.parquet"
+    parquet.write_table(table, path, row_group_size=1727, data_page_size=512, write_batch_size=8, use_dictionary=dictionary)
+    reader = _ParquetFile(str(path))
+    indices = [9999, 0, 22, 1727, 1726, 0, 22, 9999]
+    assert reader.rows_at(indices, columns=["image"]) == [{"image": values[i]} for i in indices]
+
+
 def write_source(root, rows=None, *, row_group_size=2, **kwargs):
     path = root / "task" / "part.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
