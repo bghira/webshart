@@ -53,6 +53,46 @@ entry = loader.load_sample(0, 0)
 print(entry.path, entry.captions, entry.json_metadata)
 ```
 
+### Published image-caption datasets
+
+**Photoroom Midjourney V6 Recap** has 1,235,432 images in 124 Parquet shards.
+The companion provides image dimensions and caption-availability flags. Webshart
+reads the selected caption and image from the pinned Photoroom revision.
+LLaVA is the default. Pass `caption_column="gemini"`, `"qwen3"`, or `"prompt"`
+to select another field. For Gemini and Qwen3, check both `<field>_present`
+and `<field>_status` when selecting rows. [Photoroom companion and coverage](https://huggingface.co/datasets/webshart/midjourney-v6-recap-metadata)
+
+```python
+import webshart
+
+dataset = webshart.discover_parquet_dataset(
+    "Photoroom/midjourney-v6-recap",
+    metadata="webshart/midjourney-v6-recap-metadata",
+)
+sample = next(webshart.ParquetDataLoader(dataset).iter_shard(0, stop=1))
+caption = sample.captions
+image_bytes = sample.data
+```
+
+**DALL·E 3 High Quality Captions** has 1,205,232 image entries across 69 TAR
+shards. Webshart fetches the image and its paired JSON record by byte range.
+Use `long_caption` for the detailed description or `short_caption` for its
+summary. The companion lists two entries containing HTML that callers can skip
+before decoding. [DALL·E 3 companion and scan results](https://huggingface.co/datasets/webshart/synthetic-dataset-1m-dalle3-high-quality-captions-metadata)
+
+```python
+import webshart
+
+dataset = webshart.discover_dataset(
+    "ProGamerGov/synthetic-dataset-1m-dalle3-high-quality-captions",
+    subfolder="data",
+    metadata="webshart/synthetic-dataset-1m-dalle3-high-quality-captions-metadata",
+)
+sample = webshart.TarDataLoader(dataset).load_sample(0, 0)
+caption = sample.captions["long_caption"]
+image_bytes = sample.data
+```
+
 ### Paired datasets
 
 Two datasets can remain independently loadable while also exposing an opt-in
