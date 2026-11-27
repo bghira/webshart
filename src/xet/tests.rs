@@ -528,6 +528,28 @@ async fn transfer_errors_do_not_expose_signed_urls() {
 }
 
 #[tokio::test]
+async fn shard_writer_verifies_ordered_bytes_before_cache_publication() {
+    let server = mockito::Server::new_async().await;
+    let mut file = test_file(&server, 6);
+    file.sha256 = Some(digest_to_hex(Sha256::digest(b"abcdef")));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("download.part");
+    for (chunks, valid) in [
+        (vec![b"ab".as_slice(), b"cdef"], true),
+        (vec![b"abc".as_slice()], false),
+        (vec![b"abcdefg".as_slice()], false),
+        (vec![b"def".as_slice(), b"abc"], false),
+    ] {
+        let result =
+            XetClient::write_verified(&file, &path, stream::iter(chunks.into_iter().map(Ok))).await;
+        assert_eq!(result.is_ok(), valid);
+        if valid {
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), b"abcdef");
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "downloads a public 287 MiB shard and checks independent HTTP ranges"]
 async fn live_public_hub_shard() {
     let url = "https://huggingface.co/datasets/webshart/pseudo-camera-10k-structured/resolve/3ad79f91c50aab9dc63cbae9daf2ec2c474c34af/data/shard-00018.tar";

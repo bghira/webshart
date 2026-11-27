@@ -195,6 +195,11 @@ Set `WEBSHART_XET_CONCURRENCY=1..64` before the first read to change that limit.
 `load_sample()` releases the Python GIL during I/O. Without a shard cache, only
 the requested sample ranges are reconstructed, not the entire archive.
 
+For large Hub shards, set `WEBSHART_XET_SHARD_SDK=1` to download whole files
+with the Hugging Face Rust Xet SDK. It manages its own chunk transfer concurrency.
+Webshart still controls shard prefetch, validates size and available SHA-256, and
+uses its native range reader for individual samples.
+
 Set `WEBSHART_DISABLE_XET=1` to explicitly use the ordinary HTTP path instead.
 `HF_ENDPOINT` selects the Hub origin recognized by the Xet transport for custom
 resolve URLs; it does not change repository discovery's Hub endpoint.
