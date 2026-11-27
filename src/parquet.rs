@@ -190,7 +190,32 @@ struct LocalShard {
 
 #[pyclass(name = "_ParquetShardLease")]
 struct PyParquetShardLease {
-    _shard: Arc<LocalShard>,
+    shard: Arc<LocalShard>,
+}
+
+#[pymethods]
+impl PyParquetShardLease {
+    #[getter]
+    fn path(&self) -> PathBuf {
+        self.shard.path.clone()
+    }
+}
+
+async fn cached_shard(cache: &ShardCache, name: &str) -> crate::Result<Option<LocalShard>> {
+    if !cache.is_cached(name).await {
+        return Ok(None);
+    }
+    match cache.lock_shard_for_reading(name).await {
+        Ok(guard) => {
+            cache.touch_shard(name).await;
+            Ok(Some(LocalShard {
+                path: cache.get_cached_shard_path(name),
+                _guard: guard,
+            }))
+        }
+        Err(WebshartError::CacheMiss(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 struct CacheRead {
@@ -231,18 +256,8 @@ impl CacheRead {
             ),
             _ => return Ok(None),
         };
-        if self.cache.is_cached(&name).await {
-            match self.cache.lock_shard_for_reading(&name).await {
-                Ok(guard) => {
-                    self.cache.touch_shard(&name).await;
-                    return Ok(Some(LocalShard {
-                        path: self.cache.get_cached_shard_path(&name),
-                        _guard: guard,
-                    }));
-                }
-                Err(WebshartError::CacheMiss(_)) => {}
-                Err(error) => return Err(error),
-            }
+        if let Some(shard) = cached_shard(&self.cache, &name).await? {
+            return Ok(Some(shard));
         }
         if !self.populate {
             return Ok(None);
@@ -664,6 +679,45 @@ impl PyParquetCache {
             Ok(Self { cache })
         })
     }
+    #[pyo3(signature = (identity, build=None))]
+    fn repacked_shard(
+        &self,
+        py: Python<'_>,
+        identity: &str,
+        build: Option<Py<PyAny>>,
+    ) -> PyResult<Option<PyParquetShardLease>> {
+        let name = format!(
+            "{}.parquet",
+            crate::digest_to_hex(Sha256::digest(identity.as_bytes()))
+        );
+        py.detach(|| {
+            runtime().map_err(python_error)?.block_on(async {
+                let shard = if let Some(build) = build {
+                    let (path, guard) = self
+                        .cache
+                        .ensure_cached_with(&name, true, |dest| async move {
+                            tokio::task::spawn_blocking(move || {
+                                Python::attach(|py| build.call1(py, (&dest,)))
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                                Ok(std::fs::metadata(dest)?.len())
+                            })
+                            .await
+                            .map_err(std::io::Error::other)?
+                        })
+                        .await?;
+                    Some(LocalShard {
+                        path,
+                        _guard: guard.expect("read lease requested"),
+                    })
+                } else {
+                    cached_shard(&self.cache, &name).await?
+                };
+                Ok(shard.map(|file| PyParquetShardLease {
+                    shard: Arc::new(file),
+                }))
+            })
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -854,7 +908,7 @@ impl PyParquetFile {
                 .open(&self.source)
                 .map_err(python_error)?
                 .ok_or_else(|| PyValueError::new_err("Shard has no cache identity"))?;
-            Ok(PyParquetShardLease { _shard: shard })
+            Ok(PyParquetShardLease { shard })
         })
     }
 

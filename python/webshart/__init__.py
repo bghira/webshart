@@ -795,6 +795,11 @@ def main():
     queue_parser.add_argument("--num-threads", type=int, default=4)
     queue_parser.add_argument("--flush", action="store_true")
 
+    repack_parser = subparsers.add_parser("repack-parquet", help="Rewrite a Parquet shard for sparse image reads")
+    repack_parser.add_argument("--source", required=True, help="Input Parquet file")
+    repack_parser.add_argument("--destination", required=True, help="New output Parquet file")
+    repack_parser.add_argument("--image-columns", nargs="+", required=True, help="Flat binary image columns")
+
     whitespace_parser = subparsers.add_parser("whitespace-crop", help="Measure whitespace and annotate indexed TAR images")
     whitespace_parser.add_argument("--source", required=True, help="Local directory or Hub dataset")
     whitespace_parser.add_argument("--metadata", help="Separate index directory or Hub dataset")
@@ -975,6 +980,10 @@ def main():
         except Exception as exc:
             print(f"Error uploading capture queue: {exc}", file=sys.stderr)
             sys.exit(1)
+    elif args.command == "repack-parquet":
+        from .repack import repack_parquet
+
+        print(json.dumps(repack_parquet(args.source, args.destination, args.image_columns)))
     elif args.command == "whitespace-crop":
         try:
             from .whitespace import scan_whitespace
