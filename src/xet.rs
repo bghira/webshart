@@ -1,5 +1,8 @@
 use crate::{digest_to_hex, Result, WebshartError};
-use futures::{stream, StreamExt, TryStreamExt};
+use ::xet::xet_session::{
+    header, HeaderMap as SdkHeaders, HeaderValue, XetFileInfo, XetSessionBuilder,
+};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use reqwest::{header::HeaderMap, Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -630,15 +633,68 @@ impl XetClient {
     }
 
     pub(crate) async fn download(&self, file: &XetFile, path: &Path) -> Result<u64> {
+        if std::env::var("WEBSHART_XET_SHARD_SDK").as_deref() == Ok("1") {
+            return self.download_with_sdk(file, path).await;
+        }
+        let windows = stream::iter((0..file.size).step_by(WINDOW_BYTES as usize))
+            .map(|offset| self.read_window(file, offset, (file.size - offset).min(WINDOW_BYTES)))
+            .buffered(self.concurrency);
+        Self::write_verified(file, path, windows).await
+    }
+
+    async fn download_with_sdk(&self, file: &XetFile, path: &Path) -> Result<u64> {
+        let mut headers = SdkHeaders::new();
+        if let Some(token) = &file.hub_token {
+            let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| invalid("Invalid Hub authorization header"))?;
+            auth.set_sensitive(true);
+            headers.insert(header::AUTHORIZATION, auth);
+        }
+        let session = XetSessionBuilder::new()
+            .build()
+            .map_err(|_| invalid("Could not initialize Xet SDK"))?;
+        let group = session
+            .new_download_stream_group()
+            .map_err(|_| invalid("Could not initialize Xet download group"))?
+            .with_token_refresh_url(file.auth_url.as_str(), headers)
+            .build()
+            .await
+            .map_err(|_| invalid("Could not authenticate Xet download group"))?;
+        let info = XetFileInfo {
+            hash: file.hash.clone(),
+            file_size: Some(file.size),
+            sha256: file.sha256.clone(),
+        };
+        let download = group
+            .download_stream(info, None)
+            .await
+            .map_err(|_| invalid("Could not open Xet download stream"))?;
+        let chunks = stream::try_unfold(download, |mut download| async move {
+            let chunk = download
+                .next()
+                .await
+                .map_err(|_| invalid("Xet SDK shard transfer failed"))?;
+            Ok(chunk.map(|bytes| (bytes, download)))
+        });
+        Self::write_verified(file, path, chunks).await
+    }
+
+    async fn write_verified<B: AsRef<[u8]>>(
+        file: &XetFile,
+        path: &Path,
+        chunks: impl Stream<Item = Result<B>>,
+    ) -> Result<u64> {
         let mut output = tokio::fs::File::create(path).await?;
         let mut digest = Sha256::new();
         let mut written = 0u64;
-        let mut windows = stream::iter((0..file.size).step_by(WINDOW_BYTES as usize))
-            .map(|offset| self.read_window(file, offset, (file.size - offset).min(WINDOW_BYTES)))
-            .buffered(self.concurrency);
-        while let Some(window) = windows.try_next().await.map_err(native_error)? {
-            digest.update(&window);
-            output.write_all(&window).await?;
+        futures::pin_mut!(chunks);
+        while let Some(chunk) = chunks.try_next().await.map_err(native_error)? {
+            let window = chunk.as_ref();
+            if window.len() as u64 > file.size - written {
+                return Err(invalid("Downloaded Xet file size mismatch"));
+            }
+            digest.update(window);
+            output.write_all(window).await?;
             written += window.len() as u64;
         }
         if written != file.size {
